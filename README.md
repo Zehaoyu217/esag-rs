@@ -51,7 +51,7 @@ let mean_loglik = model.score(&x_test, &y_test)?;   // held-out mean log-likelih
 let resid = model.residuals(&x, &y)?;               // Q_i and T1_i (≈ χ²_{d−1})
 
 let gof = bootstrap_gof(&model, &x, &y, GofMethod::TwoSampleReference, 200, 1)?;
-let iso = hypothesis_test(&model, &x, &y, Restriction::Isotropy, 200, 1000, 2)?;
+let iso = hypothesis_test(&model, &x, &y, Restriction::Isotropy, 200, 0, 2)?;
 let pr  = prediction_region(&model, &x, &y, &[1.0], 5000, 100, &[0.95, 0.9], 3)?;
 
 std::fs::write("model.json", model.to_json()?)?;     // save; EsagRegressorFit::from_json loads

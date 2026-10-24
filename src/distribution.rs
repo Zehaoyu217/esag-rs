@@ -145,6 +145,33 @@ impl Esag {
         Sampler::new(self)
     }
 
+    /// Exact second moment `E[Y Yᵀ]` (`d × d`), see [`second_moment_weights`].
+    pub fn second_moment(&self) -> DMatrix<f64> {
+        let frame = self.frame();
+        let d = frame.d;
+        let (w, w_mu) = second_moment_weights(&frame.lambda, frame.mu_norm);
+        let mut m = DMatrix::zeros(d, d);
+        for j in 0..d {
+            let (v, wj) = if j + 1 < d {
+                (frame.col(j), w[j])
+            } else {
+                (frame.mu_hat(), w_mu)
+            };
+            for a in 0..d {
+                for b in 0..d {
+                    m[(a, b)] += wj * v[a] * v[b];
+                }
+            }
+        }
+        m
+    }
+
+    /// The diagonal of [`Esag::second_moment`], `E[Y_k²]`.
+    pub fn second_moment_diag(&self) -> Vec<f64> {
+        let frame = self.frame();
+        second_moment_diag_from_frame(&frame)
+    }
+
     /// Draw one sample: `X ~ N_d(mu, V)`, `Y = X/|X|`.
     pub fn sample_one<R: Rng + ?Sized>(&self, frame: &Frame<f64>, rng: &mut R, out: &mut [f64]) {
         let d = self.dim();
@@ -351,6 +378,181 @@ mod sampler_tests {
                 let q2 = region_statistic(&frame, &y);
                 assert!((q1 - q2).abs() < 1e-12 * q2.max(1.0), "{q1} vs {q2}");
             }
+        }
+    }
+}
+
+/// `E[Y_k²]` from an eigen-frame of `V`.
+pub(crate) fn second_moment_diag_from_frame(frame: &Frame<f64>) -> Vec<f64> {
+    let d = frame.d;
+    let (w, w_mu) = second_moment_weights(&frame.lambda, frame.mu_norm);
+    let mut out = vec![0.0; d];
+    for j in 0..d {
+        let (v, wj) = if j + 1 < d {
+            (frame.col(j), w[j])
+        } else {
+            (frame.mu_hat(), w_mu)
+        };
+        for k in 0..d {
+            out[k] += wj * v[k] * v[k];
+        }
+    }
+    out
+}
+
+/// Step of the trapezoid rule in `s = ln t` used by [`second_moment_weights`].
+const MOMENT_STEP: f64 = 0.35;
+/// Start of the grid in `s`, shifted by `−ln(1 + ‖μ‖² + Σλ)` (the part below
+/// then contributes less than `e^{−32}`).
+const MOMENT_S_START: f64 = -32.0;
+/// End of the grid in `s` if the terms have not become negligible earlier.
+const MOMENT_S_END: f64 = 60.0;
+
+/// Eigen-weights of the exact second moment of `Y = X/‖X‖`,
+/// `X ~ N(μ, V)`, `V = Σ_j λ_j v_j v_jᵀ + μ̂μ̂ᵀ`:
+/// `E[YYᵀ] = Σ_j w_j v_j v_jᵀ + w_μ μ̂μ̂ᵀ`, returned as `(w, w_μ)`.
+///
+/// From `1/‖x‖² = ∫₀^∞ e^{−t‖x‖²} dt` and the Gaussian integral in the eigen-
+/// basis of `V` (where `μ = ‖μ‖ μ̂` has a single coordinate):
+///
+/// ```text
+/// c(t) = (1+2t)^{−1/2} Π_j (1+2tλ_j)^{−1/2} exp(−t‖μ‖²/(1+2t)),
+/// w_j  = ∫₀^∞ c(t) λ_j/(1+2tλ_j) dt,
+/// w_μ  = ∫₀^∞ c(t) [1/(1+2t) + ‖μ‖²/(1+2t)²] dt,     Σ w + w_μ = 1.
+/// ```
+///
+/// After `t = e^s` the integrands are analytic and decay exponentially in
+/// both directions. The factor `exp(−t‖μ‖²/(1+2t))` limits the useful strip
+/// of analyticity to `|Im s| < π/2`, so the trapezoid rule converges like
+/// `exp(−π²/h)` whatever the concentration: step 0.35 (0.3 for
+/// `‖μ‖ > 20`) gives ≲ 1e−12, measured up to `‖μ‖ = 80`, with about 100–300
+/// nodes once negligible terms are cut (≈ 1 µs). This replaces the Monte-Carlo moments of the R code, which
+/// carry sampling noise of order `n_mc^{−1/2}` and cost ~25 µs per 1000 draws.
+pub fn second_moment_weights(lambda: &[f64], mu_norm: f64) -> (Vec<f64>, f64) {
+    let r2 = mu_norm * mu_norm;
+    let mut w = vec![0.0; lambda.len()];
+    let mut w_mu = 0.0;
+    let mut total = 0.0;
+    let mut prev = f64::INFINITY;
+    // near t = 0 the integrands total t·(1 + ‖μ‖² + Σλ): start where the
+    // omitted part is below e^{MOMENT_S_START}
+    let scale = 1.0 + r2 + lambda.iter().sum::<f64>();
+    // very concentrated distributions need a slightly finer step for 1e-12
+    let h = if mu_norm > 20.0 { 0.3 } else { MOMENT_STEP };
+    let mut s = MOMENT_S_START - scale.ln();
+    let lam_min = lambda.iter().fold(1.0f64, |a, &b| a.min(b));
+    let s_settled = (0.5 / lam_min).ln() + 1.0;
+    while s <= MOMENT_S_END {
+        let t = s.exp();
+        s += h;
+        let a = 1.0 + 2.0 * t;
+        let mut prod = a;
+        for &l in lambda {
+            prod *= 1.0 + 2.0 * t * l;
+        }
+        // trapezoid weight h times the Jacobian dt = t ds
+        let c = (-t * r2 / a).exp() / prod.sqrt() * t * h;
+        let mut term = c * (1.0 / a + r2 / (a * a));
+        w_mu += term;
+        for (wj, &l) in w.iter_mut().zip(lambda) {
+            let v = c * l / (1.0 + 2.0 * t * l);
+            *wj += v;
+            term += v;
+        }
+        total += term;
+        // past the peak, past every eigen-scale 1/(2λ_j), and negligible:
+        // the rest decays geometrically
+        if term < prev && s > s_settled && term < 1e-17 * total {
+            break;
+        }
+        prev = term;
+    }
+    (w, w_mu)
+}
+
+#[cfg(test)]
+mod second_moment_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn weights_sum_to_one() {
+        for (lam, r) in [
+            (vec![1.0, 1.0], 0.0),
+            (vec![0.3, 3.3333333333333335], 2.5),
+            (vec![0.05, 0.5, 40.0], 12.0),
+            (vec![0.2, 0.7, 1.5, 2.0, 2.380952380952381], 0.4),
+            (vec![0.05, 0.5, 40.0], 80.0),
+            (vec![1.0, 1.0], 25.0),
+        ] {
+            let (w, wm) = second_moment_weights(&lam, r);
+            let tot: f64 = w.iter().sum::<f64>() + wm;
+            assert!((tot - 1.0).abs() < 1e-11, "lam {lam:?} r {r}: total {tot}");
+        }
+    }
+
+    #[test]
+    fn matches_monte_carlo() {
+        let dist = Esag::new(&[1.2, -0.4, 0.8, 0.3], &[0.9, -0.5, 1.4, 0.2, -0.7]).unwrap();
+        let exact = dist.second_moment();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+        let n = 2_000_000;
+        let sampler = dist.sampler();
+        let mut buf = vec![0.0; 4];
+        let mut mc = DMatrix::<f64>::zeros(4, 4);
+        for _ in 0..n {
+            sampler.sample_into(&mut rng, &mut buf);
+            for a in 0..4 {
+                for b in 0..4 {
+                    mc[(a, b)] += buf[a] * buf[b] / n as f64;
+                }
+            }
+        }
+        // MC standard error ≤ 0.5/sqrt(n) ≈ 3.5e-4
+        assert!((&exact - &mc).abs().max() < 2e-3, "exact {exact}\nmc {mc}");
+        assert!((exact.trace() - 1.0).abs() < 1e-11);
+        let diag = dist.second_moment_diag();
+        for k in 0..4 {
+            assert!((diag[k] - exact[(k, k)]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn isotropic_limit_is_uniform() {
+        // mu → 0, V = I: Y uniform on the sphere, E[YYᵀ] = I/d
+        let (w, wm) = second_moment_weights(&[1.0, 1.0, 1.0, 1.0], 1e-12);
+        for v in w.iter().chain(std::iter::once(&wm)) {
+            assert!((v - 0.2).abs() < 1e-12);
+        }
+    }
+}
+
+#[cfg(test)]
+mod second_moment_timing {
+    /// `cargo test --release --lib second_moment_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cost_per_call() {
+        for (lam, r) in [
+            (vec![0.6, 1.6666666666666667], 2.0),
+            (vec![0.3, 0.8, 1.4, 1.9, 1.5, 1.2, 0.9], 4.0),
+            (vec![0.05, 0.5, 40.0], 30.0),
+        ] {
+            let t = std::time::Instant::now();
+            let mut acc = 0.0;
+            for k in 0..100_000 {
+                let (w, wm) = super::second_moment_weights(
+                    std::hint::black_box(&lam),
+                    r + (k % 7) as f64 * 1e-3,
+                );
+                acc += w[0] + wm;
+            }
+            std::hint::black_box(acc);
+            println!(
+                "d={} r={r}: {:.2} µs",
+                lam.len() + 1,
+                t.elapsed().as_secs_f64() * 1e6 / 1e5
+            );
         }
     }
 }

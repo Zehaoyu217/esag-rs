@@ -28,5 +28,12 @@ pub(crate) fn refit_config(fit: &EsagRegressorFit) -> EsagRegressor {
     // one refit per thread already saturates the machine
     cfg.parallel = false;
     cfg.mask = Some(fit.mask.clone());
+    // refits start near the original optimum, where the observed information
+    // is nearly the same: whitening with it makes L-BFGS converge in a few
+    // iterations
+    cfg.precondition = fit
+        .cov_params
+        .as_ref()
+        .and_then(crate::regression::precondition_from_cov);
     cfg
 }

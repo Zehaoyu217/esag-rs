@@ -183,7 +183,7 @@ fn main() {
         let t = median(3, || {
             black_box(hypothesis_test(&fit, &x, &y, Restriction::Isotropy, 200, 1000, 4).unwrap());
         });
-        line("hypothesis test isotropy d=3 n=1000, 200 reps, mc=1000", t);
+        line("hypothesis test isotropy d=3 n=1000, 200 reps, exact M", t);
         let hfit = EsagRegressor::new().fit(&hx, &hy).unwrap();
         let t = median(3, || {
             black_box(

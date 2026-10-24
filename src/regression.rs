@@ -27,13 +27,14 @@ use crate::distribution::{Esag, residual_q};
 use crate::error::{EsagError, Result};
 use crate::frame::Frame;
 use crate::loglik;
-use crate::optim::lbfgs::{Lbfgs, LbfgsConfig, Objective, Status, minimize};
+use crate::optim::lbfgs::{Lbfgs, LbfgsConfig, Objective, OptimResult, Status, minimize};
 use crate::stats::normal::norm_sf;
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn default_true() -> bool {
@@ -95,6 +96,13 @@ pub struct EsagRegressor {
     pub mask: Option<DMatrix<bool>>,
     /// Optional feature names for `summary()`.
     pub feature_names: Option<Vec<String>>,
+    /// Preconditioner for warm-started refits: a lower-triangular factor `L`
+    /// of an approximate inverse Hessian over the free parameters (optimiser
+    /// order). L-BFGS then works in `z` with `θ = θ₀ + L z`, where the
+    /// Hessian is close to the identity. The resampling procedures set it
+    /// from the original fit's observed information.
+    #[serde(skip)]
+    pub(crate) precondition: Option<Arc<DMatrix<f64>>>,
 }
 
 impl Default for EsagRegressor {
@@ -119,6 +127,7 @@ impl EsagRegressor {
             verbose: false,
             mask: None,
             feature_names: None,
+            precondition: None,
         }
     }
     /// Whether to add an intercept column.
@@ -461,7 +470,9 @@ impl EsagRegressor {
             base: b0.clone(),
             free,
             parallel: self.parallel,
-            trap_streak: Some(AtomicUsize::new(0)),
+            // groups j ≥ 2 (where observations can get pinned) exist from d = 4;
+            // in practice traps need d ≥ 5 and covariates
+            trap_streak: (data.d >= 5 && data.p > 0).then(|| AtomicUsize::new(0)),
         }
     }
 
@@ -501,7 +512,30 @@ impl EsagRegressor {
         let obj = self.objective(data, b0, free);
         let cfg = self.lbfgs_config(data, free.len(), max_iter);
         let x0: Vec<f64> = free.iter().map(|&(k, j)| b0[(k, j)]).collect();
-        let r = minimize(&obj, &x0, &cfg);
+        let r = match &self.precondition {
+            Some(l) if l.nrows() == free.len() && l.ncols() == free.len() => {
+                let w = Whitened {
+                    inner: &obj,
+                    theta0: x0.clone(),
+                    l,
+                };
+                let rz = minimize(&w, &vec![0.0; free.len()], &cfg);
+                // back to θ, with the θ-gradient for the convergence check
+                let x = w.theta(&rz.x);
+                let mut grad = vec![0.0; x.len()];
+                let f = obj.value_and_gradient(&x, &mut grad);
+                OptimResult {
+                    grad_norm_inf: grad.iter().fold(0.0f64, |m, v| m.max(v.abs())),
+                    x,
+                    f,
+                    grad,
+                    n_iter: rz.n_iter,
+                    n_fev: rz.n_fev + 1,
+                    status: rz.status,
+                }
+            }
+            _ => minimize(&obj, &x0, &cfg),
+        };
         let converged = r.converged()
             && r.f.is_finite()
             && r.grad_norm_inf <= MAX_MEAN_GRADIENT * data.n.max(1) as f64;
@@ -997,6 +1031,47 @@ struct NegLogLik<'a> {
     trap_streak: Option<AtomicUsize>,
 }
 
+/// The objective in whitened coordinates `θ = θ₀ + L z` (`L` lower
+/// triangular): gradient `Lᵀ ∇_θ f`.
+struct Whitened<'a> {
+    inner: &'a NegLogLik<'a>,
+    theta0: Vec<f64>,
+    l: &'a DMatrix<f64>,
+}
+
+impl Whitened<'_> {
+    fn theta(&self, z: &[f64]) -> Vec<f64> {
+        let n = z.len();
+        (0..n)
+            .map(|i| self.theta0[i] + (0..=i).map(|j| self.l[(i, j)] * z[j]).sum::<f64>())
+            .collect()
+    }
+}
+
+impl Objective for Whitened<'_> {
+    fn value_and_gradient(&self, z: &[f64], grad: &mut [f64]) -> f64 {
+        let theta = self.theta(z);
+        let mut gt = vec![0.0; z.len()];
+        let f = self.inner.value_and_gradient(&theta, &mut gt);
+        let n = z.len();
+        for j in 0..n {
+            grad[j] = (j..n).map(|i| self.l[(i, j)] * gt[i]).sum();
+        }
+        f
+    }
+
+    fn should_stop(&self) -> bool {
+        self.inner.should_stop()
+    }
+}
+
+/// Lower Cholesky factor of a covariance matrix (the preconditioner for
+/// refits), if it is positive definite.
+pub(crate) fn precondition_from_cov(cov: &DMatrix<f64>) -> Option<Arc<DMatrix<f64>>> {
+    let sym = (cov + cov.transpose()) * 0.5;
+    sym.cholesky().map(|c| Arc::new(c.l()))
+}
+
 /// Per-observation gradient ratio (largest over median, in `eta`) above
 /// which an evaluation counts towards a trap. Healthy fits stay below ~10²;
 /// a start pinned at a singular point of the gamma parameterization reaches
@@ -1012,6 +1087,55 @@ impl NegLogLik<'_> {
             b[(k, j)] = v;
         }
         b
+    }
+}
+
+/// The negative joint log-likelihood over the free coefficients with its
+/// exact Hessian, as a [`crate::optim::prox::SmoothObjective`] for penalized
+/// (LASSO-type) fits.
+pub(crate) struct SmoothNegLogLik<'a> {
+    inner: NegLogLik<'a>,
+}
+
+impl<'a> SmoothNegLogLik<'a> {
+    pub(crate) fn new(
+        data: &'a RegressionData,
+        base: DMatrix<f64>,
+        free: &'a [(usize, usize)],
+        parallel: bool,
+    ) -> Self {
+        Self {
+            inner: NegLogLik {
+                data,
+                base,
+                free,
+                parallel,
+                trap_streak: None,
+            },
+        }
+    }
+}
+
+impl crate::optim::prox::SmoothObjective for SmoothNegLogLik<'_> {
+    fn value_grad(&self, theta: &[f64], grad: &mut [f64]) -> f64 {
+        self.inner.value_and_gradient(theta, grad)
+    }
+
+    fn value_grad_hess(&self, theta: &[f64], grad: &mut [f64], hess: &mut [f64]) -> f64 {
+        let data = self.inner.data;
+        let b = self.inner.assemble(theta);
+        let (f, g, h) = joint_loglik_grad_hess(data, &b, self.inner.parallel);
+        let (bd, full) = (data.b_dim, data.b_dim * data.p_total);
+        let free = self.inner.free;
+        let nf = free.len();
+        for (a, &(ka, ja)) in free.iter().enumerate() {
+            let ia = ja * bd + ka;
+            grad[a] = -g[ia];
+            for (c, &(kc, jc)) in free.iter().enumerate() {
+                hess[a * nf + c] = -h[ia * full + jc * bd + kc];
+            }
+        }
+        -f
     }
 }
 
@@ -1625,8 +1749,8 @@ mod timing {
     #[test]
     #[ignore]
     fn joint_eval_timings() {
-        for &(d, p) in &[(7usize, 6usize), (8, 6)] {
-            for &n in &[2000usize, 20000] {
+        for &(d, p) in &[(3usize, 1usize), (4, 1), (7, 6), (8, 6)] {
+            for &n in &[1000usize, 20000] {
                 let bd = dims::eta_len(d);
                 let x = DMatrix::from_fn(n, p, |i, j| (((i * 7 + j * 13) % 17) as f64 - 8.0) / 5.0);
                 let y = DMatrix::from_fn(n, d, |i, k| {
@@ -1668,7 +1792,7 @@ mod kernel_timing {
     #[test]
     #[ignore]
     fn kernel_vs_joint() {
-        for d in [7usize, 8] {
+        for d in [3usize, 4, 7, 8] {
             let bd = crate::dims::eta_len(d);
             let etas: Vec<Vec<f64>> = (0..64)
                 .map(|s| {

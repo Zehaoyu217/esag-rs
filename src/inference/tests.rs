@@ -5,7 +5,8 @@
 //! A restricted model (null) is compared with the full model using four
 //! statistics: `RoC` (mean ratio of concentrations `|mu_a,i|/|mu_0,i|`), `D`
 //! (`mean_i (2 − cos∠(mu_0,i, mu_a,i)) · RoC_i`), `M` (a second-moment
-//! discrepancy, Monte-Carlo; Yu & Huang use 10⁴ draws) and the likelihood
+//! discrepancy; Yu & Huang estimate the moments with 10⁴ Monte-Carlo draws,
+//! `esag` computes them exactly by default) and the likelihood
 //! ratio `LR = −2(ll_0 − ll_a)`.
 //! Null distributions come from a parametric bootstrap under the restricted
 //! fit. Unlike the R code, the bootstrap responses are simulated observation
@@ -13,7 +14,9 @@
 //! parameter matrix with the bootstrap counter), and every `d` is supported.
 
 use super::refit_config;
+use crate::distribution::second_moment_diag_from_frame;
 use crate::error::{EsagError, Result};
+use crate::frame::Frame;
 use crate::regression::{
     EsagRegressorFit, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
 };
@@ -133,11 +136,16 @@ fn roc_and_d(eta0: &DMatrix<f64>, eta_a: &DMatrix<f64>, d: usize) -> (f64, f64) 
     (roc / n as f64, ds / n as f64)
 }
 
-/// `M = ‖ mean_i ( y_i² − E[Y_i²; eta_0,i] ) ‖²` (elementwise squares) with
-/// the second moments estimated by `n_mc` Monte-Carlo draws per observation.
-/// This is the squared norm, as computed by R's `mome_stats` and as reported
-/// in the papers' tables (CSDA 2025 eq. (4) writes the norm; bootstrap
-/// p-values are identical either way).
+/// `M = ‖ mean_i ( y_i² − E[Y_i²; eta_0,i] ) ‖²` (elementwise squares).
+///
+/// With `n_mc = 0` the second moments are exact
+/// ([`crate::distribution::second_moment_weights`], ~1 µs per observation);
+/// with `n_mc > 0` they are estimated by `n_mc` Monte-Carlo draws per
+/// observation as in the R code (`mome_stats`), which adds sampling noise of
+/// order `n_mc^{−1/2}` and costs ~25 µs per 1000 draws. This is the squared
+/// norm, as computed by R's `mome_stats` and as reported in the papers'
+/// tables (CSDA 2025 eq. (4) writes the norm; bootstrap p-values are
+/// identical either way).
 fn moment_stat(
     fit0: &EsagRegressorFit,
     x: &DMatrix<f64>,
@@ -145,36 +153,54 @@ fn moment_stat(
     n_mc: usize,
     seed: u64,
     replicate: u64,
+    parallel: bool,
 ) -> Result<f64> {
-    let dists = fit0.predict_distribution(x)?;
     let d = fit0.d;
-    let diffs: Vec<Vec<f64>> = dists
-        .par_iter()
-        .enumerate()
-        .map(|(i, dist)| {
-            let mut rng = crate::stream_rng(
-                seed,
-                crate::streams::TEST_MOMENTS + (replicate << 8),
-                i as u64,
-            );
-            let sampler = dist.sampler();
-            let mut buf = vec![0.0; d];
-            let mut ey2 = vec![0.0; d];
-            for _ in 0..n_mc {
-                sampler.sample_into(&mut rng, &mut buf);
-                for k in 0..d {
-                    ey2[k] += buf[k] * buf[k];
+    let n = y.nrows();
+    let diffs: Vec<Vec<f64>> = if n_mc == 0 {
+        let eta = fit0.linear_predictor(x)?;
+        let bd = eta.ncols();
+        let one = |i: usize| -> Vec<f64> {
+            let row: Vec<f64> = (0..bd).map(|k| eta[(i, k)]).collect();
+            let frame = Frame::new(&row[..d], &row[d..]);
+            let ey2 = second_moment_diag_from_frame(&frame);
+            (0..d).map(|k| y[(i, k)].powi(2) - ey2[k]).collect()
+        };
+        if parallel {
+            (0..n).into_par_iter().with_min_len(64).map(one).collect()
+        } else {
+            (0..n).map(one).collect()
+        }
+    } else {
+        let dists = fit0.predict_distribution(x)?;
+        dists
+            .par_iter()
+            .enumerate()
+            .map(|(i, dist)| {
+                let mut rng = crate::stream_rng(
+                    seed,
+                    crate::streams::TEST_MOMENTS + (replicate << 8),
+                    i as u64,
+                );
+                let sampler = dist.sampler();
+                let mut buf = vec![0.0; d];
+                let mut ey2 = vec![0.0; d];
+                for _ in 0..n_mc {
+                    sampler.sample_into(&mut rng, &mut buf);
+                    for k in 0..d {
+                        ey2[k] += buf[k] * buf[k];
+                    }
                 }
-            }
-            (0..d)
-                .map(|k| y[(i, k)].powi(2) - ey2[k] / n_mc as f64)
-                .collect()
-        })
-        .collect();
-    let n = y.nrows() as f64;
+                (0..d)
+                    .map(|k| y[(i, k)].powi(2) - ey2[k] / n_mc as f64)
+                    .collect()
+            })
+            .collect()
+    };
+    let nf = n as f64;
     let mut m = 0.0;
     for k in 0..d {
-        let mean_k: f64 = diffs.iter().map(|r| r[k]).sum::<f64>() / n;
+        let mean_k: f64 = diffs.iter().map(|r| r[k]).sum::<f64>() / nf;
         m += mean_k * mean_k;
     }
     Ok(m)
@@ -183,8 +209,9 @@ fn moment_stat(
 /// Run a bootstrap hypothesis test of `restriction` against the full fit.
 ///
 /// `n_boot` parametric-bootstrap replicates from the restricted fit (each
-/// refitting both models, warm-started), `n_mc` Monte-Carlo draws per
-/// observation for the `M` statistic. Every replicate and every Monte-Carlo
+/// refitting both models, warm-started). `n_mc = 0` (recommended) computes
+/// the moments in the `M` statistic exactly; `n_mc > 0` uses that many
+/// Monte-Carlo draws per observation, as the R code does. Every replicate and every Monte-Carlo
 /// moment has its own random stream derived from `seed`.
 pub fn hypothesis_test(
     fit_full: &EsagRegressorFit,
@@ -214,21 +241,29 @@ pub fn hypothesis_test(
     }
     let mut cfg0 = refit_config(fit_full);
     cfg0.mask = Some(mask0.clone());
+    cfg0.precondition = None;
     let cfg_a = refit_config(fit_full);
     let fit0 = {
-        let warm = cfg0.fit_warm(x, y, &b0)?;
-        let mut auto = cfg0.clone();
+        // once, with its observed information (the preconditioner below)
+        let mut once = cfg0.clone();
+        once.compute_hessian = true;
+        let warm = once.fit_warm(x, y, &b0)?;
+        let mut auto = once.clone();
         auto.init = crate::regression::Init::Auto;
         match auto.fit(x, y) {
             Ok(a) if a.log_likelihood > warm.log_likelihood => a,
             _ => warm,
         }
     };
+    cfg0.precondition = fit0
+        .cov_params
+        .as_ref()
+        .and_then(crate::regression::precondition_from_cov);
 
     let eta0 = fit0.linear_predictor(x)?;
     let eta_a = fit_full.linear_predictor(x)?;
     let (roc, d_stat) = roc_and_d(&eta0, &eta_a, d);
-    let m_stat = moment_stat(&fit0, x, y, n_mc, seed, 0)?;
+    let m_stat = moment_stat(&fit0, x, y, n_mc, seed, 0, true)?;
     let lr = -2.0 * (fit0.log_likelihood - fit_full.log_likelihood);
 
     let boot: Vec<Option<(f64, f64, f64, f64)>> = (0..n_boot)
@@ -264,7 +299,8 @@ pub fn hypothesis_test(
             let e0 = f0.linear_predictor(x).ok()?;
             let ea = fa.linear_predictor(x).ok()?;
             let (r, dd) = roc_and_d(&e0, &ea, d);
-            let m = moment_stat(&f0, x, &yb, n_mc, seed, 1 + b as u64).ok()?;
+            // sequential: replicates already run in parallel
+            let m = moment_stat(&f0, x, &yb, n_mc, seed, 1 + b as u64, n_mc > 0).ok()?;
             let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
             Some((r, dd, m, l))
         })
@@ -309,4 +345,89 @@ pub fn hypothesis_test(
         boot_m: bm,
         boot_lr: bl,
     })
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use crate::regression::EsagRegressor;
+    use rand::SeedableRng;
+    use std::time::Instant;
+
+    /// `cargo test --release --lib inference::tests::timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replicate_breakdown() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+        let n = 1000;
+        let x = DMatrix::from_fn(n, 1, |i, _| ((i * 37 % 101) as f64 / 50.0) - 1.0);
+        let b =
+            DMatrix::from_row_slice(5, 2, &[1.5, -0.6, 0.5, 1.2, 1.0, 0.3, 0.8, 0.5, -0.4, 0.7]);
+        let full0 = EsagRegressor::new()
+            .with_init(crate::regression::Init::Custom(b))
+            .with_max_iter(0)
+            .fit(
+                &x,
+                &DMatrix::from_fn(n, 3, |_, k| if k == 2 { 1.0 } else { 0.0 }),
+            )
+            .unwrap();
+        let y = full0.sample_responses(&x, &mut rng).unwrap();
+        let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+        let mask0 = restriction_mask(&fit, &Restriction::Isotropy).unwrap();
+        let mut cfg0 = refit_config(&fit);
+        cfg0.mask = Some(mask0.clone());
+        cfg0.precondition = None;
+        let cfg_a = refit_config(&fit);
+        let mut b0 = fit.coef.clone();
+        for k in 3..5 {
+            for j in 0..2 {
+                b0[(k, j)] = 0.0;
+            }
+        }
+        let mut once = cfg0.clone();
+        once.compute_hessian = true;
+        let fit0 = once.fit_warm(&x, &y, &b0).unwrap();
+        cfg0.precondition = fit0
+            .cov_params
+            .as_ref()
+            .and_then(crate::regression::precondition_from_cov);
+        let reps = 200;
+        let (mut t_s, mut t_0, mut t_a, mut t_m) = (0.0, 0.0, 0.0, 0.0);
+        let (mut it0, mut ita) = (0, 0);
+        for r in 0..reps {
+            let mut rng = crate::stream_rng(1, 5, r);
+            let t = Instant::now();
+            let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+            t_s += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let f0 = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+            t_0 += t.elapsed().as_secs_f64();
+            it0 += f0.n_iter;
+            let mut ba = f0.coef.clone();
+            for k in 3..5 {
+                for j in 0..2 {
+                    ba[(k, j)] = 1e-3;
+                }
+            }
+            let t = Instant::now();
+            let fa = cfg_a.fit_warm(&x, &yb, &ba).unwrap();
+            let fa2 = cfg_a.fit_warm(&x, &yb, &fit.coef).unwrap();
+            t_a += t.elapsed().as_secs_f64();
+            ita += fa.n_iter + fa2.n_iter;
+
+            let t = Instant::now();
+            let _ = moment_stat(&f0, &x, &yb, 0, 1, 1, false).unwrap();
+            t_m += t.elapsed().as_secs_f64();
+        }
+        let r = reps as f64;
+        println!(
+            "per replicate (single thread for fits): sample {:.2} ms, restricted refit {:.2} ms ({} it), 2 full refits {:.2} ms ({} it), exact M {:.2} ms",
+            t_s / r * 1e3,
+            t_0 / r * 1e3,
+            it0 / reps as usize,
+            t_a / r * 1e3,
+            ita / reps as usize,
+            t_m / r * 1e3
+        );
+    }
 }

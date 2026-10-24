@@ -173,12 +173,12 @@ fn part_a() -> Res<()> {
     );
 
     // ---- hypothesis tests
-    println!("bootstrap hypothesis tests (200 replicates, M with 1000 MC draws/obs):");
+    println!("bootstrap hypothesis tests (200 replicates, M with exact moments):");
     let t = Instant::now();
-    let r = hypothesis_test(&model, &x, &y, Restriction::Isotropy, 200, 1000, 3)?;
+    let r = hypothesis_test(&model, &x, &y, Restriction::Isotropy, 200, 0, 3)?;
     print_test("H0: isotropic (gamma ≡ 0) [false]", &r, secs(t));
     let t = Instant::now();
-    let r = hypothesis_test(&model, &x, &y, Restriction::GammaOfFeature(0), 200, 1000, 5)?;
+    let r = hypothesis_test(&model, &x, &y, Restriction::GammaOfFeature(0), 200, 0, 5)?;
     print_test("H0: shape free of x1 [false]", &r, secs(t));
     let mut rng = ChaCha8Rng::seed_from_u64(99);
     let x2 = DMatrix::from_fn(1000, 2, |i, j| {
@@ -192,7 +192,7 @@ fn part_a() -> Res<()> {
         .with_feature_names(vec!["x1".into(), "noise".into()])
         .fit(&x2, &y)?;
     let t = Instant::now();
-    let r = hypothesis_test(&model2, &x2, &y, Restriction::Feature(1), 200, 1000, 13)?;
+    let r = hypothesis_test(&model2, &x2, &y, Restriction::Feature(1), 200, 0, 13)?;
     print_test("H0: pure-noise x2 has no effect [true]", &r, secs(t));
     println!(
         "  AIC with noise covariate {:.2} vs without {:.2}\n",
@@ -308,7 +308,7 @@ fn part_b() -> Res<()> {
         ),
     ] {
         let t = Instant::now();
-        let r = hypothesis_test(&model, &x, &y, restr, 300, 2000, 21)?;
+        let r = hypothesis_test(&model, &x, &y, restr, 300, 0, 21)?;
         print_test(name, &r, secs(t));
         println!("  {:<34} {paper}", "");
     }

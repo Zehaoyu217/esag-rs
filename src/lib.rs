@@ -30,6 +30,7 @@ pub mod loglik;
 pub mod onb;
 pub mod optim;
 pub mod param;
+pub mod penalized;
 pub mod preprocessing;
 pub mod regression;
 pub mod rotation;
@@ -67,6 +68,7 @@ pub(crate) mod streams {
     /// the stream id.
     pub const TEST_MOMENTS: u64 = 6;
     pub const RESTARTS: u64 = 7;
+    pub const CV_FOLDS: u64 = 8;
 }
 
 /// An independent generator for `(seed, stream, index)`: the three are
