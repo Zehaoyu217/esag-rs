@@ -27,6 +27,7 @@ pub mod frame;
 pub mod hdual;
 pub mod inference;
 pub mod loglik;
+pub mod logtangent;
 pub mod onb;
 pub mod optim;
 pub mod param;

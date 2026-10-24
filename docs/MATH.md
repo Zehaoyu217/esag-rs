@@ -117,8 +117,10 @@ only `λ_j = λ_{j+1}`, but the group's undefined angles still rotate
 coordinates `1..j+1`, which carry unequal eigenvalues. Approaching such a
 point from different directions gives limits of `V` that differ by O(1)
 however close one gets (measured: 0.27 for group 2 and 0.81 for group 3 at
-`d = 5`, flat for ε = 1e−3 … 1e−9; group 1 and `γ = 0` as a whole are
-continuous). `param::singular_set_tests` and the R script
+`d = 5`, flat for ε = 1e−3 … 1e−9). `V` is continuous only at "prefix"
+zero patterns `γ_(1) = … = γ_(m) = 0` (the ties `ξ_1 = … = ξ_{m+1}`), which
+include group 1 alone and `γ = 0`; it is not differentiable at any zero
+group. The frame `onb(μ)` is itself discontinuous at `μ_1 = μ_2 = 0`. `param::singular_set_tests` and the R script
 `reference/checks/gamma_discontinuity.R`, which uses the original R
 functions, document this. Two consequences:
 
@@ -134,6 +136,9 @@ functions, document this. Two consequences:
   likelihood then has many cliffs and local maxima, and L-BFGS can stall
   against a cliff with a huge gradient (one observation pinned at
   `‖(γ_{n−1}, γ_n)‖ ≈ 1e−12`). See "Starts" below for how fitting copes.
+
+The log-tangent parameterization (§7) describes the same distributions
+without this set.
 
 ## 3. Regression (`src/regression.rs`)
 
@@ -254,3 +259,131 @@ nulls are isotropy (`γ ≡ 0`), `μ` free of feature `j`, `γ` free of feature
 responses are drawn from each observation's own null parameters (the R code
 indexes them by the bootstrap counter), and every `d` is supported (the R
 isotropy and γ-restricted fits hard-code `d = 4`).
+
+## 7. Log-tangent shape parameterization (smooth option) (`src/logtangent.rs`)
+
+An opt-in alternative to `γ` that maps smoothly onto the same ESAG family,
+for regressions whose likelihood would otherwise have cliffs at the `γ`
+singular set (§2). Nothing else in the crate uses it yet.
+
+**Definition.** Let `p = d − 1`. Fix a reference direction `m ∈ S^{d−1}` and
+an orthonormal basis `E` (`d × p`) of `m⊥` (`LtFrame`; by default `m = e_d`,
+`E = [e_1, …, e_{d−1}]`). For `μ̂ = μ/‖μ‖ ≠ −m` let `R(m→μ̂)` be the minimal
+rotation taking `m` to `μ̂`. It rotates in `span(m, μ̂)` and fixes the
+orthogonal complement. Let `Ξ(μ̂) = R(m→μ̂) E`, a smooth orthonormal basis
+of `μ̂⊥`. Then
+
+```
+V = μ̂μ̂ᵀ + Ξ exp(S) Ξᵀ,     S = Sᵀ ∈ ℝ^{p×p},  tr S = 0,
+```
+
+so `Vμ = μ` and `det V = e^{tr S} = 1`. Given `μ`, `S = log(Ξᵀ V Ξ)` is
+unique (`s_from_covariance`), so there are no equivalent parameters and the
+map `(μ, S) ↦ (μ, V)` is a diffeomorphism wherever `μ̂ ≠ −m`.
+
+**Coordinates.** `s ∈ ℝ^{(d−2)(d+1)/2}`, the length of `γ`, holds orthonormal
+coordinates of `S` in the Frobenius inner product (`s_to_matrix`,
+`matrix_to_s`):
+
+* `s_{k−1}`, `k = 1..p−1`: the diagonal on the Helmert basis
+  `h_k = (1, …, 1, −k, 0, …, 0)/√(k(k+1))` (`k` ones), so
+  `S_jj = Σ_{k>j} s_{k−1}/√(k(k+1)) − j s_{j−1}/√(j(j+1))`;
+* then the pairs `a < b` in row-major order, `S_ab = S_ba = s/√2`.
+
+That is `(p−1) + p(p−1)/2 = (d−2)(d+1)/2` coordinates, with `‖s‖ = ‖S‖_F`.
+`‖s‖` is the affine-invariant Riemannian distance of the tangent block
+`Ξᵀ V Ξ = e^S` from `I`, and `s = 0` is isotropy.
+
+**The frame in O(d).** With `H_x = I − 2xxᵀ/(xᵀx)` and `v = μ̂ + m`,
+`R(m→μ̂) = H_v H_m`: `H_m m = −m`, `H_v(−m) = μ̂` (as
+`m·v/(v·v) = (1 + c)/(2(1 + c)) = ½`, `c = mᵀμ̂`), and both reflections fix
+`span(m, μ̂)⊥`. This is the closed form `R = I + K + K²/(1 + c)`,
+`K = μ̂mᵀ − mμ̂ᵀ`; the tests check one against the other. Since `H_m E = E`,
+
+```
+Ξ(μ̂) = H_v E,     z = Ξᵀ y = Eᵀ u,     u = H_v y = y − κ v,     κ = 2 (v·y)/(v·v).
+```
+
+`v·v = 2(1 + c)` vanishes only at `μ̂ = −m`. Near that point the frame turns
+fast: `‖dΞ‖_F ≤ 2√2 ‖dμ̂‖/‖μ̂ + m‖`. The singular point cannot be avoided,
+since `S^{d−1}` has a global smooth tangent frame only for `d ∈ {2, 4, 8}`,
+so `m` should be chosen near the data (for example the mean direction).
+Guards: at `μ̂ = −m` exactly, `v = E_0` (the rotation by `π` in the plane
+`(m, E_0)`). At `μ = 0`, `μ̂ = m`. Both frames are constant there.
+`LtFrame::new` takes `E` from `onb(m)`, so that `Ξ(m)` is the basis `γ` uses at
+`μ̂ = m`. Entries of `m̂` below `1e-70` are zeroed first, because `onb`
+underflows to NaN for inputs such as `(1e-155, 0, 0, 1)`. Two Gram–Schmidt
+passes then restore orthonormality against the true `m̂`.
+
+**Density.** `q = yᵀV⁻¹y = b² + zᵀ e^{−S} z` with `b = μ̂·y`, and the log-density
+is that of §1. With `S = QΛQᵀ`, `w = Qᵀz`,
+
+```
+zᵀ e^{−S} z = Σ_a e^{−λ_a} w_a².
+```
+
+`loglik_lt` scales `S` to unit Frobenius norm. It diagonalises `S` by cyclic
+Jacobi in round-robin order: in each of the `p − 1 + (p mod 2)` rounds the
+`⌊p/2⌋` rotations act on disjoint planes, so their angles are computed
+together and the latencies overlap. It updates only the upper triangle and
+applies each rotation to `z` as it goes, so `Q` is never formed for the
+value. The angle uses `h = a_yy − a_xx`, `g = 2a_xy`, `r = √(h² + g²)`,
+`c = (r + |h|)/√(2r(r + |h|))`, `s = sgn(h) g/√(2r(r + |h|))`, which needs two
+square roots and one division in sequence. For `|a_xy| < 5e-9 |h|` it uses
+`t = a_xy/h`, `c = 1`, which is exact to rounding. Jacobi stops at an
+off-diagonal norm `≤ 1e-15 ‖S‖_F`. On random `S` with `p = 7` that takes 5.0
+sweeps on average and at most 6. At `S = 0` the decomposition is skipped.
+
+**Gradient** (`loglik_lt_grad`, reverse mode, value bit-identical to
+`loglik_lt`). As in §2, `∇ log f = q̄ ∇q + ȳmu y − μ (μ block)` with
+`ᾱ = alpha + (log M_p)'(alpha)`, `q̄ = −(d + ᾱ alpha)/(2q)`, `ȳmu = ᾱ/√q`,
+so it remains to find `∇q`.
+
+* *Shape.* By the Daleckii–Krein formula,
+  `D e^{−S}[H] = Q (F ∘ (QᵀHQ)) Qᵀ`, where `F_ab = (e^{−λ_a} − e^{−λ_b})/(λ_a − λ_b)`
+  and `F_aa = −e^{−λ_a}`. Hence `dq = zᵀ D e^{−S}[dS] z = Σ_ab F_ab w_a w_b (QᵀdS Q)_ab`,
+  so `∂q/∂S = G = Q (F ∘ wwᵀ) Qᵀ`. It is computed as `G = Aᵀ F A` with
+  `A = diag(w) Qᵀ`, at about `1.5p³` operations. For a gap
+  `δ = λ_b − λ_a ∈ [0, ½)` (sorted so that `δ ≥ 0`),
+  `F_ab = e^{−λ_a} expm1(−δ)/δ`, which is accurate for every `δ` and tends to
+  `−e^{−λ_a}`. `G` is smooth in `S` even where eigenvalues coincide, where
+  `Q` is not unique. Finally `∂q/∂s_i = ⟨G, B_i⟩` for the basis matrices:
+  `(Σ_{j<k} G_jj − k G_kk)/√(k(k+1))` for the diagonal coordinates and
+  `√2 G_ab` for the off-diagonal ones. At `S = 0`, `G = −zzᵀ` exactly.
+* *Projection.* `∂q/∂z = 2 e^{−S} z = 2Q(e^{−λ} ∘ w)` and `ū = E z̄`. From
+  `u = y − κv` and `dκ = (2/(v·v)) u·dv`,
+  `v̄ = −κ ū − (2 (ū·v)/(v·v)) u`.
+* *Mean direction.* `v = μ̂ + m` and `b = μ̂·y` give `μ̂̄ = v̄ + 2b y`, and
+  `μ̂ = μ/‖μ‖` gives `∂q/∂μ = (μ̂̄ − (μ̂·μ̂̄) μ̂)/‖μ‖`. On the guarded branches
+  the frame terms are zero, and at `μ = 0` all of `∂q/∂μ` is.
+
+**Relation to `γ`.** It is the same family. For random `(μ, s)`, the
+canonical `γ = gamma_from_covariance(μ, V)` reproduces `loglik_lt` through
+`loglik_eta` to `2e-12` (`tests/logtangent.rs`), and conversely every
+`V(μ, γ)` has exact log-tangent coordinates. The `γ` side has two blind
+spots that the tests document:
+
+* *Exact ties* `λ_j = λ_{j+1}` of the tangent eigenvalues give a group of
+  norm 0. That erases the group's rotation, so the canonical `γ` misses a
+  generic tied `V` by `O(1)`: tied `V` are limits of the `γ` family, not
+  members.
+* *Frame-aligned shapes* (diagonal `S`): the structure of `onb` often puts
+  the canonical `γ` exactly on the singular set, where it need not
+  reproduce `V`. This happens in 20% of random cases at d = 6 and 75% at
+  d = 8.
+
+**Cost** (Apple M5 Pro, ns per call, random `η` with a full `S`;
+`examples/logtangent_bench.rs`):
+
+| d | `loglik_eta` | `loglik_eta_grad` | `loglik_lt` | `loglik_lt_grad` |
+|---|---|---|---|---|
+| 3 | 30 | 38 | 45 | 57 |
+| 4 | 41 | 65 | 154 | 200 |
+| 5 | 49 | 96 | 254 | 334 |
+| 6 | 73 | 118 | 454 | 594 |
+| 7 | 86 | 143 | 622 | 721 |
+| 8 | 102 | 167 | 878 | 1177 |
+
+The eigen-decomposition dominates. At `S = 0` it is skipped: the value then
+costs 1.1 to 1.3 times `loglik_eta`, and the value and gradient 0.8 to 1.2
+times `loglik_eta_grad`.
