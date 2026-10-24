@@ -26,6 +26,28 @@ use crate::frame::Frame;
 use crate::scalar::Scalar;
 use crate::stats::normal::{LN_2PI, norm_cdf, norm_pdf};
 
+/// `x^{1/(d−1)}`, with square and cube roots instead of `powf` where the
+/// exponent allows (d = 3, 4, 5, 7, 9). Shared by the value and gradient
+/// kernels so that both compute bit-identical values.
+#[inline]
+pub(crate) fn root_d_minus_1<S: Scalar>(x: S, d: usize) -> S {
+    match d - 1 {
+        2 => x.sqrt(),
+        3 => x.cbrt(),
+        4 => x.sqrt().sqrt(),
+        6 => x.cbrt().sqrt(),
+        8 => x.sqrt().sqrt().sqrt(),
+        k => x.powf(1.0 / k as f64),
+    }
+}
+
+/// `Φ(a)`, exactly 1 in double precision above 8.5 (the upper tail is
+/// below 1e−17 there), which saves the `erfc` call for concentrated data.
+#[inline]
+pub(crate) fn cdf_fast(a: f64) -> f64 {
+    if a > 8.5 { 1.0 } else { norm_cdf(a) }
+}
+
 /// Below this `alpha` the continued fraction is used.
 const CF_BELOW: f64 = -2.0;
 
@@ -45,7 +67,7 @@ fn cf_depth(b: f64, p: usize) -> usize {
 pub fn log_m_p_derivs(a: f64, p: usize) -> (f64, f64, f64) {
     assert!(p >= 1, "log_m_p needs p >= 1");
     if a >= CF_BELOW {
-        let cdf = norm_cdf(a);
+        let cdf = cdf_fast(a);
         let pdf = norm_pdf(a);
         let m1 = a * cdf + pdf;
         if p == 1 {
@@ -121,7 +143,7 @@ pub fn log_m_p<S: Scalar>(alpha: S, p: usize) -> S {
 pub fn log_m_p_value(a: f64, p: usize) -> f64 {
     assert!(p >= 1, "log_m_p needs p >= 1");
     if a >= CF_BELOW {
-        let cdf = norm_cdf(a);
+        let cdf = cdf_fast(a);
         let pdf = norm_pdf(a);
         let m1 = a * cdf + pdf;
         if p == 1 {
@@ -277,11 +299,7 @@ pub fn quad_form_parts<S: Scalar>(
         let e = (d - 1 - i) as i32;
         prod *= if e == 1 { k[i - 1] } else { k[i - 1].powi(e) };
     }
-    let mut inv_l = if d == 3 {
-        prod.sqrt()
-    } else {
-        prod.powf(1.0 / (d - 1) as f64)
-    };
+    let mut inv_l = root_d_minus_1(prod, d);
     let mut q = t * t;
     for j in 0..d - 1 {
         q += z[j] * z[j] * inv_l;

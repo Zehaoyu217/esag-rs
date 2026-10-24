@@ -53,6 +53,10 @@ pub trait Scalar:
     /// `self.atan2(other)` = atan2(y = self, x = other), as in `f64::atan2`.
     fn atan2(self, other: Self) -> Self;
     fn powf(self, p: f64) -> Self;
+    /// Cube root (`f64::cbrt` for `f64`).
+    fn cbrt(self) -> Self {
+        self.powf(1.0 / 3.0)
+    }
     fn powi(self, n: i32) -> Self;
     fn abs(self) -> Self;
     /// Standard normal CDF Φ(x).
@@ -106,6 +110,10 @@ impl Scalar for f64 {
     #[inline]
     fn powf(self, p: f64) -> Self {
         f64::powf(self, p)
+    }
+    #[inline]
+    fn cbrt(self) -> Self {
+        f64::cbrt(self)
     }
     #[inline]
     fn powi(self, n: i32) -> Self {

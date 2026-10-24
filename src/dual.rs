@@ -403,6 +403,14 @@ impl<const N: usize> Scalar for Dual<N> {
         self.chain(self.re.powf(p), scale)
     }
 
+    /// `d ∛x = ∛x/(3x) dx` (value from `f64::cbrt`); derivative 0 at 0.
+    #[inline]
+    fn cbrt(self) -> Self {
+        let c = self.re.cbrt();
+        let scale = if self.re == 0.0 { 0.0 } else { c / (3.0 * self.re) };
+        self.chain(c, scale)
+    }
+
     /// `d x^n = n x^(n-1) dx`; derivative 0 for `n == 0`.
     #[inline]
     fn powi(self, n: i32) -> Self {

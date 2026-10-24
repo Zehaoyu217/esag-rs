@@ -658,6 +658,21 @@ impl<const N: usize> Scalar for HDual<N> {
         self
     }
 
+    /// `f = ∛x` (value from `f64::cbrt`), `f' = f/(3x)`, `f'' = −2f'/(3x)`;
+    /// both 0 at `x == 0`.
+    #[inline]
+    fn cbrt(mut self) -> Self {
+        let x = self.re;
+        let re = x.cbrt();
+        if x == 0.0 {
+            self.flat(re);
+        } else {
+            let f1 = re / (3.0 * x);
+            self.chain_mut(re, f1, -2.0 * f1 / (3.0 * x));
+        }
+        self
+    }
+
     /// `f' = n x^{n−1}`, `f'' = n(n−1) x^{n−2}` (exactly 0 for `n = 0, 1`).
     #[inline]
     fn powi(mut self, n: i32) -> Self {

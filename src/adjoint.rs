@@ -90,7 +90,7 @@
 
 use crate::dims;
 use crate::loglik::log_m_p_derivs;
-use crate::stats::normal::{LN_2PI, norm_cdf, norm_pdf};
+use crate::stats::normal::{LN_2PI, norm_pdf};
 
 /// Log-density at the unit vector `y` for stacked `eta = (mu, gamma)`, and
 /// its exact gradient with respect to `eta`, written into `grad`, by one
@@ -331,11 +331,7 @@ fn adjoint_core(mu: &[f64], gamma: &[f64], y: &[f64], grad: &mut [f64], w: Work<
         let e = (d - 1 - i) as i32;
         prod *= if e == 1 { k[i - 1] } else { k[i - 1].powi(e) };
     }
-    let mut inv_l = if d == 3 {
-        prod.sqrt()
-    } else {
-        prod.powf(1.0 / (d - 1) as f64)
-    };
+    let mut inv_l = crate::loglik::root_d_minus_1(prod, d);
     let mut q = t * t;
     let mut wsum = 0.0;
     for j in 0..d - 1 {
@@ -447,7 +443,7 @@ const CF_BELOW: f64 = -2.0;
 fn log_m_p_d1(a: f64, p: usize) -> (f64, f64) {
     debug_assert!(p >= 2);
     if a >= CF_BELOW {
-        let cdf = norm_cdf(a);
+        let cdf = crate::loglik::cdf_fast(a);
         let pdf = norm_pdf(a);
         let m1 = a * cdf + pdf;
         // M_{k−1}, M_k

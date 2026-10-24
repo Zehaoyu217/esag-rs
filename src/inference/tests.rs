@@ -249,7 +249,11 @@ pub fn hypothesis_test(
     let mut cfg0 = refit_config(fit_full);
     cfg0.mask = Some(mask0.clone());
     cfg0.precondition = None;
-    let cfg_a = refit_config(fit_full);
+    let mut cfg_a = refit_config(fit_full);
+    // full refits start far from the original full optimum (restricted fit
+    // plus small extras, or the original fit on null data), where its
+    // observed information is a poor metric
+    cfg_a.precondition = None;
     let fit0 = {
         // once, with its observed information (the preconditioner below)
         let mut once = cfg0.clone();
