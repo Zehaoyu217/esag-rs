@@ -1,6 +1,6 @@
 use esag::distribution::Esag;
 use esag::logtangent::{LtFrame, covariance};
-use esag::penalized::{Method, PenalizedEsag};
+use esag::penalized::{Grouping, PenalizedEsag};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -33,7 +33,7 @@ fn main() {
         let y = dist.sample(n, &mut rng);
         let x = DMatrix::<f64>::zeros(n, 0);
         let t = Instant::now();
-        let path = PenalizedEsag::new(Method::EigenGap).fit(&x, &y).unwrap();
+        let path = PenalizedEsag::eigen_gap().fit(&x, &y).unwrap();
         let b = path.best();
         println!(
             "EigenGap iid n={n}: {:.0} ms, selected λ={:.3}, active gaps {:?} (truth: [true,false,false,false]), df={}, conv={}",
@@ -44,7 +44,7 @@ fn main() {
             b.converged
         );
         let t = Instant::now();
-        let path = PenalizedEsag::new(Method::Isotropy).fit(&x, &y).unwrap();
+        let path = PenalizedEsag::isotropy().fit(&x, &y).unwrap();
         println!(
             "Isotropy iid n={n}: {:.0} ms, selected active {:?}",
             t.elapsed().as_secs_f64() * 1e3,
@@ -54,7 +54,7 @@ fn main() {
     // isotropic data
     let iso = Esag::new(&mu, &vec![0.0; esag::dims::gamma_len(d)]).unwrap();
     let y = iso.sample(300, &mut rng);
-    let path = PenalizedEsag::new(Method::Isotropy)
+    let path = PenalizedEsag::isotropy()
         .fit(&DMatrix::<f64>::zeros(300, 0), &y)
         .unwrap();
     println!(
@@ -116,12 +116,10 @@ fn main() {
             }
         }
         let t = Instant::now();
-        let path = PenalizedEsag::new(Method::Drivers {
-            mean: true,
-            shape: true,
-        })
-        .fit(&x, &y)
-        .unwrap();
+        let path = PenalizedEsag::adaptive_group_lasso()
+            .grouping(Grouping::CovariatePart)
+            .fit(&x, &y)
+            .unwrap();
         let best = path.best();
         let names: Vec<String> = (1..=pdrv)
             .flat_map(|j| [format!("x{j}.mu"), format!("x{j}.shape")])

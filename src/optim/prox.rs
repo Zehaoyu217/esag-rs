@@ -93,6 +93,63 @@ impl PenaltyAtoms for GroupNorms {
     }
 }
 
+/// Sparse-group atoms over disjoint groups: first one `‖θ_G‖₂` per group,
+/// then one `|θ_i|` per member (in group order). With weights
+/// `(1−α)w_G` and `αw_i` this is the sparse group LASSO; its prox is exact:
+/// soft-threshold the entries, then block-soft-threshold each group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SparseGroupNorms {
+    pub groups: Vec<Vec<usize>>,
+}
+
+impl SparseGroupNorms {
+    /// Index of the first entry atom.
+    fn n_groups(&self) -> usize {
+        self.groups.len()
+    }
+}
+
+impl PenaltyAtoms for SparseGroupNorms {
+    fn len(&self) -> usize {
+        self.groups.len() + self.groups.iter().map(Vec::len).sum::<usize>()
+    }
+    fn atoms(&self, theta: &[f64], out: &mut [f64]) {
+        let mut e = self.n_groups();
+        for (o, g) in out.iter_mut().zip(&self.groups) {
+            *o = g.iter().map(|&i| theta[i] * theta[i]).sum::<f64>().sqrt();
+        }
+        for g in &self.groups {
+            for &i in g {
+                out[e] = theta[i].abs();
+                e += 1;
+            }
+        }
+    }
+    fn prox(&self, v: &mut [f64], t: &[f64]) {
+        let mut e = self.n_groups();
+        for (gi, g) in self.groups.iter().enumerate() {
+            for &i in g {
+                let te = t[e];
+                e += 1;
+                v[i] = if !(te < v[i].abs()) {
+                    0.0
+                } else {
+                    v[i] - te.copysign(v[i])
+                };
+            }
+            let nrm = g.iter().map(|&i| v[i] * v[i]).sum::<f64>().sqrt();
+            let tg = t[gi];
+            let scale = if !(tg < nrm) { 0.0 } else { 1.0 - tg / nrm };
+            for &i in g {
+                v[i] *= scale;
+            }
+        }
+    }
+    fn support(&self) -> Vec<usize> {
+        self.groups.iter().flatten().copied().collect()
+    }
+}
+
 /// `φ_j = σ_(j+1) − σ_(j)`: gaps between the sorted eigenvalues of the
 /// traceless symmetric `p × p` matrix `S` whose log-tangent coordinates
 /// ([`crate::logtangent::s_to_matrix`]) are `θ[offset .. offset + s_len]`.
@@ -885,6 +942,38 @@ mod tests {
             let fd = (pen.value(&tp) - pen.value(&tm)) / (2.0 * h);
             assert!((fd - g[i]).abs() < 1e-7, "i={i}: fd {fd} vs {}", g[i]);
         }
+    }
+
+    #[test]
+    fn sparse_group_prox_matches_brute_force() {
+        let sg = SparseGroupNorms {
+            groups: vec![vec![0, 1, 2], vec![3, 4]],
+        };
+        let v0 = [1.2, -0.3, 0.05, 0.4, -0.2];
+        let t = [0.3, 0.6, 0.1, 0.1, 0.1, 0.05, 0.05];
+        let mut v = v0.to_vec();
+        sg.prox(&mut v, &t);
+        let obj = |z: &[f64]| {
+            let mut a = vec![0.0; 7];
+            sg.atoms(z, &mut a);
+            0.5 * z.iter().zip(&v0).map(|(x, y)| (x - y).powi(2)).sum::<f64>()
+                + a.iter().zip(&t).map(|(x, y)| x * y).sum::<f64>()
+        };
+        let best = obj(&v);
+        let mut seed = 5u64;
+        for _ in 0..20000 {
+            let mut w = v.clone();
+            for x in w.iter_mut() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *x += ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 0.05;
+            }
+            assert!(obj(&w) >= best - 1e-12);
+        }
+        // the second group is zeroed as a whole, the third entry by the L1 part
+        assert_eq!(&v[3..], &[0.0, 0.0]);
+        assert_eq!(v[2], 0.0);
     }
 
     #[test]

@@ -14,8 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use esag::FastRng;
 use esag::distribution::Esag;
 use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region};
-use esag::optim::prox::RocMode;
-use esag::penalized::{CvScore, LambdaGrid, Method, PenalizedEsag, Selection, Weighting};
+use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, Target};
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
@@ -85,30 +84,46 @@ enum ShapeKind {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum PenaltyKind {
-    /// log-tangent: all shape coefficients as one group (isotropy)
-    Isotropy,
-    /// log-tangent, i.i.d.: gaps between eigenvalues of S (partial isotropy)
-    EigenGap,
-    /// log-tangent regression: per-covariate mean and shape groups
-    Drivers,
-    /// log-tangent regression: per-covariate mean groups only
-    DriversMean,
-    /// log-tangent regression: per-covariate shape groups only
-    DriversShape,
-    /// the paper's LASSO on gamma (reproduction mode, i.i.d.)
+    /// L1 on each target coefficient
     Lasso,
-    /// the paper's group LASSO on gamma_(j) (reproduction mode, i.i.d.)
+    /// LASSO with adaptive weights (r = 1 unless --r)
+    AdaptiveLasso,
+    /// L2 norm per group (--groups)
     GroupLasso,
+    /// group LASSO with adaptive weights
+    AdaptiveGroupLasso,
+    /// mixture of group and L1 penalties (--l1-ratio)
+    SparseGroupLasso,
+    /// all shape coefficients as one group (isotropy)
+    Isotropy,
+    /// i.i.d.: ties between the eigenvalues of the shape
+    EigenGap,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum WeightKind {
-    Plain,
-    Adaptive,
-    /// ratio of concentration, fixed point (i.i.d.)
-    Roc,
-    /// ratio of concentration inside the objective, as in the paper (i.i.d.)
-    RocJoint,
+enum TargetKind {
+    /// every slope
+    Slopes,
+    /// the mean-direction slopes
+    Mean,
+    /// the shape slopes
+    ShapeSlopes,
+    /// every shape coefficient (intercept included)
+    Shape,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupKind {
+    /// one group per covariate
+    Covariate,
+    /// per covariate: its mean slopes and its shape slopes
+    CovariatePart,
+    /// one group per parameter row
+    Parameter,
+    /// all target coefficients together
+    All,
+    /// the paper's gamma groups (gamma shape)
+    Gamma,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -203,10 +218,26 @@ enum Cmd {
         y: String,
         #[arg(long, default_value = "")]
         x: String,
+        #[arg(long, value_enum, default_value = "adaptive-lasso")]
+        penalty: PenaltyKind,
+        /// Which coefficients to penalize (default: the preset's).
         #[arg(long, value_enum)]
-        method: PenaltyKind,
-        #[arg(long, value_enum, default_value = "adaptive")]
-        weights: WeightKind,
+        target: Option<TargetKind>,
+        /// How to group them (group and sparse-group LASSO).
+        #[arg(long, value_enum)]
+        groups: Option<GroupKind>,
+        /// L1 share of the sparse group LASSO.
+        #[arg(long, default_value_t = 0.5)]
+        l1_ratio: f64,
+        /// Adaptive exponent r (weights ‖θ̃‖^-r); 0 = plain weights.
+        #[arg(long)]
+        r: Option<f64>,
+        #[arg(long, value_enum, default_value = "log-tangent")]
+        shape: ShapeKind,
+        /// Reproduce one of the paper's six methods as coded in its R scripts
+        /// (LASSO, aLASSO, RoC-LASSO, GLASSO, aGLASSO, RoC-GLASSO; i.i.d.).
+        #[arg(long)]
+        paper: Option<String>,
         #[arg(long, value_enum, default_value = "bic")]
         select: SelectKind,
         /// Use the paper's grid 0, 0.5, 1, 2, ..., 256 (default: automatic).
@@ -339,6 +370,7 @@ fn run() -> Res<()> {
             let t0 = Instant::now();
             let fit = EsagRegressor::new()
                 .with_feature_names(names)
+                .with_response_names(split_cols(&y))
                 .with_restarts(restarts, 0)
                 .with_shape(match shape {
                     ShapeKind::Gamma => Shape::Gamma,
@@ -434,105 +466,79 @@ fn run() -> Res<()> {
             };
             let t0 = Instant::now();
             let r = hypothesis_test(&fit, &xm, &ym, restriction, boot, mc, seed)?;
-            outln!(
-                "restricted log-lik {:.4}, full log-lik {:.4}, df {}",
-                r.loglik_restricted,
-                r.loglik_full,
-                r.df
-            );
-            outln!("{:<6}{:>12}{:>12}", "stat", "value", "p (boot)");
-            outln!("{:<6}{:>12.4}{:>12.3}", "RoC", r.roc, r.p_roc);
-            outln!("{:<6}{:>12.4}{:>12.3}", "D", r.d_stat, r.p_d);
-            outln!("{:<6}{:>12.5}{:>12.3}", "M", r.m_stat, r.p_m);
-            outln!(
-                "{:<6}{:>12.4}{:>12.3}   (chi-square approx p {:.2e})",
-                "LR",
-                r.lr,
-                r.p_lr,
-                r.p_lr_chisq
-            );
-            outln!(
-                "{} bootstrap replicates ({} failed), {:.1} s",
-                r.n_boot,
-                r.n_failed,
-                t0.elapsed().as_secs_f64()
-            );
+            outln!("{}", r.summary());
+            outln!("{:.2} s", t0.elapsed().as_secs_f64());
         }
         Cmd::Penalize {
             data,
             y,
             x,
-            method,
-            weights,
+            penalty,
+            target,
+            groups,
+            l1_ratio,
+            r,
+            shape,
+            paper,
             select,
             paper_grid,
             folds,
             seed,
         } => {
             let (xm, ym, names) = load_xy(&data, &y, &x)?;
-            let m = match method {
-                PenaltyKind::Isotropy => Method::Isotropy,
-                PenaltyKind::EigenGap => Method::EigenGap,
-                PenaltyKind::Drivers => Method::Drivers {
-                    mean: true,
-                    shape: true,
-                },
-                PenaltyKind::DriversMean => Method::Drivers {
-                    mean: true,
-                    shape: false,
-                },
-                PenaltyKind::DriversShape => Method::Drivers {
-                    mean: false,
-                    shape: true,
-                },
-                PenaltyKind::Lasso => Method::PaperLasso,
-                PenaltyKind::GroupLasso => Method::PaperGroupLasso,
+            let mut est = match &paper {
+                Some(name) => PenalizedEsag::paper(name)?,
+                None => {
+                    let mut e = match penalty {
+                        PenaltyKind::Lasso => PenalizedEsag::lasso(),
+                        PenaltyKind::AdaptiveLasso => PenalizedEsag::adaptive_lasso(),
+                        PenaltyKind::GroupLasso => PenalizedEsag::group_lasso(),
+                        PenaltyKind::AdaptiveGroupLasso => PenalizedEsag::adaptive_group_lasso(),
+                        PenaltyKind::SparseGroupLasso => {
+                            PenalizedEsag::sparse_group_lasso(l1_ratio)
+                        }
+                        PenaltyKind::Isotropy => PenalizedEsag::isotropy(),
+                        PenaltyKind::EigenGap => PenalizedEsag::eigen_gap(),
+                    };
+                    if let Some(t) = target {
+                        e = e.target(match t {
+                            TargetKind::Slopes => Target::Slopes,
+                            TargetKind::Mean => Target::MeanSlopes,
+                            TargetKind::ShapeSlopes => Target::ShapeSlopes,
+                            TargetKind::Shape => Target::Shape,
+                        });
+                    }
+                    if let Some(g) = groups {
+                        e = e.grouping(match g {
+                            GroupKind::Covariate => Grouping::Covariate,
+                            GroupKind::CovariatePart => Grouping::CovariatePart,
+                            GroupKind::Parameter => Grouping::Parameter,
+                            GroupKind::All => Grouping::All,
+                            GroupKind::Gamma => Grouping::GammaGroups,
+                        });
+                    }
+                    if let Some(r) = r {
+                        e = if r == 0.0 { e.plain() } else { e.adaptive(r) };
+                    }
+                    e.shape(match shape {
+                        ShapeKind::Gamma => Shape::Gamma,
+                        ShapeKind::LogTangent => Shape::LogTangent,
+                    })
+                }
             };
-            let w = match weights {
-                WeightKind::Plain => Weighting::Plain,
-                WeightKind::Adaptive => Weighting::Adaptive,
-                WeightKind::Roc => Weighting::RoC(RocMode::FixedPoint),
-                WeightKind::RocJoint => Weighting::RoC(RocMode::Joint),
+            est = match select {
+                SelectKind::Bic => est.bic(),
+                SelectKind::Aic => est.aic(),
+                SelectKind::Cv => est.cv(folds, seed),
             };
-            let sel = match select {
-                SelectKind::Bic => Selection::Bic,
-                SelectKind::Aic => Selection::Aic,
-                SelectKind::Cv => Selection::CrossValidation {
-                    folds,
-                    seed,
-                    score: CvScore::LogLikelihood,
-                },
-            };
-            let mut est = PenalizedEsag::new(m).with_weighting(w).with_selection(sel);
             if paper_grid {
                 est = est.with_grid(LambdaGrid::Paper);
             }
+            est = est.feature_names(names).response_names(split_cols(&y));
             let t0 = Instant::now();
             let path = est.fit(&xm, &ym)?;
+            outln!("{}", path.path_summary());
             outln!("{}", path.summary());
-            if let Method::Drivers { mean, shape } = m {
-                let mut labels = vec![];
-                for nm in &names {
-                    if mean {
-                        labels.push(format!("{nm}.mean"));
-                    }
-                    if shape {
-                        labels.push(format!("{nm}.shape"));
-                    }
-                }
-                let kept: Vec<&String> = labels
-                    .iter()
-                    .zip(&path.best().active)
-                    .filter(|(_, a)| **a)
-                    .map(|(l, _)| l)
-                    .collect();
-                outln!("selected drivers: {kept:?}");
-            }
-            if let Some(r) = &path.relaxed {
-                outln!("relaxed refit at the selected lambda:\n{}", r.summary());
-            } else {
-                outln!("selected coefficients:\n{:.4}", path.best().coef);
-            }
             outln!(
                 "path of {} lambdas in {:.2} s",
                 path.points.len(),

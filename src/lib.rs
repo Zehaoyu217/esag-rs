@@ -28,6 +28,7 @@ pub mod hdual;
 pub mod inference;
 pub mod loglik;
 pub mod logtangent;
+pub mod model;
 pub mod onb;
 pub mod optim;
 pub mod param;
@@ -37,6 +38,7 @@ pub mod regression;
 pub mod rotation;
 pub mod scalar;
 pub mod stats;
+pub(crate) mod summary;
 
 pub use scalar::Scalar;
 

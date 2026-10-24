@@ -16,7 +16,6 @@
 use super::refit_config;
 use crate::distribution::second_moment_diag_from_frame;
 use crate::error::{EsagError, Result};
-use crate::frame::Frame;
 use crate::regression::{
     EsagRegressorFit, Shape, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
 };
@@ -43,6 +42,9 @@ pub enum Restriction {
 /// Results of a bootstrap hypothesis test.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HypothesisTestResult {
+    /// The null hypothesis, in words.
+    #[serde(default)]
+    pub null: String,
     /// Observed statistics.
     pub roc: f64,
     pub d_stat: f64,
@@ -65,10 +67,82 @@ pub struct HypothesisTestResult {
     pub coef_restricted: DMatrix<f64>,
     pub n_boot: usize,
     pub n_failed: usize,
+    /// Replicates whose restricted or full refit did not pass the
+    /// convergence check (their statistics are still used; for the gamma
+    /// shape at d >= 5 with covariates the likelihood has cliffs, see
+    /// `docs/MATH.md`).
+    #[serde(default)]
+    pub n_unconverged: usize,
     pub boot_roc: Vec<f64>,
     pub boot_d: Vec<f64>,
     pub boot_m: Vec<f64>,
     pub boot_lr: Vec<f64>,
+}
+
+/// One bootstrap replicate: RoC, D, M, LR, and whether both refits converged.
+type Replicate = (f64, f64, f64, f64, bool);
+
+fn restriction_label(fit: &EsagRegressorFit, r: &Restriction) -> String {
+    let name = |j: usize| {
+        let off = usize::from(fit.fit_intercept);
+        fit.column_names
+            .get(j + off)
+            .cloned()
+            .unwrap_or_else(|| format!("x{}", j + 1))
+    };
+    match r {
+        Restriction::Isotropy => "isotropy (shape = 0)".into(),
+        Restriction::MuOfFeature(j) => format!("mu free of {}", name(*j)),
+        Restriction::GammaOfFeature(j) => format!("shape free of {}", name(*j)),
+        Restriction::Feature(j) => format!("no effect of {}", name(*j)),
+        Restriction::Custom(_) => "custom restriction".into(),
+    }
+}
+
+impl HypothesisTestResult {
+    /// statsmodels-style summary: the null, the fits, and each statistic
+    /// with its bootstrap p-value (and the χ² approximation for LR).
+    pub fn summary(&self) -> String {
+        use crate::summary::{WIDTH, header, num};
+        use std::fmt::Write as _;
+        let left = vec![
+            ("Null hypothesis:".to_string(), self.null.clone()),
+            (
+                "Restricted log-lik:".to_string(),
+                num(self.loglik_restricted),
+            ),
+            ("Full log-lik:".to_string(), num(self.loglik_full)),
+        ];
+        let right = vec![
+            ("Bootstrap replicates:".to_string(), self.n_boot.to_string()),
+            (
+                "Failed / unconverged:".to_string(),
+                format!("{} / {}", self.n_failed, self.n_unconverged),
+            ),
+            ("Restricted df:".to_string(), self.df.to_string()),
+        ];
+        let mut s = header("ESAG Bootstrap Hypothesis Test", &left, &right);
+        let _ = writeln!(s, "{}", "=".repeat(WIDTH));
+        let _ = writeln!(
+            s,
+            "{:<10}{:>16}{:>18}{:>22}",
+            "", "statistic", "P (bootstrap)", "P (asymptotic)"
+        );
+        let _ = writeln!(s, "{}", "-".repeat(WIDTH));
+        let _ = writeln!(s, "{:<10}{:>16.6}{:>18.3}", "RoC", self.roc, self.p_roc);
+        let _ = writeln!(s, "{:<10}{:>16.6}{:>18.3}", "D", self.d_stat, self.p_d);
+        let _ = writeln!(s, "{:<10}{:>16.4e}{:>18.3}", "M", self.m_stat, self.p_m);
+        let _ = writeln!(
+            s,
+            "{:<10}{:>16.4}{:>18.3}{:>22}",
+            "LR",
+            self.lr,
+            self.p_lr,
+            format!("{:.3e} (chi2_{})", self.p_lr_chisq, self.df)
+        );
+        let _ = writeln!(s, "{}", "=".repeat(WIDTH));
+        s
+    }
 }
 
 fn restriction_mask(fit: &EsagRegressorFit, r: &Restriction) -> Result<DMatrix<bool>> {
@@ -163,13 +237,7 @@ fn moment_stat(
         let lt = fit0.lt_frame();
         let one = |i: usize| -> Vec<f64> {
             let row: Vec<f64> = (0..bd).map(|k| eta[(i, k)]).collect();
-            let frame = match &lt {
-                None => Frame::new(&row[..d], &row[d..]),
-                Some(_) => fit0
-                    .distribution_at(&row, lt.as_ref())
-                    .expect("valid log-tangent parameters")
-                    .frame(),
-            };
+            let frame = fit0.frame_at(&row, lt.as_ref());
             let ey2 = second_moment_diag_from_frame(&frame);
             (0..d).map(|k| y[(i, k)].powi(2) - ey2[k]).collect()
         };
@@ -250,10 +318,14 @@ pub fn hypothesis_test(
     cfg0.mask = Some(mask0.clone());
     cfg0.precondition = None;
     let mut cfg_a = refit_config(fit_full);
-    // full refits start far from the original full optimum (restricted fit
-    // plus small extras, or the original fit on null data), where its
-    // observed information is a poor metric
-    cfg_a.precondition = None;
+    // Full refits on null data start at the restricted refit (extra
+    // coefficients at 0) and end near it, not near the original full
+    // optimum: precondition them with the full model's observed information
+    // at the restricted fit. Not for gamma when the null zeroes every shape
+    // coefficient: gamma = 0 is a cone of the parameterization, without a
+    // Hessian.
+    let shape_zeroed = (d..mask0.nrows()).all(|k| (0..mask0.ncols()).all(|j| !mask0[(k, j)]));
+    let gamma_cone = fit_full.config.shape == Shape::Gamma && shape_zeroed;
     let fit0 = {
         // once, with its observed information (the preconditioner below)
         let mut once = cfg0.clone();
@@ -270,6 +342,20 @@ pub fn hypothesis_test(
         .cov_params
         .as_ref()
         .and_then(crate::regression::precondition_from_cov);
+    cfg_a.precondition = if gamma_cone {
+        None
+    } else {
+        cfg_a.precondition_at(x, y, &fit0.coef, &fit_full.mask)
+    };
+    // extra coefficients start at their null value 0 (just off it for gamma,
+    // whose likelihood is not differentiable at zero groups)
+    let extra_start = |k: usize| {
+        if k < d || fit_full.config.shape == Shape::LogTangent {
+            0.0
+        } else {
+            1e-3
+        }
+    };
 
     let eta0 = fit0.linear_predictor(x)?;
     let eta_a = fit_full.linear_predictor(x)?;
@@ -277,18 +363,18 @@ pub fn hypothesis_test(
     let m_stat = moment_stat(&fit0, x, y, n_mc, seed, 0, true)?;
     let lr = -2.0 * (fit0.log_likelihood - fit_full.log_likelihood);
 
-    let boot: Vec<Option<(f64, f64, f64, f64)>> = (0..n_boot)
+    let boot: Vec<Option<Replicate>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
             let mut rng = crate::stream_rng(seed, crate::streams::TEST_BOOT, b as u64);
             let yb = fit0.sample_responses(x, &mut rng).ok()?;
             let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
-            // full-model start: restricted MLE, with the restricted mu entries
-            // set to 1 (the R code's recommendation) and gamma entries small
+            // full-model start: the restricted refit with the extra coefficients
+            // at their null value (see `extra_start`)
             let mut ba = f0.coef.clone();
             for &(k, j) in &fit_full.free {
                 if !mask0[(k, j)] {
-                    ba[(k, j)] = if k < d { 1.0 } else { 1e-3 };
+                    ba[(k, j)] = extra_start(k);
                 }
             }
             // full refit: best of two starts (from the restricted refit, and
@@ -323,7 +409,7 @@ pub fn hypothesis_test(
             // sequential: replicates already run in parallel
             let m = moment_stat(&f0, x, &yb, n_mc, seed, 1 + b as u64, n_mc > 0).ok()?;
             let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
-            Some((r, dd, m, l))
+            Some((r, dd, m, l, f0.converged && fa.converged))
         })
         .collect();
 
@@ -332,9 +418,11 @@ pub fn hypothesis_test(
     let mut bm = vec![];
     let mut bl = vec![];
     let mut n_failed = 0;
+    let mut n_unconverged = 0;
     for r in boot {
         match r {
-            Some((a, b, c, e)) => {
+            Some((a, b, c, e, ok)) => {
+                n_unconverged += usize::from(!ok);
                 br.push(a);
                 bd.push(b);
                 bm.push(c);
@@ -345,7 +433,9 @@ pub fn hypothesis_test(
     }
     let nb = br.len().max(1) as f64;
     let pv = |obs: f64, v: &[f64]| v.iter().filter(|&&s| obs < s).count() as f64 / nb;
+    let null = restriction_label(fit_full, &restriction);
     Ok(HypothesisTestResult {
+        null,
         roc,
         d_stat,
         m_stat,
@@ -361,6 +451,7 @@ pub fn hypothesis_test(
         coef_restricted: fit0.coef,
         n_boot: br.len(),
         n_failed,
+        n_unconverged,
         boot_roc: br,
         boot_d: bd,
         boot_m: bm,

@@ -115,6 +115,9 @@ pub struct EsagRegressor {
     /// Shape parameterization (default [`Shape::Gamma`]).
     #[serde(default)]
     pub shape: Shape,
+    /// Optional response (column) names for `summary()`.
+    #[serde(default)]
+    pub response_names: Option<Vec<String>>,
     /// Reference direction of the log-tangent frame (`Shape::LogTangent`);
     /// `None` = the sample mean direction of `Y`. A fitted model records the
     /// direction it used, so refits keep the same frame.
@@ -152,6 +155,7 @@ impl EsagRegressor {
             mask: None,
             feature_names: None,
             shape: Shape::Gamma,
+            response_names: None,
             lt_reference: None,
             precondition: None,
         }
@@ -203,6 +207,11 @@ impl EsagRegressor {
         self
     }
     /// Feature names (length = number of columns of `X`, excluding intercept).
+    pub fn with_response_names(mut self, names: Vec<String>) -> Self {
+        self.response_names = Some(names);
+        self
+    }
+
     pub fn with_shape(mut self, shape: Shape) -> Self {
         self.shape = shape;
         self
@@ -321,7 +330,10 @@ impl EsagRegressor {
         let mask = self.resolve_mask(&data)?;
         let free = free_params(&mask);
         let raw = self.optimize(&data, b0, &free, self.max_iter);
-        if raw.converged || self.max_iter == 0 {
+        // the R-style restart rescues warm starts at low dimension; for
+        // gamma at d >= 5 with covariates it does not converge either
+        let retry = data.d <= 4 || data.p == 0 || data.lt.is_some();
+        if raw.converged || self.max_iter == 0 || !retry {
             return self.finalize(&data, raw, mask);
         }
         // Safety net (used by every bootstrap refit): a warm start that ends
@@ -786,7 +798,7 @@ impl EsagRegressor {
     fn param_column_names(&self, data: &RegressionData) -> Vec<String> {
         let mut names = Vec::with_capacity(data.p_total);
         if self.fit_intercept {
-            names.push("(Intercept)".to_string());
+            names.push("const".to_string());
         }
         for j in 0..data.p {
             let nm = self
@@ -1159,6 +1171,32 @@ impl Objective for Whitened<'_> {
 
     fn should_stop(&self) -> bool {
         self.inner.should_stop()
+    }
+}
+
+impl EsagRegressor {
+    /// The refit preconditioner at coefficients `b`: the Cholesky factor of
+    /// the inverse observed information over the free entries of `mask`, if
+    /// the information is positive definite there.
+    pub(crate) fn precondition_at(
+        &self,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        b: &DMatrix<f64>,
+        mask: &DMatrix<bool>,
+    ) -> Option<Arc<DMatrix<f64>>> {
+        let data = self.data(x, y).ok()?;
+        let free = free_params(mask);
+        let (_, _, h) = joint_loglik_grad_hess(&data, b, true);
+        let (bd, full) = (data.b_dim, data.b_dim * data.p_total);
+        let nf = free.len();
+        let info = DMatrix::from_fn(nf, nf, |a, c| {
+            let (ka, ja) = free[a];
+            let (kc, jc) = free[c];
+            -h[(ja * bd + ka) * full + jc * bd + kc]
+        });
+        let cov = info.cholesky()?.inverse();
+        precondition_from_cov(&cov)
     }
 }
 
@@ -1625,6 +1663,17 @@ impl EsagRegressorFit {
             .collect()
     }
 
+    /// The eigen-frame of `V` for one linear predictor `eta` (pass
+    /// `self.lt_frame()` for log-tangent fits): cheaper than building an
+    /// [`Esag`] for sampling, moments and residuals.
+    pub fn frame_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Frame<f64> {
+        let d = self.d;
+        match lt {
+            None => Frame::new(&eta[..d], &eta[d..]),
+            Some(fr) => crate::logtangent::eigen_frame(fr, &eta[..d], &eta[d..]),
+        }
+    }
+
     /// The log-tangent frame of a `Shape::LogTangent` fit.
     pub fn lt_frame(&self) -> Option<LtFrame> {
         match (self.config.shape, &self.config.lt_reference) {
@@ -1689,10 +1738,7 @@ impl EsagRegressorFit {
         let mut t1 = Vec::with_capacity(data.n);
         for i in 0..data.n {
             let e: Vec<f64> = (0..self.b_dim()).map(|k| eta[(i, k)]).collect();
-            let frame = match &lt {
-                None => Frame::new(&e[..d], &e[d..]),
-                Some(_) => self.distribution_at(&e, lt.as_ref())?.frame(),
-            };
+            let frame = self.frame_at(&e, lt.as_ref());
             let yi = &data.y[i * d..(i + 1) * d];
             let qi = residual_q(&frame, yi);
             let s: f64 = frame.lambda.iter().sum();
@@ -1709,12 +1755,18 @@ impl EsagRegressorFit {
         x: &DMatrix<f64>,
         rng: &mut R,
     ) -> Result<DMatrix<f64>> {
-        let dists = self.predict_distribution(x)?;
+        let eta = self.linear_predictor(x)?;
+        let lt = self.lt_frame();
         let d = self.d;
         let mut out = DMatrix::zeros(x.nrows(), d);
         let mut buf = vec![0.0; d];
-        for (i, dist) in dists.iter().enumerate() {
-            dist.sampler().sample_into(rng, &mut buf);
+        let mut row = vec![0.0; eta.ncols()];
+        for i in 0..x.nrows() {
+            for (k, r) in row.iter_mut().enumerate() {
+                *r = eta[(i, k)];
+            }
+            let frame = self.frame_at(&row, lt.as_ref());
+            crate::distribution::Sampler::from_frame(&row[..d], &frame).sample_into(rng, &mut buf);
             for k in 0..d {
                 out[(i, k)] = buf[k];
             }
@@ -1754,76 +1806,150 @@ impl EsagRegressorFit {
             .collect()
     }
 
-    /// A statsmodels-style text summary: coefficient table with standard
-    /// errors, z-values and two-sided p-values.
-    pub fn summary(&self) -> String {
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        let _ = writeln!(
-            s,
-            "ESAG regression (d = {}, n = {}, p = {} covariate(s){})",
-            self.d,
-            self.n_obs,
-            self.n_features,
-            if self.fit_intercept {
-                " + intercept"
+    /// Coefficients `B` (`b_dim × p_total`; rows `row_names()`, columns
+    /// `column_names`), as statsmodels' `params`.
+    pub fn params(&self) -> &DMatrix<f64> {
+        &self.coef
+    }
+    /// Standard errors (`NaN` where fixed or unavailable), statsmodels' `bse`.
+    pub fn bse(&self) -> DMatrix<f64> {
+        self.std_errors()
+            .unwrap_or_else(|| DMatrix::from_element(self.b_dim(), self.p_total(), f64::NAN))
+    }
+    /// z statistics `coef / se` (statsmodels' `tvalues` for these models).
+    pub fn zvalues(&self) -> DMatrix<f64> {
+        self.coef.zip_map(&self.bse(), |c, s| c / s)
+    }
+    /// Two-sided normal p-values of the z statistics.
+    pub fn pvalues(&self) -> DMatrix<f64> {
+        self.zvalues().map(|z| {
+            if z.is_finite() {
+                2.0 * norm_sf(z.abs())
             } else {
-                ""
+                f64::NAN
             }
-        );
-        let _ = writeln!(
-            s,
-            "log-likelihood = {:.4}   AIC = {:.3}   BIC = {:.3}   params = {}",
-            self.log_likelihood,
-            self.aic(),
-            self.bic(),
-            self.n_params()
-        );
-        let _ = writeln!(
-            s,
-            "optimiser: {:?}, {} iterations, {} evaluations, |grad|_inf = {:.2e}",
-            self.status, self.n_iter, self.n_fev, self.grad_norm
-        );
-        let se = self.std_errors();
-        let rows = self.row_names();
-        let _ = writeln!(
-            s,
-            "{:<22}{:>12}{:>12}{:>9}{:>10}",
-            "parameter", "estimate", "std.err", "z", "p>|z|"
-        );
-        let _ = writeln!(s, "{}", "-".repeat(65));
-        for j in 0..self.p_total() {
-            let _ = writeln!(s, "[{}]", self.column_names[j]);
-            for k in 0..self.b_dim() {
-                let est = self.coef[(k, j)];
-                if !self.mask[(k, j)] {
-                    let _ = writeln!(
-                        s,
-                        "  {:<20}{:>12.5}{:>12}{:>9}{:>10}",
-                        rows[k], est, "(fixed)", "", ""
-                    );
-                    continue;
+        })
+    }
+    /// `(lower, upper)` Wald confidence limits at level `1 − alpha`.
+    pub fn conf_int(&self, alpha: f64) -> (DMatrix<f64>, DMatrix<f64>) {
+        let q = crate::stats::normal::norm_quantile(1.0 - alpha / 2.0);
+        let se = self.bse();
+        (
+            self.coef.zip_map(&se, |c, s| c - q * s),
+            self.coef.zip_map(&se, |c, s| c + q * s),
+        )
+    }
+    /// Maximised log-likelihood (statsmodels' `llf`).
+    pub fn llf(&self) -> f64 {
+        self.log_likelihood
+    }
+    /// Number of observations.
+    pub fn nobs(&self) -> usize {
+        self.n_obs
+    }
+    /// Number of estimated parameters.
+    pub fn df_model(&self) -> usize {
+        self.n_params()
+    }
+    /// `nobs − df_model`.
+    pub fn df_resid(&self) -> f64 {
+        self.n_obs as f64 - self.n_params() as f64
+    }
+
+    /// statsmodels-style summary with 95% intervals (see [`Self::summary_alpha`]).
+    pub fn summary(&self) -> String {
+        self.summary_alpha(0.05)
+    }
+
+    /// statsmodels-style summary: a header block (model, data, fit
+    /// statistics) and one coefficient block per parameter row of `B`, each
+    /// listing the design columns with coef, std err, z, P>|z| and the
+    /// `1 − alpha` confidence interval.
+    pub fn summary_alpha(&self, alpha: f64) -> String {
+        self.summary_titled("ESAG Regression Results", "MLE", alpha, &[], "(fixed)")
+    }
+
+    /// The summary with a custom title, method label and extra header rows.
+    pub(crate) fn summary_titled(
+        &self,
+        title: &str,
+        method: &str,
+        alpha: f64,
+        extra: &[(String, String)],
+        fixed_note: &'static str,
+    ) -> String {
+        use crate::summary::{CoefRow, coef_blocks, header, num, utc_date_time};
+        let (date, time) = utc_date_time();
+        let dep = match &self.config.response_names {
+            Some(v) if v.len() == self.d => v.join(", "),
+            _ => format!("y (S^{})", self.d - 1),
+        };
+        let dep = if dep.len() > 24 {
+            format!("{}…", &dep[..23])
+        } else {
+            dep
+        };
+        let shape = match self.config.shape {
+            Shape::Gamma => "gamma",
+            Shape::LogTangent => "log-tangent",
+        };
+        let mut left = vec![
+            ("Dep. Variable:".to_string(), dep),
+            ("Model:".to_string(), "ESAG".to_string()),
+            ("Shape:".to_string(), shape.to_string()),
+            ("Method:".to_string(), method.to_string()),
+            ("Date:".to_string(), date),
+            ("Time:".to_string(), format!("{time} UTC")),
+            (
+                "converged:".to_string(),
+                if self.converged { "True" } else { "False" }.to_string(),
+            ),
+        ];
+        let mut right = vec![
+            ("No. Observations:".to_string(), self.n_obs.to_string()),
+            ("Df Residuals:".to_string(), format!("{}", self.df_resid())),
+            ("Df Model:".to_string(), self.n_params().to_string()),
+            ("Log-Likelihood:".to_string(), num(self.log_likelihood)),
+            ("AIC:".to_string(), num(self.aic())),
+            ("BIC:".to_string(), num(self.bic())),
+            (
+                "Covariance Type:".to_string(),
+                if self.cov_params.is_some() {
+                    "observed info"
+                } else {
+                    "none"
                 }
-                match se.as_ref().map(|m| m[(k, j)]) {
-                    Some(sev) if sev.is_finite() => {
-                        let z = est / sev;
-                        let p = 2.0 * norm_sf(z.abs());
-                        let _ = writeln!(
-                            s,
-                            "  {:<20}{:>12.5}{:>12.5}{:>9.3}{:>10.4}",
-                            rows[k], est, sev, z, p
-                        );
-                    }
-                    _ => {
-                        let _ = writeln!(
-                            s,
-                            "  {:<20}{:>12.5}{:>12}{:>9}{:>10}",
-                            rows[k], est, "n/a", "", ""
-                        );
-                    }
-                }
+                .to_string(),
+            ),
+        ];
+        for (i, e) in extra.iter().enumerate() {
+            if i % 2 == 0 {
+                left.push(e.clone())
+            } else {
+                right.push(e.clone())
             }
         }
+        let se = self.std_errors();
+        let rows = self.row_names();
+        let blocks: Vec<(String, Vec<CoefRow>)> = (0..self.b_dim())
+            .map(|k| {
+                let r = (0..self.p_total())
+                    .map(|j| CoefRow {
+                        name: self.column_names[j].clone(),
+                        coef: self.coef[(k, j)],
+                        se: if self.mask[(k, j)] {
+                            se.as_ref().map(|m| m[(k, j)])
+                        } else {
+                            None
+                        },
+                        note: if self.mask[(k, j)] { "n/a" } else { fixed_note },
+                    })
+                    .collect();
+                (rows[k].clone(), r)
+            })
+            .collect();
+        let mut s = header(title, &left, &right);
+        s += &coef_blocks(&blocks, alpha);
         s
     }
 

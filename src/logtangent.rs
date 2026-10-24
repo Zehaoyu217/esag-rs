@@ -754,6 +754,41 @@ fn check_mu_s(frame: &LtFrame, mu: &[f64], s: &[f64]) -> (usize, usize) {
     (d, d - 1)
 }
 
+/// The eigen-frame of `V(μ, s)` (eigenvalues ascending, then `μ̂`) for
+/// sampling, residuals and moments: the tangent eigenvalues are `exp(σ_j)`
+/// for the eigenvalues `σ_j` of `S` and the eigenvectors are `Ξ(μ̂) q_j`, so one
+/// `(d−1) × (d−1)` eigen-decomposition suffices (no inverse map to γ).
+pub fn eigen_frame(frame: &LtFrame, mu: &[f64], s: &[f64]) -> crate::frame::Frame<f64> {
+    let d = frame.dim();
+    let p = d - 1;
+    let sm = s_to_matrix(s, p);
+    let eig = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(p, p, &sm));
+    let mut idx: Vec<usize> = (0..p).collect();
+    idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+    let xi = frame.frame_at(mu);
+    let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mut basis = vec![0.0; d * d];
+    for (c, &j) in idx.iter().enumerate() {
+        let q = eig.eigenvectors.column(j);
+        for r in 0..d {
+            basis[c * d + r] = (0..p).map(|a| xi[(r, a)] * q[a]).sum();
+        }
+    }
+    for r in 0..d {
+        basis[(d - 1) * d + r] = if mu_norm > 0.0 {
+            mu[r] / mu_norm
+        } else {
+            frame.reference()[r]
+        };
+    }
+    crate::frame::Frame {
+        d,
+        mu_norm,
+        lambda: idx.iter().map(|&j| eig.eigenvalues[j].exp()).collect(),
+        basis,
+    }
+}
+
 /// The ESAG covariance `V = μ̂μ̂ᵀ + Ξ exp(S) Ξᵀ` (`d × d`, symmetric, with
 /// `Vμ = μ` and `det V = 1`) for mean `mu` and shape coordinates `s`, with
 /// `Ξ = frame.frame_at(mu)` and `S = s_to_matrix(s, d − 1)`.

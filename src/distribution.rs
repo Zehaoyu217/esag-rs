@@ -313,7 +313,12 @@ pub struct Sampler {
 impl Sampler {
     /// Precompute the scaled eigen-frame of `dist`.
     pub fn new(dist: &Esag) -> Self {
-        let frame = dist.frame();
+        Self::from_frame(dist.mu(), &dist.frame())
+    }
+
+    /// The sampler for mean `mu` and an eigen-frame of `V` (e.g. from
+    /// [`crate::logtangent::eigen_frame`]).
+    pub fn from_frame(mu: &[f64], frame: &Frame<f64>) -> Self {
         let d = frame.d;
         let sqrt_lambda: Vec<f64> = frame.lambda.iter().map(|l| l.sqrt()).collect();
         let mut w = frame.basis.clone();
@@ -324,7 +329,7 @@ impl Sampler {
         }
         Self {
             d,
-            mu: dist.mu().to_vec(),
+            mu: mu.to_vec(),
             mu_norm: frame.mu_norm,
             w,
             lambda: frame.lambda.clone(),

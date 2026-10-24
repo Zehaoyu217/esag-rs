@@ -170,7 +170,7 @@ fn microbiome_application_reproduces_paper() {
 // ---- corrected methods (log-tangent shape) ----
 
 use esag::distribution::Esag;
-use esag::penalized::Method;
+use esag::penalized::Grouping;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
@@ -200,7 +200,7 @@ fn tied_iid(n: usize, seed: u64) -> DMatrix<f64> {
 fn eigengap_recovers_tied_eigenvalues() {
     let y = tied_iid(150, 1);
     let x = DMatrix::<f64>::zeros(150, 0);
-    let path = PenalizedEsag::new(Method::EigenGap).fit(&x, &y).unwrap();
+    let path = PenalizedEsag::eigen_gap().fit(&x, &y).unwrap();
     let b = path.best();
     assert_eq!(
         b.active,
@@ -220,16 +220,14 @@ fn isotropy_penalty_detects_isotropic_errors() {
     let mu = [2.0, -1.0, 1.5, 0.5];
     let x = DMatrix::<f64>::zeros(300, 0);
     let iso = Esag::new(&mu, &[0.0; 5]).unwrap().sample(300, &mut rng);
-    let path = PenalizedEsag::new(Method::Isotropy).fit(&x, &iso).unwrap();
+    let path = PenalizedEsag::isotropy().fit(&x, &iso).unwrap();
     assert_eq!(path.best().active, vec![false]);
     let relaxed = path.relaxed.as_ref().unwrap();
     assert!(relaxed.coef.rows(4, 5).iter().all(|&v| v == 0.0));
     let aniso = Esag::new(&mu, &[1.5, -0.5, 1.0, 0.5, -0.8])
         .unwrap()
         .sample(300, &mut rng);
-    let path = PenalizedEsag::new(Method::Isotropy)
-        .fit(&x, &aniso)
-        .unwrap();
+    let path = PenalizedEsag::isotropy().fit(&x, &aniso).unwrap();
     assert_eq!(path.best().active, vec![true]);
 }
 
@@ -281,12 +279,10 @@ fn driver_selection_in_regression() {
             y[(i, k)] = buf[k];
         }
     }
-    let path = PenalizedEsag::new(Method::Drivers {
-        mean: true,
-        shape: true,
-    })
-    .fit(&x, &y)
-    .unwrap();
+    let path = PenalizedEsag::adaptive_group_lasso()
+        .grouping(Grouping::CovariatePart)
+        .fit(&x, &y)
+        .unwrap();
     // groups: x1.mu x1.shape x2.mu x2.shape x3.mu x3.shape x4.mu x4.shape
     assert_eq!(
         path.best().active,

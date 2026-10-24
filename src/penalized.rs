@@ -6,35 +6,35 @@
 //! `F = −Σ_i ℓ_i + λ·P`, so `λ` is the paper's `n·λ_n`. `μ` (and the
 //! intercept column in regression) is never penalized.
 //!
-//! # Methods
+//! # Choosing a penalty
 //!
-//! **Recommended (smooth log-tangent shape, [`crate::regression::Shape::LogTangent`]).**
-//! The paper's `γ ↦ V` map is discontinuous at exact zeros of any group
-//! above group 1 and at vanishing trailing pairs (`docs/MATH.md`), so
-//! sparsity is placed on the log-tangent shape `S` instead:
+//! A penalty is three choices, combined freely, plus the weights:
 //!
-//! * [`Method::Isotropy`]: one group with all shape coefficients, `w‖s‖`
-//!   (the paper's eq. 4.4); zero ⇔ isotropic errors.
-//! * [`Method::EigenGap`] (i.i.d.): `Σ_j w_j (σ_(j+1) − σ_(j))` on the sorted
-//!   eigenvalues of `S`; a zero gap is a tie `ξ_j = ξ_{j+1}` anywhere in the
-//!   spectrum (partial isotropy), frame-free. This is what the paper's group
-//!   LASSO meant `γ_(j) = 0` to express (`‖γ_(j)‖ = e^{gap_j} − 1`).
-//! * [`Method::Drivers`] (regression): one group per covariate for its
-//!   `μ`-slopes and/or its shape slopes, on standardized covariates
-//!   (variable selection of drivers).
+//! * [`Penalty`]: `Lasso` (each coefficient), `GroupLasso` (groups),
+//!   `SparseGroupLasso { l1_ratio }` (both), `EigenGap` (ties between the
+//!   eigenvalues of the shape, i.i.d.);
+//! * [`Target`]: which coefficients, `Slopes` (default), `MeanSlopes`,
+//!   `ShapeSlopes`, or `Shape` (all shape coefficients, intercept included);
+//! * [`Grouping`]: `Covariate` (default), `CovariatePart` (mean / shape
+//!   slopes of each covariate), `Parameter` (a row of `B`), `All`,
+//!   `GammaGroups`, or `Custom`;
+//! * [`Weighting`]: `Plain`, `Adaptive(r)` (`‖θ̃_g‖^{−r}` from the
+//!   unpenalized fit) or `RoC` (i.i.d.).
 //!
-//! These are solved exactly by proximal Newton ([`crate::optim::prox`]):
-//! exact zeros, no thresholding.
+//! The presets cover the usual estimators: `PenalizedEsag::lasso()`,
+//! `adaptive_lasso()`, `group_lasso()`, `adaptive_group_lasso()`,
+//! `sparse_group_lasso(α)`, `isotropy()` (the paper's eq. 4.4),
+//! `eigen_gap()`, and `paper(name)` for the six methods exactly as coded in
+//! the Project 3 R scripts. Group weights carry Yuan & Lin's `√|g|` factor.
 //!
-//! **Paper reproduction (`γ`, i.i.d.).** [`Method::PaperLasso`] and
-//! [`Method::PaperGroupLasso`] with [`Weighting::Plain`], `Adaptive` and
-//! `RoC` are the six methods as coded in the R scripts: penalties on the
-//! entries / groups `γ_(j)` of `γ`, weights `b^r` with `b = 1/|γ̃|`,
-//! `r = max(1, ‖μ̃‖/‖μ‖)` inside the objective for RoC. Solved by smoothing
-//! continuation (`|x| → √(x² + ε²)`, ε = 1e−2 … 1e−8) with exact-gradient
-//! L-BFGS, then the R code's post-hoc rule `|x| < 0.01 → 0` and its
-//! BIC/AIC/SBIC (df = nonzero entries including `μ`). Reproduction only:
-//! those zeros can sit on discontinuities of `γ ↦ V`.
+//! The default shape is the smooth log-tangent one
+//! ([`crate::regression::Shape::LogTangent`]): exact zeros of the paper's
+//! `γ` (a whole group `j ≥ 2`, or its trailing pair) lie on discontinuities
+//! of `γ ↦ V` (`docs/MATH.md`). Slope penalties also work with
+//! `Shape::Gamma` (zero slopes are not singular points). The paper mode
+//! (`Solver::PaperReproduction`) uses smoothing continuation, the R code's
+//! post-hoc rule `|x| < 0.01 → 0` and its BIC/AIC/SBIC; the default solver,
+//! proximal Newton ([`crate::optim::prox`]), gives exact zeros.
 //!
 //! # Selection
 //!
@@ -48,7 +48,8 @@ use crate::distribution::Esag;
 use crate::error::{EsagError, Result};
 use crate::optim::lbfgs::{LbfgsConfig, Objective, minimize};
 use crate::optim::prox::{
-    EigenGaps, Exponent, GroupNorms, Penalty, PenaltyAtoms, ProxConfig, RocMode, SmoothObjective,
+    EigenGaps, Exponent, GroupNorms, Penalty as AtomPenalty, PenaltyAtoms, ProxConfig, RocMode,
+    SmoothObjective, SparseGroupNorms,
 };
 use crate::regression::{
     EsagRegressor, EsagRegressorFit, Init, RegressionData, Shape, SmoothNegLogLik, isotropic_mask,
@@ -57,44 +58,78 @@ use nalgebra::DMatrix;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// The penalty structure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Method {
-    /// All shape coefficients as one group (log-tangent): zero ⇔ isotropy.
-    Isotropy,
-    /// Gaps between the sorted eigenvalues of `S` (log-tangent, i.i.d.).
+/// The penalty family.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Penalty {
+    /// `Σ_k w_k |β_k|` over the target coefficients (LASSO).
+    Lasso,
+    /// `Σ_g w_g ‖β_g‖₂` over groups of target coefficients (group LASSO).
+    GroupLasso,
+    /// `(1−α) Σ_g w_g ‖β_g‖₂ + α Σ_k w_k |β_k|` (sparse group LASSO), with
+    /// `α = l1_ratio ∈ [0, 1]`.
+    SparseGroupLasso { l1_ratio: f64 },
+    /// `Σ_j w_j (σ_(j+1) − σ_(j))`, gaps between the sorted eigenvalues of
+    /// the log-tangent shape `S` (i.i.d.): zero gaps are tied eigenvalues of
+    /// `V` (partial isotropy).
     EigenGap,
-    /// Per-covariate groups of slopes (log-tangent regression): the `μ`
-    /// slopes of each covariate (`mean`) and/or its shape slopes (`shape`).
-    Drivers { mean: bool, shape: bool },
-    /// The paper's elementwise penalty on `γ` (reproduction, i.i.d.).
-    PaperLasso,
-    /// The paper's group penalty on `γ_(1..d−2)` (reproduction, i.i.d.).
-    PaperGroupLasso,
 }
 
-impl Method {
-    fn is_paper(self) -> bool {
-        matches!(self, Method::PaperLasso | Method::PaperGroupLasso)
-    }
-    fn shape(self) -> Shape {
-        if self.is_paper() {
-            Shape::Gamma
-        } else {
-            Shape::LogTangent
-        }
-    }
+/// How the target coefficients are grouped (group and sparse-group LASSO).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Grouping {
+    /// One group per covariate: all its target slopes (does the covariate
+    /// matter at all?).
+    Covariate,
+    /// Per covariate, its `μ` slopes and its shape slopes as two groups
+    /// (does it move the mean direction? the shape?).
+    CovariatePart,
+    /// One group per parameter row (`mu[k]` or a shape coordinate) across
+    /// the target columns.
+    Parameter,
+    /// All target coefficients as one group (with `Target::Shape`: isotropy).
+    All,
+    /// The groups `γ_(1), …, γ_(d−2)` of Yu & Huang's γ (per column).
+    GammaGroups,
+    /// Explicit groups of `(row, column)` coefficients of `B` (column 0 is
+    /// the intercept).
+    Custom(Vec<Vec<(usize, usize)>>),
+}
+
+/// Which coefficients are penalized. The intercept column is penalized only
+/// by `Shape` and `All` (shape coefficients).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    /// Every slope (all rows, covariate columns). The default.
+    Slopes,
+    /// The `μ` slopes.
+    MeanSlopes,
+    /// The shape slopes.
+    ShapeSlopes,
+    /// Every shape coefficient, intercept included (i.i.d. shape sparsity,
+    /// isotropy).
+    Shape,
 }
 
 /// Adaptive weights `b_g^r`, `b_g = 1/φ_g(θ̃)` from the unpenalized fit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Weighting {
-    /// `r = 0` (for `EigenGap`: the concave baseline `w_j = j(k−j)/k`).
+    /// `r = 0`: every weight 1 (for `EigenGap`: the concave baseline
+    /// `w_j = j(k−j)/k`).
     Plain,
-    /// `r = 1`.
-    Adaptive,
+    /// `r` given (the adaptive LASSO uses `r = 1`).
+    Adaptive(f64),
     /// `r = max(1, ‖μ̃‖/‖μ‖)`, the ratio of concentration (i.i.d. only).
     RoC(RocMode),
+}
+
+/// How the penalized problem is solved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Solver {
+    /// Proximal Newton: exact zeros, KKT certificate (default).
+    Exact,
+    /// The R code of Project 3: smoothing continuation, then the rule
+    /// `|x| < 0.01 → 0` and the R code's BIC/AIC/SBIC (γ, i.i.d.).
+    PaperReproduction,
 }
 
 /// The λ grid (sum scale).
@@ -130,64 +165,260 @@ pub enum Selection {
     },
 }
 
-/// Penalized ESAG estimator (configure, then [`PenalizedEsag::fit`]).
+/// Penalized ESAG estimator. Start from a preset (`lasso()`,
+/// `adaptive_lasso()`, `group_lasso()`, `adaptive_group_lasso()`,
+/// `sparse_group_lasso(α)`, `isotropy()`, `eigen_gap()`, `paper(name)`),
+/// adjust with the builder methods, then [`PenalizedEsag::fit`].
+///
+/// ```no_run
+/// use esag::penalized::{Grouping, PenalizedEsag, Target};
+/// # let (x, y) = (nalgebra::DMatrix::<f64>::zeros(1, 1), nalgebra::DMatrix::<f64>::zeros(1, 3));
+/// // adaptive group LASSO: which covariates move the mean, which the shape?
+/// let path = PenalizedEsag::adaptive_group_lasso()
+///     .grouping(Grouping::CovariatePart)
+///     .fit(&x, &y)?;
+/// // plain LASSO on the shape slopes only, λ by 10-fold cross-validation
+/// let path = PenalizedEsag::lasso().target(Target::ShapeSlopes).cv(10, 1).fit(&x, &y)?;
+/// # Ok::<(), esag::error::EsagError>(())
+/// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PenalizedEsag {
-    pub method: Method,
+    pub penalty: Penalty,
+    pub grouping: Grouping,
+    pub target: Target,
     pub weighting: Weighting,
+    /// Shape parameterization of the model (default
+    /// [`Shape::LogTangent`]: smooth, exact zeros are well-posed).
+    pub shape: Shape,
+    pub solver: Solver,
     pub grid: LambdaGrid,
     pub selection: Selection,
+    /// Multiply group weights by `√(group size)` (Yuan & Lin; default
+    /// `true`, `false` in paper mode as in the R code).
+    pub group_size_factor: bool,
     /// Compute BIC/AIC at the relaxed refit (default `true`; ignored by the
-    /// paper methods, which use the R code's rule).
+    /// paper mode, which uses the R code's rule).
     pub relax: bool,
     /// Stationarity tolerance of the solver (sum scale). Default 1e-6.
     pub tol: f64,
     /// Parallel likelihood evaluation.
     pub parallel: bool,
-    /// Paper methods: unpenalized estimate (`b_dim × 1`) to build the weights
+    /// Paper mode: unpenalized estimate (`b_dim × 1`) to build the weights
     /// from, e.g. R's `unp_mle$par` (default: `esag`'s MLE).
     pub initial_coef: Option<DMatrix<f64>>,
-    /// Paper methods: start every λ from this (e.g. R's `truth + 0.1`)
-    /// instead of warm-starting along the path.
+    /// Paper mode: start every λ from this (e.g. R's `truth + 0.1`) instead
+    /// of warm-starting along the path.
     pub start_coef: Option<DMatrix<f64>>,
+    /// Covariate names for summaries.
+    #[serde(default)]
+    pub feature_names: Option<Vec<String>>,
+    /// Response (column) names for summaries.
+    #[serde(default)]
+    pub response_names: Option<Vec<String>>,
 }
 
 impl PenalizedEsag {
-    /// Defaults: adaptive weights (the paper's methods use the paper grid,
-    /// the corrected ones an automatic grid), BIC at the relaxed refit.
-    pub fn new(method: Method) -> Self {
+    fn base(penalty: Penalty, grouping: Grouping, target: Target, weighting: Weighting) -> Self {
         Self {
-            method,
-            weighting: Weighting::Adaptive,
-            grid: if method.is_paper() {
-                LambdaGrid::Paper
-            } else {
-                LambdaGrid::Auto {
-                    count: 30,
-                    ratio: 1e-3,
-                }
+            penalty,
+            grouping,
+            target,
+            weighting,
+            shape: Shape::LogTangent,
+            solver: Solver::Exact,
+            grid: LambdaGrid::Auto {
+                count: 30,
+                ratio: 1e-3,
             },
             selection: Selection::Bic,
+            group_size_factor: true,
             relax: true,
             tol: 1e-6,
             parallel: true,
             initial_coef: None,
             start_coef: None,
+            feature_names: None,
+            response_names: None,
         }
     }
-    /// One of the paper's six methods by name: `LASSO`, `aLASSO`,
-    /// `RoC-LASSO`, `GLASSO`, `aGLASSO`, `RoC-GLASSO`.
+    /// LASSO on every slope coefficient.
+    pub fn lasso() -> Self {
+        Self::base(
+            Penalty::Lasso,
+            Grouping::Covariate,
+            Target::Slopes,
+            Weighting::Plain,
+        )
+    }
+    /// Adaptive LASSO (`r = 1`) on every slope coefficient.
+    pub fn adaptive_lasso() -> Self {
+        Self::lasso().adaptive(1.0)
+    }
+    /// Group LASSO, one group per covariate.
+    pub fn group_lasso() -> Self {
+        Self::base(
+            Penalty::GroupLasso,
+            Grouping::Covariate,
+            Target::Slopes,
+            Weighting::Plain,
+        )
+    }
+    /// Adaptive group LASSO (`r = 1`), one group per covariate.
+    pub fn adaptive_group_lasso() -> Self {
+        Self::group_lasso().adaptive(1.0)
+    }
+    /// Sparse group LASSO with L1 share `l1_ratio`, groups per covariate.
+    pub fn sparse_group_lasso(l1_ratio: f64) -> Self {
+        Self::base(
+            Penalty::SparseGroupLasso { l1_ratio },
+            Grouping::Covariate,
+            Target::Slopes,
+            Weighting::Plain,
+        )
+    }
+    /// Shrink the whole shape towards isotropy (one group: all shape
+    /// coefficients; the paper's eq. 4.4), adaptive weights.
+    pub fn isotropy() -> Self {
+        Self::base(
+            Penalty::GroupLasso,
+            Grouping::All,
+            Target::Shape,
+            Weighting::Adaptive(1.0),
+        )
+    }
+    /// Partial isotropy for i.i.d. data: gaps between the eigenvalues of the
+    /// shape, adaptive weights.
+    pub fn eigen_gap() -> Self {
+        Self::base(
+            Penalty::EigenGap,
+            Grouping::All,
+            Target::Shape,
+            Weighting::Adaptive(1.0),
+        )
+    }
+    /// One of the paper's six methods, reproduced as coded in its R scripts
+    /// (γ shape, i.i.d.): `LASSO`, `aLASSO`, `RoC-LASSO`, `GLASSO`,
+    /// `aGLASSO`, `RoC-GLASSO`.
     pub fn paper(name: &str) -> Result<Self> {
-        let (m, w) = match name {
-            "LASSO" => (Method::PaperLasso, Weighting::Plain),
-            "aLASSO" => (Method::PaperLasso, Weighting::Adaptive),
-            "RoC-LASSO" => (Method::PaperLasso, Weighting::RoC(RocMode::Joint)),
-            "GLASSO" => (Method::PaperGroupLasso, Weighting::Plain),
-            "aGLASSO" => (Method::PaperGroupLasso, Weighting::Adaptive),
-            "RoC-GLASSO" => (Method::PaperGroupLasso, Weighting::RoC(RocMode::Joint)),
-            other => return Err(EsagError::Data(format!("unknown paper method {other:?}"))),
+        let (penalty, grouping, w) = match name {
+            "LASSO" => (Penalty::Lasso, Grouping::All, Weighting::Plain),
+            "aLASSO" => (Penalty::Lasso, Grouping::All, Weighting::Adaptive(1.0)),
+            "RoC-LASSO" => (
+                Penalty::Lasso,
+                Grouping::All,
+                Weighting::RoC(RocMode::Joint),
+            ),
+            "GLASSO" => (Penalty::GroupLasso, Grouping::GammaGroups, Weighting::Plain),
+            "aGLASSO" => (
+                Penalty::GroupLasso,
+                Grouping::GammaGroups,
+                Weighting::Adaptive(1.0),
+            ),
+            "RoC-GLASSO" => (
+                Penalty::GroupLasso,
+                Grouping::GammaGroups,
+                Weighting::RoC(RocMode::Joint),
+            ),
+            other => {
+                return Err(EsagError::Data(format!(
+                    "unknown paper method {other:?} (LASSO, aLASSO, RoC-LASSO, GLASSO, aGLASSO, RoC-GLASSO)"
+                )));
+            }
         };
-        Ok(Self::new(m).with_weighting(w))
+        let mut s = Self::base(penalty, grouping, Target::Shape, w);
+        s.shape = Shape::Gamma;
+        s.solver = Solver::PaperReproduction;
+        s.grid = LambdaGrid::Paper;
+        s.group_size_factor = false;
+        s.relax = false;
+        Ok(s)
+    }
+    /// Which coefficients are penalized.
+    pub fn target(mut self, t: Target) -> Self {
+        self.target = t;
+        self
+    }
+    /// How they are grouped (group and sparse-group LASSO).
+    pub fn grouping(mut self, g: Grouping) -> Self {
+        self.grouping = g;
+        self
+    }
+    /// Adaptive weights `‖θ̃_g‖^{−r}`.
+    pub fn adaptive(mut self, r: f64) -> Self {
+        self.weighting = Weighting::Adaptive(r);
+        self
+    }
+    /// Plain weights (all 1).
+    pub fn plain(mut self) -> Self {
+        self.weighting = Weighting::Plain;
+        self
+    }
+    /// RoC weights (i.i.d.).
+    pub fn roc(mut self, mode: RocMode) -> Self {
+        self.weighting = Weighting::RoC(mode);
+        self
+    }
+    /// Shape parameterization.
+    pub fn shape(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
+    }
+    /// Explicit λ values (sum scale; the paper's `λ_n = λ/n`).
+    pub fn lambdas(mut self, v: Vec<f64>) -> Self {
+        self.grid = LambdaGrid::Custom(v);
+        self
+    }
+    /// Covariate names for summaries.
+    pub fn feature_names(mut self, names: Vec<String>) -> Self {
+        self.feature_names = Some(names);
+        self
+    }
+    /// Response names for summaries.
+    pub fn response_names(mut self, names: Vec<String>) -> Self {
+        self.response_names = Some(names);
+        self
+    }
+    /// A short name of the method ("adaptive group LASSO", …).
+    pub fn method_name(&self) -> String {
+        let weights = match self.weighting {
+            Weighting::Plain => "",
+            Weighting::Adaptive(_) => "adaptive ",
+            Weighting::RoC(_) => "RoC-",
+        };
+        let core = match self.penalty {
+            Penalty::Lasso => "LASSO".to_string(),
+            Penalty::GroupLasso
+                if self.grouping == Grouping::All && self.target == Target::Shape =>
+            {
+                "isotropy group LASSO".to_string()
+            }
+            Penalty::GroupLasso => "group LASSO".to_string(),
+            Penalty::SparseGroupLasso { l1_ratio } => {
+                format!("sparse group LASSO (l1_ratio={l1_ratio})")
+            }
+            Penalty::EigenGap => "eigen-gap LASSO".to_string(),
+        };
+        let paper = if self.is_paper() { " [paper mode]" } else { "" };
+        format!("{weights}{core}{paper}")
+    }
+    /// Select λ by BIC (default).
+    pub fn bic(mut self) -> Self {
+        self.selection = Selection::Bic;
+        self
+    }
+    /// Select λ by AIC.
+    pub fn aic(mut self) -> Self {
+        self.selection = Selection::Aic;
+        self
+    }
+    /// Select λ by `folds`-fold cross-validated held-out log-likelihood.
+    pub fn cv(mut self, folds: usize, seed: u64) -> Self {
+        self.selection = Selection::CrossValidation {
+            folds,
+            seed,
+            score: CvScore::LogLikelihood,
+        };
+        self
     }
     pub fn with_weighting(mut self, w: Weighting) -> Self {
         self.weighting = w;
@@ -217,6 +448,9 @@ impl PenalizedEsag {
         self.start_coef = b;
         self
     }
+    fn is_paper(&self) -> bool {
+        self.solver == Solver::PaperReproduction
+    }
 
     /// Fit the λ path to `(x, y)` (`x` may have zero columns: i.i.d.) and
     /// select λ.
@@ -227,7 +461,7 @@ impl PenalizedEsag {
             Selection::Bic => points.iter().map(|p| p.bic).collect(),
             Selection::Aic => points.iter().map(|p| p.aic).collect(),
             Selection::CrossValidation { folds, seed, score } => {
-                let v = self.cv(x, y, &prep.lambdas, folds, seed, score)?;
+                let v = self.cross_validate(x, y, &prep.lambdas, folds, seed, score)?;
                 for (p, &c) in points.iter_mut().zip(&v) {
                     p.cv = Some(c);
                 }
@@ -250,15 +484,13 @@ impl PenalizedEsag {
                 selected = i;
             }
         }
-        let relaxed = if self.method.is_paper() {
+        let relaxed = if self.is_paper() {
             None
         } else {
             prep.relaxed_fit(&points[selected]).ok()
         };
         Ok(PenalizedPath {
-            method: self.method,
-            weighting: self.weighting,
-            selection: self.selection,
+            config: self.clone(),
             initial: prep.initial,
             points,
             criterion,
@@ -291,7 +523,7 @@ impl PenalizedEsag {
 
     /// Mean held-out score per λ over shuffled, seeded folds (lower is
     /// better: negative mean log-likelihood, or RMSE).
-    fn cv(
+    fn cross_validate(
         &self,
         x: &DMatrix<f64>,
         y: &DMatrix<f64>,
@@ -381,9 +613,8 @@ pub struct PathPoint {
 /// A fitted λ path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PenalizedPath {
-    pub method: Method,
-    pub weighting: Weighting,
-    pub selection: Selection,
+    /// The estimator configuration.
+    pub config: PenalizedEsag,
     /// The unpenalized fit behind the adaptive weights.
     pub initial: EsagRegressorFit,
     pub points: Vec<PathPoint>,
@@ -401,13 +632,106 @@ impl PenalizedPath {
         &self.points[self.selected]
     }
 
-    /// A text table of the path.
+    /// statsmodels-style summary of the selected model: header (method,
+    /// target, selection, λ, active groups, fit statistics at the relaxed
+    /// refit) and the coefficient blocks of the relaxed refit, with standard
+    /// errors; dropped coefficients are marked. [`Self::path_summary`] lists
+    /// the whole λ path.
     pub fn summary(&self) -> String {
+        let b = self.best();
+        let c = &self.config;
+        let target = match c.target {
+            Target::Slopes => "slopes",
+            Target::MeanSlopes => "mean slopes",
+            Target::ShapeSlopes => "shape slopes",
+            Target::Shape => "shape",
+        };
+        let grouping = match (&c.penalty, &c.grouping) {
+            (Penalty::Lasso, _) => "entries".to_string(),
+            (Penalty::EigenGap, _) => "eigen-gaps".to_string(),
+            (_, Grouping::Covariate) => "covariate".to_string(),
+            (_, Grouping::CovariatePart) => "cov. part".to_string(),
+            (_, Grouping::Parameter) => "parameter".to_string(),
+            (_, Grouping::All) => "one group".to_string(),
+            (_, Grouping::GammaGroups) => "gamma groups".to_string(),
+            (_, Grouping::Custom(g)) => format!("{} groups", g.len()),
+        };
+        let selection = match c.selection {
+            Selection::Bic => "BIC".to_string(),
+            Selection::Aic => "AIC".to_string(),
+            Selection::CrossValidation { folds, score, .. } => format!(
+                "{folds}-fold CV ({})",
+                if score == CvScore::LogLikelihood {
+                    "log-lik"
+                } else {
+                    "RMSE"
+                }
+            ),
+        };
+        let n_active = b.active.iter().filter(|&&a| a).count();
+        let extra = vec![
+            ("Penalized:".to_string(), format!("{target} / {grouping}")),
+            ("lambda (sum):".to_string(), crate::summary::num(b.lambda)),
+            ("Selection:".to_string(), selection),
+            (
+                "alpha = lambda/n:".to_string(),
+                crate::summary::num(b.lambda_n),
+            ),
+            (
+                "Active atoms:".to_string(),
+                format!("{n_active} / {}", b.active.len()),
+            ),
+            (
+                if self.relaxed.is_some() {
+                    "Penalized log-lik:"
+                } else {
+                    "Log-lik:"
+                }
+                .to_string(),
+                crate::summary::num(b.log_likelihood),
+            ),
+        ];
+        match &self.relaxed {
+            Some(r) => r.summary_titled(
+                "ESAG Regularized Regression Results",
+                &c.method_name(),
+                0.05,
+                &extra,
+                "(dropped)",
+            ),
+            None => {
+                // no relaxed refit (paper mode, tie patterns): penalized
+                // coefficients without standard errors
+                let mut fit = self.initial.clone();
+                fit.coef = b.coef_thresholded.clone().unwrap_or_else(|| b.coef.clone());
+                fit.cov_params = None;
+                fit.log_likelihood = b.criterion_loglik;
+                fit.mask = fit.coef.map(|v| v != 0.0);
+                for (k, j) in
+                    (0..fit.coef.nrows()).flat_map(|k| (0..fit.coef.ncols()).map(move |j| (k, j)))
+                {
+                    if !self.initial.mask[(k, j)] {
+                        fit.mask[(k, j)] = false;
+                    }
+                }
+                fit.summary_titled(
+                    "ESAG Regularized Regression Results",
+                    &c.method_name(),
+                    0.05,
+                    &extra,
+                    "(dropped)",
+                )
+            }
+        }
+    }
+
+    /// A text table of the λ path.
+    pub fn path_summary(&self) -> String {
         let mut s = format!(
-            "Penalized ESAG: {:?}, {:?} weights, selection {:?}\n{:>10} {:>10} {:>12} {:>7} {:>12} {:>10} {:>9}\n",
-            self.method,
-            self.weighting,
-            self.selection,
+            "Penalized ESAG: {}, {:?} weights, selection {:?}\n{:>10} {:>10} {:>12} {:>7} {:>12} {:>10} {:>9}\n",
+            self.config.method_name(),
+            self.config.weighting,
+            self.config.selection,
             "lambda",
             "lambda_n",
             "loglik",
@@ -461,6 +785,7 @@ struct Prepared {
 #[derive(Clone, Debug)]
 enum Atoms {
     Groups(GroupNorms),
+    SparseGroups(SparseGroupNorms),
     Gaps(EigenGaps),
 }
 
@@ -468,15 +793,13 @@ impl Atoms {
     fn len(&self) -> usize {
         match self {
             Atoms::Groups(g) => g.len(),
+            Atoms::SparseGroups(g) => g.len(),
             Atoms::Gaps(g) => g.len(),
         }
     }
     fn atoms(&self, theta: &[f64]) -> Vec<f64> {
         let mut out = vec![0.0; self.len()];
-        match self {
-            Atoms::Groups(g) => g.atoms(theta, &mut out),
-            Atoms::Gaps(g) => g.atoms(theta, &mut out),
-        }
+        PenaltyAtoms::atoms(self, theta, &mut out);
         out
     }
 }
@@ -485,19 +808,43 @@ impl Prepared {
     fn new(cfg: &PenalizedEsag, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<Self> {
         let d = y.ncols();
         let p = x.ncols();
-        let method = cfg.method;
-        if (method.is_paper() || method == Method::EigenGap) && p > 0 {
+        let paper = cfg.is_paper();
+        let iid_only = paper || cfg.penalty == Penalty::EigenGap;
+        if iid_only && p > 0 {
             return Err(EsagError::Data(format!(
-                "{method:?} is for i.i.d. data (no covariates)"
+                "{:?} is for i.i.d. data (no covariates)",
+                if paper {
+                    "paper mode".to_string()
+                } else {
+                    format!("{:?}", cfg.penalty)
+                }
             )));
         }
-        if matches!(method, Method::Drivers { .. }) && p == 0 {
-            return Err(EsagError::Data("Method::Drivers needs covariates".into()));
+        if matches!(
+            cfg.target,
+            Target::Slopes | Target::MeanSlopes | Target::ShapeSlopes
+        ) && p == 0
+        {
+            return Err(EsagError::Data(format!(
+                "Target::{:?} penalizes slopes but there are no covariates (use Target::Shape)",
+                cfg.target
+            )));
         }
         if matches!(cfg.weighting, Weighting::RoC(_)) && p > 0 {
             return Err(EsagError::Data(
-                "RoC weights are defined for i.i.d. data; use Adaptive in regression".into(),
+                "RoC weights are defined for i.i.d. data; use adaptive weights in regression"
+                    .into(),
             ));
+        }
+        if cfg.penalty == Penalty::EigenGap && cfg.shape != Shape::LogTangent {
+            return Err(EsagError::Data("EigenGap needs Shape::LogTangent".into()));
+        }
+        if let Penalty::SparseGroupLasso { l1_ratio } = cfg.penalty
+            && !(0.0..=1.0).contains(&l1_ratio)
+        {
+            return Err(EsagError::Data(format!(
+                "l1_ratio must be in [0, 1], got {l1_ratio}"
+            )));
         }
         // standardise covariates (mean 0, sd 1)
         let n = x.nrows() as f64;
@@ -514,11 +861,17 @@ impl Prepared {
             })
             .collect();
         let xs = DMatrix::from_fn(x.nrows(), p, |i, j| (x[(i, j)] - center[j]) / scale[j]);
-        let config = EsagRegressor::new()
-            .with_shape(method.shape())
+        let mut config = EsagRegressor::new()
+            .with_shape(cfg.shape)
             .with_parallel(cfg.parallel)
             .with_hessian(false);
-        let initial = match (&cfg.initial_coef, method.is_paper()) {
+        if let Some(n) = &cfg.feature_names {
+            config = config.with_feature_names(n.clone());
+        }
+        if let Some(n) = &cfg.response_names {
+            config = config.with_response_names(n.clone());
+        }
+        let initial = match (&cfg.initial_coef, paper) {
             (Some(b), true) => config
                 .clone()
                 .with_max_iter(0)
@@ -536,51 +889,122 @@ impl Prepared {
         // a user-supplied initial estimate is used verbatim (the paper's
         // weights depend on its coordinates, not only on its V)
         let theta_init: Vec<f64> = match &cfg.initial_coef {
-            Some(b) if method.is_paper() => free.iter().map(|&(k, j)| b[(k, j)]).collect(),
+            Some(b) if paper => free.iter().map(|&(k, j)| b[(k, j)]).collect(),
             _ => free.iter().map(|&(k, j)| initial.coef[(k, j)]).collect(),
         };
-        let g = dims::gamma_len(d);
-        let atoms = match method {
-            Method::Isotropy => Atoms::Groups(GroupNorms {
-                groups: vec![
-                    (0..pt)
-                        .flat_map(|j| (d..bd).map(move |k| idx(k, j)))
-                        .collect(),
-                ],
+        // the target coefficients (row, column)
+        let in_target = |k: usize, j: usize| -> bool {
+            match cfg.target {
+                Target::Slopes => j >= 1,
+                Target::MeanSlopes => j >= 1 && k < d,
+                Target::ShapeSlopes => j >= 1 && k >= d,
+                Target::Shape => k >= d,
+            }
+        };
+        let target: Vec<(usize, usize)> = (0..pt)
+            .flat_map(|j| (0..bd).map(move |k| (k, j)))
+            .filter(|&(k, j)| in_target(k, j))
+            .collect();
+        if target.is_empty() {
+            return Err(EsagError::Data("the target selects no coefficients".into()));
+        }
+        let groups: Vec<Vec<usize>> = match &cfg.grouping {
+            Grouping::Covariate => (0..pt)
+                .map(|j| {
+                    target
+                        .iter()
+                        .filter(|c| c.1 == j)
+                        .map(|&(k, j)| idx(k, j))
+                        .collect()
+                })
+                .collect(),
+            Grouping::CovariatePart => (0..pt)
+                .flat_map(|j| {
+                    let mean: Vec<usize> = target
+                        .iter()
+                        .filter(|c| c.1 == j && c.0 < d)
+                        .map(|&(k, j)| idx(k, j))
+                        .collect();
+                    let shape: Vec<usize> = target
+                        .iter()
+                        .filter(|c| c.1 == j && c.0 >= d)
+                        .map(|&(k, j)| idx(k, j))
+                        .collect();
+                    [mean, shape]
+                })
+                .collect(),
+            Grouping::Parameter => (0..bd)
+                .map(|k| {
+                    target
+                        .iter()
+                        .filter(|c| c.0 == k)
+                        .map(|&(k, j)| idx(k, j))
+                        .collect()
+                })
+                .collect(),
+            Grouping::All => vec![target.iter().map(|&(k, j)| idx(k, j)).collect()],
+            Grouping::GammaGroups => {
+                if cfg.shape != Shape::Gamma {
+                    return Err(EsagError::Data(
+                        "Grouping::GammaGroups needs Shape::Gamma".into(),
+                    ));
+                }
+                (0..pt)
+                    .flat_map(|j| {
+                        let tg = &target;
+                        (1..=d - 2).map(move |jg| {
+                            let start = d + jg * (jg + 1) / 2 - 1;
+                            (start..start + jg + 1)
+                                .filter(|&k| tg.contains(&(k, j)))
+                                .map(|k| idx(k, j))
+                                .collect::<Vec<usize>>()
+                        })
+                    })
+                    .collect()
+            }
+            Grouping::Custom(gs) => gs
+                .iter()
+                .map(|g| {
+                    g.iter()
+                        .map(|&(k, j)| {
+                            if k >= bd || j >= pt {
+                                Err(EsagError::Shape(format!(
+                                    "custom group entry ({k}, {j}) is outside B ({bd}×{pt})"
+                                )))
+                            } else {
+                                Ok(idx(k, j))
+                            }
+                        })
+                        .collect::<Result<Vec<usize>>>()
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let groups: Vec<Vec<usize>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
+        let atoms = match cfg.penalty {
+            Penalty::Lasso => Atoms::Groups(GroupNorms {
+                groups: target.iter().map(|&(k, j)| vec![idx(k, j)]).collect(),
             }),
-            Method::EigenGap => Atoms::Gaps(EigenGaps {
+            Penalty::GroupLasso => Atoms::Groups(GroupNorms { groups }),
+            Penalty::SparseGroupLasso { .. } => Atoms::SparseGroups(SparseGroupNorms { groups }),
+            Penalty::EigenGap => Atoms::Gaps(EigenGaps {
                 p: d - 1,
                 offset: d,
             }),
-            Method::Drivers { mean, shape } => {
-                let mut groups = vec![];
-                for j in 1..pt {
-                    if mean {
-                        groups.push((0..d).map(|k| idx(k, j)).collect());
-                    }
-                    if shape {
-                        groups.push((d..bd).map(|k| idx(k, j)).collect());
-                    }
-                }
-                if groups.is_empty() {
-                    return Err(EsagError::Data("Drivers needs mean and/or shape".into()));
-                }
-                Atoms::Groups(GroupNorms { groups })
-            }
-            Method::PaperLasso => Atoms::Groups(GroupNorms {
-                groups: (d..d + g).map(|i| vec![i]).collect(),
-            }),
-            Method::PaperGroupLasso => Atoms::Groups(GroupNorms {
-                groups: (1..=d - 2)
-                    .map(|jg| {
-                        let s = d + jg * (jg + 1) / 2 - 1;
-                        (s..s + jg + 1).collect()
-                    })
-                    .collect(),
-            }),
         };
+        // base weights: adaptive 1/φ(θ̃) (∞ at zero), group-size factor √|g|
+        // on group atoms, and the sparse-group mixture (1−α) / α
         let phi0 = atoms.atoms(&theta_init);
-        let base: Vec<f64> = match (cfg.weighting, &atoms) {
+        let sizes: Vec<f64> = match &atoms {
+            Atoms::Groups(g) => g.groups.iter().map(|g| g.len() as f64).collect(),
+            Atoms::SparseGroups(g) => g
+                .groups
+                .iter()
+                .map(|g| g.len() as f64)
+                .chain(std::iter::repeat_n(1.0, g.support().len()))
+                .collect(),
+            Atoms::Gaps(g) => vec![1.0; g.p - 1],
+        };
+        let mut base: Vec<f64> = match (cfg.weighting, &atoms) {
             (Weighting::Plain, Atoms::Gaps(gp)) => {
                 // concave baseline w_j = j(k−j)/k (r = 0 uses b^0 = 1, so the
                 // baseline goes into the base with r fixed at 1 below)
@@ -593,10 +1017,53 @@ impl Prepared {
                 .map(|&v| if v > 0.0 { 1.0 / v } else { f64::INFINITY })
                 .collect(),
         };
+        let r_scale = |b: f64, factor: f64, r: f64| -> f64 {
+            // weight = (b · factor^{1/r})^r = b^r · factor, so the factor is
+            // not raised to the adaptive exponent
+            if r == 0.0 {
+                b * factor
+            } else {
+                b * factor.powf(1.0 / r)
+            }
+        };
+        // plain weights use r = 1 with the base set to the factor, so that
+        // the factor survives (b^0 would be 1)
+        let r_fixed = match cfg.weighting {
+            Weighting::Plain => 1.0,
+            Weighting::Adaptive(r) => r,
+            Weighting::RoC(_) => 1.0,
+        };
+        let gfac = |i: usize| -> f64 {
+            let size = if cfg.group_size_factor && cfg.penalty != Penalty::Lasso {
+                sizes[i].sqrt()
+            } else {
+                1.0
+            };
+            let mix = match (&atoms, cfg.penalty) {
+                (Atoms::SparseGroups(sg), Penalty::SparseGroupLasso { l1_ratio }) => {
+                    if i < sg.groups.len() {
+                        1.0 - l1_ratio
+                    } else {
+                        l1_ratio
+                    }
+                }
+                _ => 1.0,
+            };
+            size * mix
+        };
+        if !matches!(atoms, Atoms::Gaps(_)) {
+            for (i, b) in base.iter_mut().enumerate() {
+                let f = gfac(i);
+                *b = if f == 0.0 {
+                    0.0
+                } else {
+                    r_scale(*b, f, r_fixed)
+                };
+            }
+        }
         let exponent = match (cfg.weighting, &atoms) {
-            (Weighting::Plain, Atoms::Gaps(_)) => Exponent::Fixed(1.0),
-            (Weighting::Plain, _) => Exponent::Fixed(0.0),
-            (Weighting::Adaptive, _) => Exponent::Fixed(1.0),
+            (Weighting::Plain, _) => Exponent::Fixed(1.0),
+            (Weighting::Adaptive(r), _) => Exponent::Fixed(r),
             (Weighting::RoC(mode), _) => Exponent::RoC {
                 mu: (0..d).collect(),
                 mu_tilde_norm: theta_init[..d].iter().map(|v| v * v).sum::<f64>().sqrt(),
@@ -653,7 +1120,7 @@ impl Prepared {
         config: &EsagRegressor,
     ) -> Result<f64> {
         // the null model: penalized atoms at zero, the rest refitted
-        let pen = Penalty {
+        let pen = AtomPenalty {
             atoms: atoms_as_groups_or_gaps(atoms),
             base: base.iter().map(|_| f64::INFINITY).collect(),
             exponent: Exponent::Fixed(1.0),
@@ -684,6 +1151,57 @@ impl Prepared {
                 .filter(|(_, wg)| wg.is_finite() && **wg > 0.0)
                 .map(|(grp, wg)| grp.iter().map(|&i| g[i] * g[i]).sum::<f64>().sqrt() / wg)
                 .fold(0.0, f64::max),
+            Atoms::SparseGroups(sg) => {
+                // a group is zero at λ iff ‖S(g; λ w_i)‖ ≤ λ w_G: solve by
+                // bisection per group (the left side minus the right
+                // decreases in λ)
+                let ng = sg.groups.len();
+                let mut e = ng;
+                let mut lmax: f64 = 0.0;
+                for (gi, grp) in sg.groups.iter().enumerate() {
+                    let we: Vec<f64> = (0..grp.len()).map(|t| w[e + t]).collect();
+                    e += grp.len();
+                    let wg = w[gi];
+                    let excess = |lam: f64| -> f64 {
+                        let s2: f64 = grp
+                            .iter()
+                            .zip(&we)
+                            .map(|(&i, &wi)| {
+                                let t = if wi.is_finite() {
+                                    lam * wi
+                                } else {
+                                    f64::INFINITY
+                                };
+                                (g[i].abs() - t).max(0.0).powi(2)
+                            })
+                            .sum();
+                        s2.sqrt()
+                            - if wg.is_finite() {
+                                lam * wg
+                            } else {
+                                f64::INFINITY
+                            }
+                    };
+                    if excess(0.0) <= 0.0 {
+                        continue;
+                    }
+                    let mut hi = 1.0;
+                    while excess(hi) > 0.0 && hi < 1e12 {
+                        hi *= 2.0;
+                    }
+                    let mut lo = 0.0;
+                    for _ in 0..80 {
+                        let mid = 0.5 * (lo + hi);
+                        if excess(mid) > 0.0 {
+                            lo = mid
+                        } else {
+                            hi = mid
+                        }
+                    }
+                    lmax = lmax.max(hi);
+                }
+                lmax
+            }
             Atoms::Gaps(gp) => {
                 // bound: spectral norm of the S-gradient over the smallest weight
                 let s = &g[gp.offset..gp.offset + (gp.p - 1) * (gp.p + 2) / 2];
@@ -726,7 +1244,7 @@ impl Prepared {
             if let Some(s) = &start {
                 theta = s.clone();
             }
-            let (th, objective, r, kkt, converged, n_iter) = if cfg.method.is_paper() {
+            let (th, objective, r, kkt, converged, n_iter) = if cfg.is_paper() {
                 let mut starts = vec![theta.clone()];
                 if theta != self.theta_init {
                     starts.push(self.theta_init.clone());
@@ -787,7 +1305,7 @@ impl Prepared {
                 loglik_thresholded: None,
                 sbic: None,
             };
-            if cfg.method.is_paper() {
+            if cfg.is_paper() {
                 // the R code's rule: threshold every entry, df = nonzeros incl. mu
                 let thr: Vec<f64> = theta
                     .iter()
@@ -832,8 +1350,8 @@ impl Prepared {
             .collect())
     }
 
-    fn penalty(&self, lambda: f64) -> Penalty<Atoms> {
-        Penalty {
+    fn penalty(&self, lambda: f64) -> AtomPenalty<Atoms> {
+        AtomPenalty {
             atoms: self.atoms.clone(),
             base: self.base.clone(),
             exponent: self.exponent.clone(),
@@ -841,22 +1359,14 @@ impl Prepared {
         }
     }
 
-    /// Model dimension of the selected model (`docs/project3/METHODOLOGY.md` §5).
+    /// Model dimension of the selected model (`docs/project3/METHODOLOGY.md`
+    /// §5): every coefficient minus the penalized ones that are exactly
+    /// zero, or for eigen-gaps with `K` distinct eigenvalues of
+    /// multiplicities `m_i`, `d + (K − 1) + k(k−1)/2 − Σ m_i(m_i−1)/2`.
     fn model_df(&self, theta: &[f64], active: &[bool]) -> f64 {
         let total = self.free.len() as f64;
         match &self.atoms {
-            Atoms::Groups(g) => {
-                total
-                    - g.groups
-                        .iter()
-                        .zip(active)
-                        .filter(|(_, a)| !**a)
-                        .map(|(grp, _)| grp.len() as f64)
-                        .sum::<f64>()
-            }
             Atoms::Gaps(gp) => {
-                // K distinct eigenvalues with multiplicities m_i:
-                // (K − 1) + k(k−1)/2 − Σ m_i(m_i−1)/2, plus μ
                 let k = gp.p;
                 let mut mult = vec![1usize];
                 for &a in active {
@@ -866,11 +1376,14 @@ impl Prepared {
                         *mult.last_mut().unwrap() += 1;
                     }
                 }
-                let _ = theta;
                 let kk = mult.len();
                 let shape_df = (kk - 1) as f64 + (k * (k - 1) / 2) as f64
                     - mult.iter().map(|&m| (m * (m - 1) / 2) as f64).sum::<f64>();
                 self.data.d as f64 + shape_df
+            }
+            a => {
+                let zeros = a.support().iter().filter(|&&i| theta[i] == 0.0).count();
+                total - zeros as f64
             }
         }
     }
@@ -884,7 +1397,7 @@ impl Prepared {
             &self.free,
             self.config.parallel,
         );
-        let pen = Penalty {
+        let pen = AtomPenalty {
             atoms: self.atoms.clone(),
             base: active
                 .iter()
@@ -903,16 +1416,6 @@ impl Prepared {
         let theta: Vec<f64> = self.to_standardized(&pt.coef);
         let mut mask = DMatrix::from_element(self.data.b_dim, self.data.p_total, true);
         match &self.atoms {
-            Atoms::Groups(g) => {
-                for (grp, &a) in g.groups.iter().zip(&pt.active) {
-                    if !a {
-                        for &i in grp {
-                            let (k, j) = self.free[i];
-                            mask[(k, j)] = false;
-                        }
-                    }
-                }
-            }
             Atoms::Gaps(_) => {
                 if pt.active.iter().all(|&a| !a) {
                     mask = isotropic_mask(self.data.d, self.data.p_total);
@@ -920,6 +1423,17 @@ impl Prepared {
                     return Err(EsagError::Data(
                         "tie patterns are not a coefficient mask".into(),
                     ));
+                }
+            }
+            a => {
+                // penalized coefficients that are exactly zero stay zero
+                let support = a.support();
+                let zero_at = |i: usize| self.theta_at_zero(&pt.coef, i);
+                for i in support {
+                    if zero_at(i) {
+                        let (k, j) = self.free[i];
+                        mask[(k, j)] = false;
+                    }
                 }
             }
         }
@@ -933,6 +1447,14 @@ impl Prepared {
         cfg.init = Init::Custom(b0.clone());
         let fit = cfg.fit_warm(&x, &y, &b0)?;
         Ok(self.fit_to_original(fit))
+    }
+
+    /// Whether free parameter `i` of `coef` (original scale) is an exact
+    /// zero of the penalized fit (slopes are zero on both scales; the
+    /// intercept is never a zero of a slope penalty).
+    fn theta_at_zero(&self, coef: &DMatrix<f64>, i: usize) -> bool {
+        let (k, j) = self.free[i];
+        coef[(k, j)] == 0.0
     }
 
     /// Held-out score of coefficients `coef` (original scale) on `(x, y)`.
@@ -1142,18 +1664,21 @@ impl PenaltyAtoms for Atoms {
     fn atoms(&self, theta: &[f64], out: &mut [f64]) {
         match self {
             Atoms::Groups(g) => g.atoms(theta, out),
+            Atoms::SparseGroups(g) => g.atoms(theta, out),
             Atoms::Gaps(g) => g.atoms(theta, out),
         }
     }
     fn prox(&self, v: &mut [f64], t: &[f64]) {
         match self {
             Atoms::Groups(g) => g.prox(v, t),
+            Atoms::SparseGroups(g) => g.prox(v, t),
             Atoms::Gaps(g) => g.prox(v, t),
         }
     }
     fn support(&self) -> Vec<usize> {
         match self {
             Atoms::Groups(g) => g.support(),
+            Atoms::SparseGroups(g) => g.support(),
             Atoms::Gaps(g) => g.support(),
         }
     }
@@ -1161,7 +1686,7 @@ impl PenaltyAtoms for Atoms {
 
 fn solve(
     obj: &SmoothNegLogLik,
-    pen: &Penalty<Atoms>,
+    pen: &AtomPenalty<Atoms>,
     theta0: &[f64],
     tol: f64,
 ) -> Result<crate::optim::prox::ProxResult> {
@@ -1170,7 +1695,7 @@ fn solve(
 
 fn solve_warm(
     obj: &SmoothNegLogLik,
-    pen: &Penalty<Atoms>,
+    pen: &AtomPenalty<Atoms>,
     theta0: &[f64],
     tol: f64,
     hess0: Option<&[f64]>,
@@ -1196,7 +1721,7 @@ fn obj_n(obj: &SmoothNegLogLik) -> usize {
 struct Smoothed<'a> {
     obj: &'a SmoothNegLogLik<'a>,
     groups: &'a GroupNorms,
-    pen: &'a Penalty<Atoms>,
+    pen: &'a AtomPenalty<Atoms>,
     eps: f64,
 }
 

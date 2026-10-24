@@ -2,7 +2,7 @@
 //! coded (γ, reproduction mode) and the corrected eigen-gap penalty, on one
 //! replicate of experiment 1. `cargo run --release --example project3_paper`
 use esag::distribution::Esag;
-use esag::penalized::{Method, PenalizedEsag, selection_rates};
+use esag::penalized::{PenalizedEsag, selection_rates};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use std::time::Instant;
@@ -57,7 +57,7 @@ fn main() {
         );
     }
     let t = Instant::now();
-    let path = PenalizedEsag::new(Method::EigenGap).fit(&x, &y).unwrap();
+    let path = PenalizedEsag::eigen_gap().fit(&x, &y).unwrap();
     let b = path.best();
     let fit = b.coef.column(0).iter().copied().collect::<Vec<f64>>();
     let lt = path.initial.lt_frame().unwrap();

@@ -129,7 +129,12 @@ fn json_roundtrip_and_errors() {
         .unwrap();
     let back = EsagRegressorFit::from_json(&fit.to_json().unwrap()).unwrap();
     assert_eq!(back.coef, fit.coef);
-    assert!(back.summary().contains("[dose]"));
+    let summary = back.summary();
+    assert!(
+        summary.contains("ESAG Regression Results")
+            && summary.contains("dose")
+            && summary.contains("P>|z|")
+    );
     // shape errors
     assert!(
         EsagRegressor::new()
