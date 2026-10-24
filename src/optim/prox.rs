@@ -508,7 +508,7 @@ mod tests {
         let r = prox_newton(&f, &pen, &[0.0; 6], &ProxConfig::default());
         assert!(r.converged, "kkt {}", r.kkt);
         assert!(r.kkt < 1e-6);
-        assert!(r.theta.iter().any(|&v| v == 0.0), "{:?}", r.theta);
+        assert!(r.theta.contains(&0.0), "{:?}", r.theta);
     }
 
     #[test]
