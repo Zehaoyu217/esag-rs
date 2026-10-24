@@ -1213,6 +1213,13 @@ impl<'a> SmoothNegLogLik<'a> {
     }
 }
 
+impl SmoothNegLogLik<'_> {
+    /// Number of observations.
+    pub(crate) fn n_obs(&self) -> usize {
+        self.inner.data.n
+    }
+}
+
 impl crate::optim::prox::SmoothObjective for SmoothNegLogLik<'_> {
     fn value_grad(&self, theta: &[f64], grad: &mut [f64]) -> f64 {
         self.inner.value_and_gradient(theta, grad)
