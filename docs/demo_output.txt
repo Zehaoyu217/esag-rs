@@ -4,23 +4,23 @@ train n = 1000, test n = 500; covariate x1 ~ N(0, 1); Y | x1 ~ ESAG(mu(x1), gamm
 
 ESAG regression (d = 3, n = 1000, p = 1 covariate(s) + intercept)
 log-likelihood = -1060.4310   AIC = 2140.862   BIC = 2189.940   params = 10
-optimiser: FunctionConverged, 25 iterations, 32 evaluations, |grad|_inf = 1.43e-11
+optimiser: GradientConverged, 15 iterations, 17 evaluations, |grad|_inf = 2.40e-8
 parameter                 estimate     std.err        z     p>|z|
 -----------------------------------------------------------------
 [(Intercept)]
-  mu[1]                    1.58042     0.03980   39.704    0.0000
-  mu[2]                    0.52411     0.03699   14.167    0.0000
+  mu[1]                    1.58042     0.03980   39.705    0.0000
+  mu[2]                    0.52411     0.03700   14.167    0.0000
   mu[3]                    1.05676     0.03723   28.384    0.0000
   gamma[1]                 0.80123     0.12348    6.489    0.0000
-  gamma[2]                -0.43621     0.08890   -4.907    0.0000
+  gamma[2]                -0.43621     0.08893   -4.905    0.0000
 [x1]
   mu[1]                   -0.63405     0.03749  -16.914    0.0000
   mu[2]                    1.20280     0.04273   28.151    0.0000
   mu[3]                    0.34636     0.03427   10.106    0.0000
-  gamma[1]                 0.59434     0.10680    5.565    0.0000
+  gamma[1]                 0.59434     0.10682    5.564    0.0000
   gamma[2]                 0.64106     0.10997    5.829    0.0000
 
-fit time: 3.4 ms (incl. standard errors)
+fit time: 1.9 ms (incl. standard errors)
 
 coefficient recovery (true vs estimate ± 1.96 se):
   (Intercept)mu[1]     true +1.500   est +1.580 ± 0.078   ✗
@@ -49,17 +49,17 @@ prediction region at x1 = 1: centre [0.391, 0.714, 0.580]; q95 = 1.049, q90 = 0.
     plug-in regions (n_boot = 0):            95% → 0.924, 90% → 0.852, 80% → 0.756
     Algorithm 4 regions (100 bootstrap refits): 95% → 0.920, 90% → 0.850, 80% → 0.758
 
-bootstrap hypothesis tests (200 replicates, M with 1000 MC draws/obs):
-  H0: isotropic (gamma ≡ 0) [false]  RoC 1.020 (p=0.000)  D 1.021 (p=0.000)  M 1.14e-4 (p=0.090)  LR  113.26 (p=0.000; χ²_4 approx 1.5e-23)  [0.4 s]
-  H0: shape free of x1 [false]       RoC 1.019 (p=0.000)  D 1.019 (p=0.000)  M 1.48e-4 (p=0.005)  LR  106.39 (p=0.000; χ²_2 approx 7.9e-24)  [0.3 s]
-  H0: pure-noise x2 has no effect [true] RoC 1.001 (p=0.735)  D 1.001 (p=0.705)  M 1.63e-5 (p=0.550)  LR    2.56 (p=0.755; χ²_5 approx 7.7e-1)  [0.4 s]
+bootstrap hypothesis tests (200 replicates, M with exact moments):
+  H0: isotropic (gamma ≡ 0) [false]  RoC 1.020 (p=0.000)  D 1.021 (p=0.000)  M 1.20e-4 (p=0.085)  LR  113.26 (p=0.000; χ²_4 approx 1.5e-23)  [0.1 s]
+  H0: shape free of x1 [false]       RoC 1.019 (p=0.000)  D 1.019 (p=0.000)  M 1.43e-4 (p=0.005)  LR  106.39 (p=0.000; χ²_2 approx 7.9e-24)  [0.1 s]
+  H0: pure-noise x2 has no effect [true] RoC 1.001 (p=0.735)  D 1.001 (p=0.705)  M 1.80e-5 (p=0.500)  LR    2.56 (p=0.755; χ²_5 approx 7.7e-1)  [0.1 s]
   AIC with noise covariate 2148.30 vs without 2140.86
 
 pairs-bootstrap vs Hessian standard errors (200 refits, 0.0 s):
   [(Intercept)] mu[1]: 0.040/0.040  mu[2]: 0.037/0.037  mu[3]: 0.040/0.037  gamma[1]: 0.129/0.123  gamma[2]: 0.095/0.089
   [x1] mu[1]: 0.039/0.037  mu[2]: 0.042/0.043  mu[3]: 0.033/0.034  gamma[1]: 0.110/0.107  gamma[2]: 0.113/0.110
 
-model saved/loaded as JSON (7056 bytes); predictions identical after reload
+model saved/loaded as JSON (7096 bytes); predictions identical after reload
 
 ════════ Part B: real data — Yu & Huang (2025) Sec. 7.1 ════════
 
@@ -67,31 +67,31 @@ sqrt-compositions of (K, Na, Ca, Mg) on S³; X = 0 Anoia tributaries (n = 67), 1
 
 ESAG regression (d = 4, n = 110, p = 1 covariate(s) + intercept)
 log-likelihood = 361.8153   AIC = -687.631   BIC = -639.022   params = 18
-optimiser: FunctionConverged, 106 iterations, 119 evaluations, |grad|_inf = 1.09e-10
+optimiser: GradientConverged, 77 iterations, 84 evaluations, |grad|_inf = 5.46e-10
 parameter                 estimate     std.err        z     p>|z|
 -----------------------------------------------------------------
 [(Intercept)]
   mu[1]                    1.98600     0.15238   13.033    0.0000
-  mu[2]                    5.73646     0.34649   16.556    0.0000
+  mu[2]                    5.73646     0.34650   16.555    0.0000
   mu[3]                    7.95011     0.42871   18.544    0.0000
   mu[4]                    4.58809     0.25001   18.352    0.0000
-  gamma[1]                 0.67196     0.41255    1.629    0.1034
-  gamma[2]                -0.15021     0.18124   -0.829    0.4072
-  gamma[3]                -0.81692     0.40618   -2.011    0.0443
-  gamma[4]                 6.11908     1.76794    3.461    0.0005
+  gamma[1]                 0.67196     0.41271    1.628    0.1035
+  gamma[2]                -0.15021     0.18127   -0.829    0.4073
+  gamma[3]                -0.81692     0.40622   -2.011    0.0443
+  gamma[4]                 6.11908     1.76856    3.460    0.0005
   gamma[5]                 0.63571     0.31076    2.046    0.0408
 [LLt]
-  mu[1]                    1.28228     0.27953    4.587    0.0000
-  mu[2]                    2.82535     0.71862    3.932    0.0001
+  mu[1]                    1.28228     0.27952    4.587    0.0000
+  mu[2]                    2.82535     0.71863    3.932    0.0001
   mu[3]                    1.06235     0.74100    1.434    0.1517
-  mu[4]                    1.19708     0.50458    2.372    0.0177
-  gamma[1]                 1.08331     0.94892    1.142    0.2536
+  mu[4]                    1.19708     0.50457    2.372    0.0177
+  gamma[1]                 1.08331     0.94898    1.142    0.2536
   gamma[2]                 0.21667     0.31450    0.689    0.4909
-  gamma[3]                -8.53863     3.12711   -2.731    0.0063
-  gamma[4]                 7.95740     4.93278    1.613    0.1067
-  gamma[5]                -1.74435     0.61830   -2.821    0.0048
+  gamma[3]                -8.53863     3.12705   -2.731    0.0063
+  gamma[4]                 7.95740     4.93315    1.613    0.1067
+  gamma[5]                -1.74435     0.61837   -2.821    0.0048
 
-fit time: 6.2 ms (11 starts)
+fit time: 2.3 ms (11 starts)
 
                                                   paper (CSDA 2025 / EJS 2024)                       esag (Rust)
 mu intercept alpha_0                                  (1.99, 5.74, 7.95, 4.59)          [1.99, 5.74, 7.95, 4.59]
@@ -102,11 +102,11 @@ lower Llobregat: eigenvalues of V                           (0.19, 0.54, 9.61)  
 lower Llobregat: |gamma|                                                 17.03                             17.03
 
 hypothesis tests (dissertation Table 2.9 values in brackets; 300 bootstrap replicates):
-  H0: isotropy                       RoC 1.518 (p=0.000)  D 1.518 (p=0.000)  M 2.24e-4 (p=0.000)  LR  275.41 (p=0.000; χ²_10 approx 2.4e-53)  [0.3 s]
+  H0: isotropy                       RoC 1.518 (p=0.000)  D 1.518 (p=0.000)  M 2.17e-4 (p=0.000)  LR  275.41 (p=0.000; χ²_10 approx 2.4e-53)  [0.1 s]
                                      [RoC 1.518, D 1.518, LR 275.4, all p = 0.00]
-  H0: mu free of river group         RoC 1.059 (p=0.000)  D 1.062 (p=0.000)  M 8.47e-4 (p=0.023)  LR   31.58 (p=0.000; χ²_4 approx 2.3e-6)  [0.2 s]
+  H0: mu free of river group         RoC 1.059 (p=0.000)  D 1.062 (p=0.000)  M 8.56e-4 (p=0.020)  LR   31.58 (p=0.000; χ²_4 approx 2.3e-6)  [0.0 s]
                                      [RoC 1.059, D 1.062, LR 31.6, all p = 0.00]
-  H0: gamma free of river group      RoC 1.090 (p=0.000)  D 1.090 (p=0.000)  M 9.17e-5 (p=0.017)  LR   57.56 (p=0.000; χ²_5 approx 3.9e-11)  [0.2 s]
+  H0: gamma free of river group      RoC 1.090 (p=0.000)  D 1.090 (p=0.000)  M 9.47e-5 (p=0.010)  LR   57.56 (p=0.000; χ²_5 approx 3.9e-11)  [0.0 s]
                                      [RoC 1.090, D 1.090, LR 57.6, all p ≤ 0.01]
 
 prediction-region thresholds q at 70/80/90% (dissertation Table 2.10 in brackets):
@@ -115,4 +115,4 @@ prediction-region thresholds q at 70/80/90% (dissertation Table 2.10 in brackets
 
 goodness of fit (Algorithm 1): bootstrap p = 0.197 (300 replicates)
 
-total wall time 2.0 s on 15 threads
+total wall time 0.6 s on 15 threads
