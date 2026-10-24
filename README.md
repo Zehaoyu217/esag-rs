@@ -282,17 +282,50 @@ The last row shows why the papers use the bootstrap.
 ## Performance
 
 Measured on the same machine (Apple M5 Pro), with the same data and settings
-as the R timings stored in the fixtures. Run
-`cargo run --release --example bench_vs_r`.
+as the R timings stored in the fixtures. R is single-threaded, so the
+one-core column is the like-for-like comparison. Run
+`RAYON_NUM_THREADS=1 cargo run --release --example bench_vs_r`.
 
-| task | R 4.6.1 | esag | speed-up |
-|---|---|---|---|
-| MLE + Hessian, regression d=3, n=200, p=2 | 7.02 s | 0.77 ms | 9,100× |
-| MLE + Hessian, regression d=3, n=1000, p=2 | 36.5 s | 1.33 ms | 27,000× |
-| MLE + Hessian, i.i.d. d=3, n=300 | 3.24 s | 0.76 ms | 4,200× |
-| MLE + Hessian, i.i.d. d=4, n=300 | 12.4 s | 1.08 ms | 11,500× |
-| `Bootstrap_GoF`, 20 refits, n=200 | 79 s | 0.77 ms | 103,000× |
-| `Prediction_Region`, m=2000, 5 refits | 21 s | 0.39 ms | 55,000× |
+| task | R 4.6.1 | esag, 1 core | speed-up, 1 core | esag, all cores |
+|---|---|---|---|---|
+| MLE + Hessian, regression d=3, n=200, p=2 | 7.02 s | 1.29 ms | 5,400× | 0.77 ms |
+| MLE + Hessian, regression d=3, n=1000, p=2 | 36.5 s | 3.07 ms | 11,900× | 1.33 ms |
+| MLE + Hessian, i.i.d. d=3, n=300 | 3.24 s | 0.50 ms | 6,400× | 0.76 ms |
+| MLE + Hessian, i.i.d. d=4, n=300 | 12.4 s | 1.50 ms | 8,300× | 1.08 ms |
+| `Bootstrap_GoF`, 20 refits, n=200 | 79 s | 2.73 ms | 29,000× | 0.77 ms |
+| `Prediction_Region`, m=2000, 5 refits | 21 s | 0.63 ms | 33,000× | 0.39 ms |
+
+### Why it is fast on one core
+
+Parallelism adds a factor of about 10 on 15 threads; everything else is
+algorithmic and holds on a single core. Memory stays small: a B = 500 test
+at n = 2000 peaks at 5–9 MB (31 MB for d = 8). Replicates are generated,
+refitted and reduced to four numbers one at a time.
+
+* **Exact derivatives.** The R code uses `optim` with finite-difference
+  gradients (k + 1 likelihood passes per gradient for k coefficients) and a
+  numerical Hessian. esag computes the gradient in about one pass (dual
+  numbers and an adjoint for γ, closed-form Daleckii–Krein derivatives for
+  the log-tangent shape) and the Hessian exactly.
+* **A compiled per-observation kernel.** It works on the eigen-structure of
+  V directly, with no d × d inverse, and uses a stable `log M_p` with fixed
+  sizes on the stack: 37–160 ns per observation for γ (d = 3–8) and
+  55–1,070 ns for the log-tangent shape.
+* **Exact moments for M.** The R code estimates `E[y²|x_i]` by Monte Carlo
+  (10⁴ draws per observation per replicate). esag uses a 1-D integral that
+  is exact to 1e−12, with both tails of the quadrature summed in closed
+  form: 0.3–0.6 µs per observation.
+* **Bootstrap refits that start where they end.** Each refit is
+  warm-started at the original fit and whitened with its inverse
+  information, takes a Newton-sized first step, and stops on a statistical
+  rule: coefficients within 0.0014 SE, log-likelihood within 1e−6. A refit
+  takes 6–10 likelihood passes at n = 2000.
+* **A smooth shape model where γ is singular.** The log-tangent shape
+  removes the discontinuities of γ ↦ V that make big γ regressions take
+  hundreds of iterations or fail.
+* **Small things that add up.** Matrix-product assembly of η = B X̃ᵀ and of
+  the gradient, cube and square roots instead of `powf`, a Newton finish
+  for standard errors, and early pruning of dominated starts.
 
 `cargo run --release --example perf_suite` times a wider set of workloads
 (medians; the "now" column was measured with other processes running, load
@@ -310,19 +343,21 @@ average about 5).
 | `regression_demo`, whole run | 6.3 s | 2.0 s | 0.6 s |
 
 Bootstrap hypothesis tests at B = 500, n = 2000, 5 covariates + const
-(`cargo run --release --example test_bench 3,5,8`; each run computes RoC, D,
-M and LR; the four nulls are isotropy, μ free of x1, shape free of x1, and
-no effect of x5):
+(`cargo run --release --example test_bench 3,5,8`, with
+`RAYON_NUM_THREADS=1` for one core; each run computes RoC, D, M and LR; the
+four nulls are isotropy, μ free of x1, shape free of x1, and no effect of
+x5):
 
-| d | log-tangent shape | γ shape |
-|---|---|---|
-| 3 | 0.30–0.34 s | 0.49–0.78 s |
-| 5 | 0.80–1.21 s | 3.1–8.4 s; isotropy 178 s* |
-| 8 | 4.1–5.0 s | 21–74 s |
+| d | log-tangent, 1 core | log-tangent, 15 threads | γ, 1 core | γ, 15 threads |
+|---|---|---|---|---|
+| 3 | 1.6–1.8 s | 0.16–0.17 s | 2.5–6.2 s | 0.26–0.62 s |
+| 5 | 5.5–8.4 s | 0.47–0.70 s | 27–79 s; isotropy 370 s* | 3.1–8.4 s† |
+| 8 | 24–32 s | 2.4–3.0 s | 198–711 s | 21–74 s† |
 
 \* In γ, the isotropy null of a d ≥ 5 regression lies on the singular set
 (§2 of `docs/MATH.md`), so full refits of null replicates do not converge;
-the log-tangent shape has no such problem. The Python session in
+the log-tangent shape has no such problem. † Measured before the latest
+refit and quadrature changes. The Python session in
 `python/examples/demo.py` (d = 3, γ, five nulls, five penalties) runs each
 test in 1.1–1.8 s and each penalty path in 0.6–1.3 s.
 
