@@ -102,7 +102,9 @@ pub fn bootstrap_gof(
             let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1 + b as u64));
             let yb = fit.sample_responses(x, &mut rng).ok()?;
             let refit = cfg.fit_warm(x, &yb, &fit.coef).ok()?;
-            ks_stat(&refit, x, &yb, method, &mut rng).ok().map(|(_, p)| p)
+            ks_stat(&refit, x, &yb, method, &mut rng)
+                .ok()
+                .map(|(_, p)| p)
         })
         .collect();
     let pvals: Vec<f64> = boot.iter().flatten().copied().collect();

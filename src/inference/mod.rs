@@ -10,7 +10,10 @@ pub mod tests;
 
 pub use bootstrap::{BootstrapResult, bootstrap_coef};
 pub use gof::{GofMethod, GofResult, bootstrap_gof};
-pub use regions::{PredictionRegion, confidence_region_sample, prediction_region, region_coverage};
+pub use regions::{
+    PredictionRegion, bootstrap_refits, confidence_region_sample, prediction_region,
+    prediction_regions, region_coverage,
+};
 pub use tests::{HypothesisTestResult, Restriction, hypothesis_test};
 
 use crate::regression::{EsagRegressor, EsagRegressorFit};

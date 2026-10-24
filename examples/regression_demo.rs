@@ -13,7 +13,8 @@
 
 use esag::distribution::Esag;
 use esag::inference::{
-    GofMethod, Restriction, bootstrap_coef, bootstrap_gof, hypothesis_test, prediction_region, region_coverage,
+    GofMethod, Restriction, bootstrap_coef, bootstrap_gof, hypothesis_test, prediction_region,
+    region_coverage,
 };
 use esag::regression::{EsagRegressor, EsagRegressorFit};
 use nalgebra::DMatrix;
@@ -58,14 +59,19 @@ fn print_test(name: &str, r: &esag::inference::HypothesisTestResult, dt: f64) {
 fn part_a() -> Res<()> {
     println!("════════ Part A: simulated ESAG regression (d = 3) ════════\n");
     // rows (mu1, mu2, mu3, gamma1, gamma2); columns (intercept, slope on x1)
-    let b_true = DMatrix::from_column_slice(5, 2, &[1.5, 0.5, 1.0, 0.8, -0.4, -0.6, 1.2, 0.3, 0.5, 0.7]);
+    let b_true =
+        DMatrix::from_column_slice(5, 2, &[1.5, 0.5, 1.0, 0.8, -0.4, -0.6, 1.2, 0.3, 0.5, 0.7]);
     let (x, y) = simulate(1000, &b_true, 2024);
     let (x_test, y_test) = simulate(500, &b_true, 2025);
-    println!("train n = 1000, test n = 500; covariate x1 ~ N(0, 1); Y | x1 ~ ESAG(mu(x1), gamma(x1))\n");
+    println!(
+        "train n = 1000, test n = 500; covariate x1 ~ N(0, 1); Y | x1 ~ ESAG(mu(x1), gamma(x1))\n"
+    );
 
     // ---- fit
     let t = Instant::now();
-    let model = EsagRegressor::new().with_feature_names(vec!["x1".into()]).fit(&x, &y)?;
+    let model = EsagRegressor::new()
+        .with_feature_names(vec!["x1".into()])
+        .fit(&x, &y)?;
     let fit_ms = secs(t) * 1e3;
     println!("{}", model.summary());
     println!("fit time: {fit_ms:.1} ms (incl. standard errors)\n");
@@ -94,8 +100,13 @@ fn part_a() -> Res<()> {
 
     // ---- predict / score
     let yhat = model.predict(&x_test)?;
-    let mean_cos = (0..500).map(|i| (0..3).map(|k| yhat[(i, k)] * y_test[(i, k)]).sum::<f64>()).sum::<f64>() / 500.0;
-    let base = EsagRegressor::new().with_hessian(false).fit(&DMatrix::zeros(1000, 0), &y)?;
+    let mean_cos = (0..500)
+        .map(|i| (0..3).map(|k| yhat[(i, k)] * y_test[(i, k)]).sum::<f64>())
+        .sum::<f64>()
+        / 500.0;
+    let base = EsagRegressor::new()
+        .with_hessian(false)
+        .fit(&DMatrix::zeros(1000, 0), &y)?;
     println!("held-out performance:");
     println!("  mean cos(predicted mean direction, observed y) = {mean_cos:.4}");
     println!(
@@ -116,7 +127,10 @@ fn part_a() -> Res<()> {
 
     // ---- residuals and goodness of fit
     let res = model.residuals(&x, &y)?;
-    println!("residual diagnostics: mean T1 = {:.3} (≈ chi²_2 mean 2)", res.t1.iter().sum::<f64>() / 1000.0);
+    println!(
+        "residual diagnostics: mean T1 = {:.3} (≈ chi²_2 mean 2)",
+        res.t1.iter().sum::<f64>() / 1000.0
+    );
     for method in [GofMethod::TwoSampleReference, GofMethod::OneSampleChiSquare] {
         let t = Instant::now();
         let g = bootstrap_gof(&model, &x, &y, method, 200, 1)?;
@@ -142,9 +156,19 @@ fn part_a() -> Res<()> {
         pr.thresholds[2],
         secs(t)
     );
-    let cov = region_coverage(&model, &x_test, &y_test, 4000, &levels, 11)?;
+    let t = Instant::now();
+    let cov0 = region_coverage(&model, &x, &y, &x_test, &y_test, 2000, 0, &levels, 11)?;
+    let cov = region_coverage(&model, &x, &y, &x_test, &y_test, 500, 100, &levels, 11)?;
     println!(
-        "  held-out coverage of plug-in regions: 95% → {:.3}, 90% → {:.3}, 80% → {:.3}\n",
+        "  held-out coverage on the 500 test points ({:.1} s):",
+        secs(t)
+    );
+    println!(
+        "    plug-in regions (n_boot = 0):            95% → {:.3}, 90% → {:.3}, 80% → {:.3}",
+        cov0[0], cov0[1], cov0[2]
+    );
+    println!(
+        "    Algorithm 4 regions (100 bootstrap refits): 95% → {:.3}, 90% → {:.3}, 80% → {:.3}\n",
         cov[0], cov[1], cov[2]
     );
 
@@ -157,19 +181,36 @@ fn part_a() -> Res<()> {
     let r = hypothesis_test(&model, &x, &y, Restriction::GammaOfFeature(0), 200, 1000, 5)?;
     print_test("H0: shape free of x1 [false]", &r, secs(t));
     let mut rng = ChaCha8Rng::seed_from_u64(99);
-    let x2 = DMatrix::from_fn(1000, 2, |i, j| if j == 0 { x[(i, 0)] } else { StandardNormal.sample(&mut rng) });
-    let model2 = EsagRegressor::new().with_feature_names(vec!["x1".into(), "noise".into()]).fit(&x2, &y)?;
+    let x2 = DMatrix::from_fn(1000, 2, |i, j| {
+        if j == 0 {
+            x[(i, 0)]
+        } else {
+            StandardNormal.sample(&mut rng)
+        }
+    });
+    let model2 = EsagRegressor::new()
+        .with_feature_names(vec!["x1".into(), "noise".into()])
+        .fit(&x2, &y)?;
     let t = Instant::now();
     let r = hypothesis_test(&model2, &x2, &y, Restriction::Feature(1), 200, 1000, 13)?;
     print_test("H0: pure-noise x2 has no effect [true]", &r, secs(t));
-    println!("  AIC with noise covariate {:.2} vs without {:.2}\n", model2.aic(), model.aic());
+    println!(
+        "  AIC with noise covariate {:.2} vs without {:.2}\n",
+        model2.aic(),
+        model.aic()
+    );
 
     // ---- bootstrap SEs
     let t = Instant::now();
     let bs = bootstrap_coef(&model, &x, &y, 200, 0.95, 17)?;
-    println!("pairs-bootstrap vs Hessian standard errors (200 refits, {:.1} s):", secs(t));
+    println!(
+        "pairs-bootstrap vs Hessian standard errors (200 refits, {:.1} s):",
+        secs(t)
+    );
     for j in 0..2 {
-        let line: Vec<String> = (0..5).map(|k| format!("{}: {:.3}/{:.3}", rows[k], bs.coef_se[(k, j)], se[(k, j)])).collect();
+        let line: Vec<String> = (0..5)
+            .map(|k| format!("{}: {:.3}/{:.3}", rows[k], bs.coef_se[(k, j)], se[(k, j)]))
+            .collect();
         println!("  [{}] {}", model.column_names[j], line.join("  "));
     }
 
@@ -177,44 +218,94 @@ fn part_a() -> Res<()> {
     let json = model.to_json()?;
     let back = EsagRegressorFit::from_json(&json)?;
     assert_eq!(back.predict(&x_test)?, yhat);
-    println!("\nmodel saved/loaded as JSON ({} bytes); predictions identical after reload\n", json.len());
+    println!(
+        "\nmodel saved/loaded as JSON ({} bytes); predictions identical after reload\n",
+        json.len()
+    );
     Ok(())
 }
 
 fn part_b() -> Res<()> {
     println!("════════ Part B: real data — Yu & Huang (2025) Sec. 7.1 ════════\n");
-    let mut rdr = csv::Reader::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/hydrochem_At_LLt.csv"))?;
+    let mut rdr = csv::Reader::from_path(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/data/hydrochem_At_LLt.csv"
+    ))?;
     let rows: Vec<csv::StringRecord> = rdr.records().collect::<Result<_, _>>()?;
     let n = rows.len();
     let x = DMatrix::from_fn(n, 1, |i, _| rows[i][1].parse::<f64>().unwrap());
     let y = DMatrix::from_fn(n, 4, |i, j| rows[i][6 + j].parse::<f64>().unwrap());
-    println!("sqrt-compositions of (K, Na, Ca, Mg) on S³; X = 0 Anoia tributaries (n = 67), 1 lower-Llobregat tributaries (n = 43)\n");
+    println!(
+        "sqrt-compositions of (K, Na, Ca, Mg) on S³; X = 0 Anoia tributaries (n = 67), 1 lower-Llobregat tributaries (n = 43)\n"
+    );
 
     let t = Instant::now();
-    let model = EsagRegressor::new().with_feature_names(vec!["LLt".into()]).with_restarts(10, 3).fit(&x, &y)?;
+    let model = EsagRegressor::new()
+        .with_feature_names(vec!["LLt".into()])
+        .with_restarts(10, 3)
+        .fit(&x, &y)?;
     println!("{}", model.summary());
     println!("fit time: {:.1} ms (11 starts)\n", secs(t) * 1e3);
 
-    println!("{:<44}{:>34}{:>34}", "", "paper (CSDA 2025 / EJS 2024)", "esag (Rust)");
+    println!(
+        "{:<44}{:>34}{:>34}",
+        "", "paper (CSDA 2025 / EJS 2024)", "esag (Rust)"
+    );
     let a0: Vec<f64> = (0..4).map(|k| model.coef[(k, 0)]).collect();
     let a1: Vec<f64> = (0..4).map(|k| model.coef[(k, 1)]).collect();
-    println!("{:<44}{:>34}{:>34}", "mu intercept alpha_0", "(1.99, 5.74, 7.95, 4.59)", format!("{a0:.2?}"));
-    println!("{:<44}{:>34}{:>34}", "mu slope alpha_1", "(1.28, 2.83, 1.06, 1.20)", format!("{a1:.2?}"));
+    println!(
+        "{:<44}{:>34}{:>34}",
+        "mu intercept alpha_0",
+        "(1.99, 5.74, 7.95, 4.59)",
+        format!("{a0:.2?}")
+    );
+    println!(
+        "{:<44}{:>34}{:>34}",
+        "mu slope alpha_1",
+        "(1.28, 2.83, 1.06, 1.20)",
+        format!("{a1:.2?}")
+    );
     for (lab, xv, paper_l, paper_g) in [
         ("Anoia", 0.0, "(0.37, 0.62, 4.44)", "6.24"),
         ("lower Llobregat", 1.0, "(0.19, 0.54, 9.61)", "17.03"),
     ] {
-        let dist = model.predict_distribution(&DMatrix::from_element(1, 1, xv))?.remove(0);
+        let dist = model
+            .predict_distribution(&DMatrix::from_element(1, 1, xv))?
+            .remove(0);
         let gn = dist.gamma().iter().map(|v| v * v).sum::<f64>().sqrt();
-        println!("{:<44}{:>34}{:>34}", format!("{lab}: eigenvalues of V"), paper_l, format!("{:.2?}", dist.angles().lambda));
-        println!("{:<44}{:>34}{:>34}", format!("{lab}: |gamma|"), paper_g, format!("{gn:.2}"));
+        println!(
+            "{:<44}{:>34}{:>34}",
+            format!("{lab}: eigenvalues of V"),
+            paper_l,
+            format!("{:.2?}", dist.angles().lambda)
+        );
+        println!(
+            "{:<44}{:>34}{:>34}",
+            format!("{lab}: |gamma|"),
+            paper_g,
+            format!("{gn:.2}")
+        );
     }
 
-    println!("\nhypothesis tests (dissertation Table 2.9 values in brackets; 300 bootstrap replicates):");
+    println!(
+        "\nhypothesis tests (dissertation Table 2.9 values in brackets; 300 bootstrap replicates):"
+    );
     for (name, restr, paper) in [
-        ("H0: isotropy", Restriction::Isotropy, "[RoC 1.518, D 1.518, LR 275.4, all p = 0.00]"),
-        ("H0: mu free of river group", Restriction::MuOfFeature(0), "[RoC 1.059, D 1.062, LR 31.6, all p = 0.00]"),
-        ("H0: gamma free of river group", Restriction::GammaOfFeature(0), "[RoC 1.090, D 1.090, LR 57.6, all p ≤ 0.01]"),
+        (
+            "H0: isotropy",
+            Restriction::Isotropy,
+            "[RoC 1.518, D 1.518, LR 275.4, all p = 0.00]",
+        ),
+        (
+            "H0: mu free of river group",
+            Restriction::MuOfFeature(0),
+            "[RoC 1.059, D 1.062, LR 31.6, all p = 0.00]",
+        ),
+        (
+            "H0: gamma free of river group",
+            Restriction::GammaOfFeature(0),
+            "[RoC 1.090, D 1.090, LR 57.6, all p ≤ 0.01]",
+        ),
     ] {
         let t = Instant::now();
         let r = hypothesis_test(&model, &x, &y, restr, 300, 2000, 21)?;
@@ -222,8 +313,13 @@ fn part_b() -> Res<()> {
         println!("  {:<34} {paper}", "");
     }
 
-    println!("\nprediction-region thresholds q at 70/80/90% (dissertation Table 2.10 in brackets):");
-    for (lab, xv, paper) in [("Anoia", 0.0, "[0.0286, 0.0364, 0.0495]"), ("lower Llobregat", 1.0, "[0.0178, 0.0227, 0.0312]")] {
+    println!(
+        "\nprediction-region thresholds q at 70/80/90% (dissertation Table 2.10 in brackets):"
+    );
+    for (lab, xv, paper) in [
+        ("Anoia", 0.0, "[0.0286, 0.0364, 0.0495]"),
+        ("lower Llobregat", 1.0, "[0.0178, 0.0227, 0.0312]"),
+    ] {
         let t = Instant::now();
         let pr = prediction_region(&model, &x, &y, &[xv], 10_000, 100, &[0.70, 0.80, 0.90], 31)?;
         println!(
@@ -236,7 +332,10 @@ fn part_b() -> Res<()> {
         );
     }
     let g = bootstrap_gof(&model, &x, &y, GofMethod::TwoSampleReference, 300, 41)?;
-    println!("\ngoodness of fit (Algorithm 1): bootstrap p = {:.3} ({} replicates)", g.p_value, g.n_boot);
+    println!(
+        "\ngoodness of fit (Algorithm 1): bootstrap p = {:.3} ({} replicates)",
+        g.p_value, g.n_boot
+    );
     Ok(())
 }
 
@@ -244,6 +343,10 @@ fn main() -> Res<()> {
     let t = Instant::now();
     part_a()?;
     part_b()?;
-    println!("\ntotal wall time {:.1} s on {} threads", secs(t), rayon::current_num_threads());
+    println!(
+        "\ntotal wall time {:.1} s on {} threads",
+        secs(t),
+        rayon::current_num_threads()
+    );
     Ok(())
 }

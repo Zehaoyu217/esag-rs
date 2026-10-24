@@ -1,0 +1,118 @@
+════════ Part A: simulated ESAG regression (d = 3) ════════
+
+train n = 1000, test n = 500; covariate x1 ~ N(0, 1); Y | x1 ~ ESAG(mu(x1), gamma(x1))
+
+ESAG regression (d = 3, n = 1000, p = 1 covariate(s) + intercept)
+log-likelihood = -1060.4310   AIC = 2140.862   BIC = 2189.940   params = 10
+optimiser: FunctionConverged, 22 iterations, 25 evaluations, |grad|_inf = 1.30e-4
+parameter                 estimate     std.err        z     p>|z|
+-----------------------------------------------------------------
+[(Intercept)]
+  mu[1]                    1.58042     0.03980   39.704    0.0000
+  mu[2]                    0.52411     0.03699   14.167    0.0000
+  mu[3]                    1.05676     0.03723   28.384    0.0000
+  gamma[1]                 0.80123     0.12348    6.489    0.0000
+  gamma[2]                -0.43621     0.08890   -4.907    0.0000
+[x1]
+  mu[1]                   -0.63405     0.03749  -16.914    0.0000
+  mu[2]                    1.20280     0.04273   28.151    0.0000
+  mu[3]                    0.34636     0.03427   10.106    0.0000
+  gamma[1]                 0.59434     0.10680    5.565    0.0000
+  gamma[2]                 0.64106     0.10997    5.829    0.0000
+
+fit time: 18.3 ms (incl. standard errors)
+
+coefficient recovery (true vs estimate ± 1.96 se):
+  (Intercept)mu[1]     true +1.500   est +1.580 ± 0.078   ✗
+  (Intercept)mu[2]     true +0.500   est +0.524 ± 0.073   ✓
+  (Intercept)mu[3]     true +1.000   est +1.057 ± 0.073   ✓
+  (Intercept)gamma[1]  true +0.800   est +0.801 ± 0.242   ✓
+  (Intercept)gamma[2]  true -0.400   est -0.436 ± 0.174   ✓
+  x1         mu[1]     true -0.600   est -0.634 ± 0.073   ✓
+  x1         mu[2]     true +1.200   est +1.203 ± 0.084   ✓
+  x1         mu[3]     true +0.300   est +0.346 ± 0.067   ✓
+  x1         gamma[1]  true +0.500   est +0.594 ± 0.209   ✓
+  x1         gamma[2]  true +0.700   est +0.641 ± 0.216   ✓
+  9/10 true values inside their 95% Wald interval
+
+held-out performance:
+  mean cos(predicted mean direction, observed y) = 0.7772
+  mean log-likelihood: regression -1.2210  vs  intercept-only -1.7415
+  fitted conditional distribution at x1 = +0.106: mean dir [0.765, 0.329, 0.553], |mu| 1.977, lambda (0.718, 1.393)
+
+residual diagnostics: mean T1 = 2.376 (≈ chi²_2 mean 2)
+  GoF TwoSampleReference: KS_p = 0.181, bootstrap p = 0.100 (200 replicates, 0.1 s)
+  GoF OneSampleChiSquare: KS_p = 0.000, bootstrap p = 0.270 (200 replicates, 0.1 s)
+
+prediction region at x1 = 1: centre [0.391, 0.714, 0.580]; q95 = 1.058, q90 = 0.765, q80 = 0.511 (50 bootstrap refits, 0.0 s)
+  held-out coverage on the 500 test points (0.2 s):
+    plug-in regions (n_boot = 0):            95% → 0.916, 90% → 0.848, 80% → 0.754
+    Algorithm 4 regions (100 bootstrap refits): 95% → 0.920, 90% → 0.850, 80% → 0.756
+
+bootstrap hypothesis tests (200 replicates, M with 1000 MC draws/obs):
+  H0: isotropic (gamma ≡ 0) [false]  RoC 1.020 (p=0.000)  D 1.021 (p=0.000)  M 1.27e-4 (p=0.070)  LR  113.26 (p=0.000; χ²_4 approx 1.5e-23)  [0.7 s]
+  H0: shape free of x1 [false]       RoC 1.019 (p=0.000)  D 1.019 (p=0.000)  M 1.49e-4 (p=0.015)  LR  106.39 (p=0.000; χ²_2 approx 7.9e-24)  [0.7 s]
+  H0: pure-noise x2 has no effect [true] RoC 1.001 (p=0.690)  D 1.001 (p=0.685)  M 1.63e-5 (p=0.535)  LR    2.56 (p=0.740; χ²_5 approx 7.7e-1)  [0.8 s]
+  AIC with noise covariate 2148.30 vs without 2140.86
+
+pairs-bootstrap vs Hessian standard errors (200 refits, 0.1 s):
+  [(Intercept)] mu[1]: 0.041/0.040  mu[2]: 0.038/0.037  mu[3]: 0.038/0.037  gamma[1]: 0.132/0.123  gamma[2]: 0.089/0.089
+  [x1] mu[1]: 0.038/0.037  mu[2]: 0.043/0.043  mu[3]: 0.038/0.034  gamma[1]: 0.102/0.107  gamma[2]: 0.108/0.110
+
+model saved/loaded as JSON (7016 bytes); predictions identical after reload
+
+════════ Part B: real data — Yu & Huang (2025) Sec. 7.1 ════════
+
+sqrt-compositions of (K, Na, Ca, Mg) on S³; X = 0 Anoia tributaries (n = 67), 1 lower-Llobregat tributaries (n = 43)
+
+ESAG regression (d = 4, n = 110, p = 1 covariate(s) + intercept)
+log-likelihood = 361.8153   AIC = -687.631   BIC = -639.022   params = 18
+optimiser: FunctionConverged, 188 iterations, 206 evaluations, |grad|_inf = 6.36e-5
+parameter                 estimate     std.err        z     p>|z|
+-----------------------------------------------------------------
+[(Intercept)]
+  mu[1]                    1.98600     0.15238   13.033    0.0000
+  mu[2]                    5.73646     0.34649   16.556    0.0000
+  mu[3]                    7.95011     0.42871   18.544    0.0000
+  mu[4]                    4.58809     0.25001   18.352    0.0000
+  gamma[1]                 0.67195     0.41255    1.629    0.1034
+  gamma[2]                -0.15021     0.18124   -0.829    0.4072
+  gamma[3]                -0.81692     0.40618   -2.011    0.0443
+  gamma[4]                 6.11906     1.76793    3.461    0.0005
+  gamma[5]                 0.63571     0.31075    2.046    0.0408
+[LLt]
+  mu[1]                    1.28228     0.27953    4.587    0.0000
+  mu[2]                    2.82535     0.71862    3.932    0.0001
+  mu[3]                    1.06233     0.74100    1.434    0.1517
+  mu[4]                    1.19707     0.50458    2.372    0.0177
+  gamma[1]                 1.08332     0.94893    1.142    0.2536
+  gamma[2]                 0.21667     0.31450    0.689    0.4909
+  gamma[3]                -8.53865     3.12714   -2.730    0.0063
+  gamma[4]                 7.95743     4.93281    1.613    0.1067
+  gamma[5]                -1.74435     0.61831   -2.821    0.0048
+
+fit time: 179.6 ms (11 starts)
+
+                                                  paper (CSDA 2025 / EJS 2024)                       esag (Rust)
+mu intercept alpha_0                                  (1.99, 5.74, 7.95, 4.59)          [1.99, 5.74, 7.95, 4.59]
+mu slope alpha_1                                      (1.28, 2.83, 1.06, 1.20)          [1.28, 2.83, 1.06, 1.20]
+Anoia: eigenvalues of V                                     (0.37, 0.62, 4.44)                [0.37, 0.62, 4.44]
+Anoia: |gamma|                                                            6.24                              6.24
+lower Llobregat: eigenvalues of V                           (0.19, 0.54, 9.61)                [0.19, 0.54, 9.61]
+lower Llobregat: |gamma|                                                 17.03                             17.03
+
+hypothesis tests (dissertation Table 2.9 values in brackets; 300 bootstrap replicates):
+  H0: isotropy                       RoC 1.518 (p=0.000)  D 1.518 (p=0.000)  M 2.15e-4 (p=0.000)  LR  275.41 (p=0.000; χ²_10 approx 2.4e-53)  [1.1 s]
+                                     [RoC 1.518, D 1.518, LR 275.4, all p = 0.00]
+  H0: mu free of river group         RoC 1.059 (p=0.000)  D 1.062 (p=0.000)  M 8.66e-4 (p=0.017)  LR   31.58 (p=0.000; χ²_4 approx 2.3e-6)  [1.0 s]
+                                     [RoC 1.059, D 1.062, LR 31.6, all p = 0.00]
+  H0: gamma free of river group      RoC 1.090 (p=0.000)  D 1.090 (p=0.000)  M 9.72e-5 (p=0.003)  LR   57.56 (p=0.000; χ²_5 approx 3.9e-11)  [0.7 s]
+                                     [RoC 1.090, D 1.090, LR 57.6, all p ≤ 0.01]
+
+prediction-region thresholds q at 70/80/90% (dissertation Table 2.10 in brackets):
+  Anoia            0.0287, 0.0365, 0.0495   [0.0286, 0.0364, 0.0495]   (100 bootstrap refits, 0.1 s)
+  lower Llobregat  0.0176, 0.0226, 0.0309   [0.0178, 0.0227, 0.0312]   (100 bootstrap refits, 0.1 s)
+
+goodness of fit (Algorithm 1): bootstrap p = 0.080 (300 replicates)
+
+total wall time 6.3 s on 15 threads

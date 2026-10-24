@@ -216,7 +216,21 @@ impl EsagRegressor {
             )));
         }
         let mask = self.resolve_mask(&data)?;
-        self.fit_from(&data, b0.clone(), mask)
+        let fit = self.fit_from(&data, b0.clone(), mask.clone())?;
+        if fit.converged || self.max_iter == 0 {
+            return Ok(fit);
+        }
+        // Safety net (used by every bootstrap refit): a warm start that ends
+        // at a singular point of the parameterization fails the gradient
+        // check; retry from the R-style start and keep the better fit.
+        let mut b1 = self.clone().with_init(Init::RStyle).initial_coef(&data)?;
+        for (v, &free) in b1.iter_mut().zip(mask.iter()) {
+            if !free {
+                *v = 0.0;
+            }
+        }
+        let alt = self.fit_from(&data, b1, mask)?;
+        Ok(if better(&alt, &fit) { alt } else { fit })
     }
 
     fn resolve_mask(&self, data: &RegressionData) -> Result<DMatrix<bool>> {

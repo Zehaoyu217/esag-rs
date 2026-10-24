@@ -1,5 +1,9 @@
 # esag — architecture and implementation contract
 
+> This was the contract the modules were built against. Deviations made
+> during implementation are listed at the end; see `docs/MATH.md` for the
+> mathematics as implemented and `README.md` for the API.
+
 Rust port + re-engineering of the ESAG R code in `Zehaoyu217/ESAG`
 (`ESAG_Project2.R` is the authoritative, general-`d` version; `ESAG.R` is an
 older variant). Reference R sources are mirrored under `reference/r/`.
@@ -135,7 +139,9 @@ src/error.rs       EsagError (thiserror)
 src/distribution.rs  Esag { mu, gamma } : log_pdf, pdf, sample, covariance, mean_direction, angles, ...
 src/regression.rs  EsagRegressor (config/builder) + EsagRegressorFit (fitted model)
 src/estimator.rs   EsagEstimator (no covariates) + EsagFit; traits Fit/Predict/Score
-src/inference/     residuals.rs, gof.rs, regions.rs, tests.rs
+src/inference/     gof.rs, regions.rs, tests.rs, bootstrap.rs (residuals live on the fitted model)
+src/preprocessing.rs MinMaxScaler ([1, 2] covariate scaling, as in the papers)
+src/bin/esag.rs    command-line tool
 examples/          regression_demo.rs, …
 tests/             r_parity.rs (fixtures), properties.rs
 ```
@@ -154,3 +160,20 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
   `seed_from_u64(seed.wrapping_add(replicate as u64))` so results do not depend
   on thread count. (rand 0.10 / rand_distr 0.6 — check the exact API in
   `~/.cargo/registry/src/*/rand-0.10*/` before using it.)
+
+## Deviations made during implementation
+
+* `log M_p` for `alpha < -2` uses a backward continued fraction instead of the
+  asymptotic series; the series is not accurate enough at `|alpha| = 8` for
+  `p ≥ 5`.
+* L-BFGS also accepts Hager–Zhang approximate-Wolfe points, because a
+  function-value line search stalls at `‖g‖ ≈ sqrt(2 λ_max ulp(f))`.
+* Fits are canonicalised under the exact symmetry `γ group 1 → −γ group 1`
+  (`regression::canonicalize_coef`).
+* `Init::Auto` (default) runs the data-driven and R-style starts. A fit only
+  counts as converged if the mean per-observation gradient is ≤ 1e-3.
+* Goodness of fit defaults to the paper's two-sample statistic (Algorithm 1);
+  the R code's one-sample χ² variant is `GofMethod::OneSampleChiSquare`.
+* `M` is the squared norm, as in the R code and the published tables.
+* Hypothesis-test refits take the best of two starts, which removed an
+  over-rejection of the bootstrap LR test.

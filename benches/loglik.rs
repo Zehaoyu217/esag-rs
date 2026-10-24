@@ -1,10 +1,11 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use esag::distribution::Esag;
 use esag::loglik::{loglik_eta, loglik_eta_grad};
 use esag::regression::EsagRegressor;
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::hint::black_box;
 
 fn bench(c: &mut Criterion) {
     for d in [3usize, 4, 5] {

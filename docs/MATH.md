@@ -69,6 +69,16 @@ equivalences exist. Compare fitted distributions (`μ_i`, `V_i`) rather than
 raw `γ` coefficients, and use the bootstrap for uncertainty, as the papers
 recommend.
 
+**Singular set.** Where the trailing coordinates of a group vanish, for
+example `(γ_4, γ_5) = 0` with `γ_3 ≠ 0` for `d = 4`, the angle
+`θ = atan2(γ_5, γ_4)` is undefined but still rotates `V`. So `γ ↦ V` is
+discontinuous on this codimension-2 set (Yu & Huang 2024, Appendix B), and
+gradients blow up near it. An optimiser started badly can be drawn towards
+it and stop with a huge gradient and a poor likelihood. `esag` detects this
+with the gradient check (`MAX_MEAN_GRADIENT`). The default `Init::Auto` then
+falls back to its other start or to random restarts, and warm-started refits
+retry from the R-style start.
+
 ## 3. Regression (`src/regression.rs`)
 
 `Y_i | x_i ~ ESAG(μ_i, γ_i)`, `(μ_i, γ_i) = B x̃_i` with `x̃_i = (1, x_i)`.
@@ -133,11 +143,13 @@ Restricted fit (`μ_{0i}`, `γ_{0i}`) versus full fit (`μ_{ai}`):
 ```
 RoC = mean_i ‖μ_{ai}‖ / ‖μ_{0i}‖
 D   = mean_i {2 − cos∠(μ_{0i}, μ_{ai})} ‖μ_{ai}‖ / ‖μ_{0i}‖
-M   = ‖ mean_i ( y_i² − Ê_0 y_i² ) ‖      (elementwise squares; Ê_0 by Monte Carlo)
+M   = ‖ mean_i ( y_i² − Ê_0 y_i² ) ‖²     (elementwise squares; Ê_0 by Monte Carlo)
 LR  = −2 (ℓ_0 − ℓ_a)
 ```
 
-Null distributions come from a parametric bootstrap under the restricted fit,
+`M` is the squared norm, as in the R code and the papers' tables (CSDA eq. (4)
+prints the norm; p-values are unaffected). Null distributions come from a
+parametric bootstrap under the restricted fit,
 refitting both models each time, and `p = #{stat^(b) > stat}/B`. Supported
 nulls are isotropy (`γ ≡ 0`), `μ` free of feature `j`, `γ` free of feature
 `j`, both, or any custom mask. Two differences from the R code: bootstrap

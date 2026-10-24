@@ -23,6 +23,7 @@ pub mod dual;
 pub mod error;
 pub mod estimator;
 pub mod frame;
+pub mod inference;
 pub mod loglik;
 pub mod onb;
 pub mod optim;
@@ -32,6 +33,5 @@ pub mod regression;
 pub mod rotation;
 pub mod scalar;
 pub mod stats;
-// pub mod inference;    // enabled once the math core + optimizer + stats land
 
 pub use scalar::Scalar;

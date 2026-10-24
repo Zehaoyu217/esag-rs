@@ -91,3 +91,41 @@ fn reproduces_published_estimates() {
         assert_close(&vr, &v, 0.0151, &format!("V X={xv}"));
     }
 }
+
+#[test]
+fn reproduces_published_test_statistics_and_region_quantiles() {
+    use esag::inference::{Restriction, hypothesis_test, prediction_region};
+    let (x, y) = load();
+    let f = fit();
+    // dissertation Table 2.9 (RoC, D, M, LR); M is Monte-Carlo based
+    for (r, roc, dd, m, lr) in [
+        (Restriction::Isotropy, 1.518, 1.518, Some(2.2e-4), 275.4),
+        (Restriction::MuOfFeature(0), 1.059, 1.062, None, 31.6),
+        (
+            Restriction::GammaOfFeature(0),
+            1.090,
+            1.090,
+            Some(9.4e-5),
+            57.6,
+        ),
+    ] {
+        let t = hypothesis_test(&f, &x, &y, r.clone(), 20, 4000, 2).unwrap();
+        assert!((t.roc - roc).abs() < 6e-4, "{r:?} RoC {}", t.roc);
+        assert!((t.d_stat - dd).abs() < 6e-4, "{r:?} D {}", t.d_stat);
+        assert!((t.lr - lr).abs() < 0.06, "{r:?} LR {}", t.lr);
+        if let Some(m) = m {
+            assert!((t.m_stat - m).abs() / m < 0.2, "{r:?} M {}", t.m_stat);
+        }
+        assert!(t.p_roc < 0.05 && t.p_d < 0.05 && t.p_lr < 0.05);
+    }
+    // dissertation Table 2.10: q at 70/80/90 %
+    for (xv, want) in [
+        (0.0, [0.0286, 0.0364, 0.0495]),
+        (1.0, [0.0178, 0.0227, 0.0312]),
+    ] {
+        let pr = prediction_region(&f, &x, &y, &[xv], 20_000, 60, &[0.70, 0.80, 0.90], 8).unwrap();
+        for (g, w) in pr.thresholds.iter().zip(want) {
+            assert!((g - w).abs() / w < 0.04, "X={xv}: {g} vs {w}");
+        }
+    }
+}

@@ -135,11 +135,18 @@ fn roc_and_d(eta0: &DMatrix<f64>, eta_a: &DMatrix<f64>, d: usize) -> (f64, f64) 
     (roc / n as f64, ds / n as f64)
 }
 
-/// `M = ‖ mean_i ( y_i² − E[Y_i²; eta_0,i] ) ‖` (elementwise squares, Euclidean
-/// norm; Yu & Huang 2025 eq. (4)) with the second moments estimated by `n_mc`
-/// Monte-Carlo draws per observation. (R's `mome_stats` returns the squared
-/// norm; bootstrap p-values are identical.)
-fn moment_stat(fit0: &EsagRegressorFit, x: &DMatrix<f64>, y: &DMatrix<f64>, n_mc: usize, seed: u64) -> Result<f64> {
+/// `M = ‖ mean_i ( y_i² − E[Y_i²; eta_0,i] ) ‖²` (elementwise squares) with
+/// the second moments estimated by `n_mc` Monte-Carlo draws per observation.
+/// This is the squared norm, as computed by R's `mome_stats` and as reported
+/// in the papers' tables (CSDA 2025 eq. (4) writes the norm; bootstrap
+/// p-values are identical either way).
+fn moment_stat(
+    fit0: &EsagRegressorFit,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    n_mc: usize,
+    seed: u64,
+) -> Result<f64> {
     let dists = fit0.predict_distribution(x)?;
     let d = fit0.d;
     let diffs: Vec<Vec<f64>> = dists
@@ -167,7 +174,7 @@ fn moment_stat(fit0: &EsagRegressorFit, x: &DMatrix<f64>, y: &DMatrix<f64>, n_mc
         let mean_k: f64 = diffs.iter().map(|r| r[k]).sum::<f64>() / n;
         m += mean_k * mean_k;
     }
-    Ok(m.sqrt())
+    Ok(m)
 }
 
 /// Run a bootstrap hypothesis test of `restriction` against the full fit.
@@ -204,7 +211,15 @@ pub fn hypothesis_test(
     let mut cfg0 = refit_config(fit_full);
     cfg0.mask = Some(mask0.clone());
     let cfg_a = refit_config(fit_full);
-    let fit0 = cfg0.fit_warm(x, y, &b0)?;
+    let fit0 = {
+        let warm = cfg0.fit_warm(x, y, &b0)?;
+        let mut auto = cfg0.clone();
+        auto.init = crate::regression::Init::Auto;
+        match auto.fit(x, y) {
+            Ok(a) if a.log_likelihood > warm.log_likelihood => a,
+            _ => warm,
+        }
+    };
 
     let eta0 = fit0.linear_predictor(x)?;
     let eta_a = fit_full.linear_predictor(x)?;
@@ -227,7 +242,22 @@ pub fn hypothesis_test(
                     ba[(k, j)] = if k < d { 1.0 } else { 1e-3 };
                 }
             }
-            let fa = cfg_a.fit_warm(x, &yb, &ba).ok()?;
+            // full refit: best of two starts (from the restricted refit, and
+            // from the original full MLE) so that LR^(b) is not deflated by a
+            // refit stuck below the maximum
+            let fa1 = cfg_a.fit_warm(x, &yb, &ba).ok();
+            let fa2 = cfg_a.fit_warm(x, &yb, &fit_full.coef).ok();
+            let fa = match (fa1, fa2) {
+                (Some(a), Some(b)) => {
+                    if a.log_likelihood >= b.log_likelihood {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => return None,
+            };
             let e0 = f0.linear_predictor(x).ok()?;
             let ea = fa.linear_predictor(x).ok()?;
             let (r, dd) = roc_and_d(&e0, &ea, d);
@@ -277,4 +307,3 @@ pub fn hypothesis_test(
         boot_lr: bl,
     })
 }
-
