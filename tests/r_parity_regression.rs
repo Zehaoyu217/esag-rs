@@ -159,8 +159,15 @@ fn iid_fits_match_r() {
         );
         assert!(fit.converged());
         assert!(fit.log_likelihood() >= r_value - 1e-6);
-        // gamma itself is only identified up to an equivalence class for
-        // d >= 4 (eigenvector sign patterns), so compare mu and V.
+        // gamma is only identified up to an equivalence class; intercept-only
+        // fits report the canonical member, so compare with the canonical
+        // gamma of R's fitted V.
+        let canon_r = esag::param::gamma_from_covariance(r_dist.mu(), r_dist.covariance().transpose().as_slice());
+        let dg = fit.gamma().iter().zip(&canon_r).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        eprintln!("{name}: max |canonical gamma diff| = {dg:.2e}");
+        if d >= 4 {
+            assert!(dg < 5e-3, "{name}: canonical gamma differs by {dg}");
+        }
         let dmu = fit
             .mu()
             .iter()

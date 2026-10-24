@@ -353,9 +353,19 @@ fn grad_dual<const N: usize>(eta: &[f64], y: &[f64], grad: &mut [f64]) -> f64 {
 
 /// Log-density and its exact gradient with respect to `eta`.
 ///
-/// Uses forward-mode AD for `d = 3..=8` (`eta` lengths 5, 9, 14, 20, 27, 35)
-/// and central finite differences otherwise.
+/// Uses the hand-written reverse-mode gradient
+/// [`crate::adjoint::loglik_grad_adjoint`] (1.3–2.3× the cost of the value
+/// for every `d`, versus ~N× for forward mode); see
+/// [`loglik_eta_grad_dual`] for the forward-mode reference.
+#[inline]
 pub fn loglik_eta_grad(eta: &[f64], y: &[f64], grad: &mut [f64]) -> f64 {
+    crate::adjoint::loglik_grad_adjoint(eta, y, grad)
+}
+
+/// Forward-mode reference for [`loglik_eta_grad`]: dual numbers for
+/// `d = 3..=8` (`eta` lengths 5, 9, 14, 20, 27, 35) and central finite
+/// differences otherwise.
+pub fn loglik_eta_grad_dual(eta: &[f64], y: &[f64], grad: &mut [f64]) -> f64 {
     debug_assert_eq!(eta.len(), grad.len());
     match eta.len() {
         5 => grad_dual::<5>(eta, y, grad),

@@ -393,6 +393,29 @@ impl EsagRegressor {
         // Pick the canonical member of the {B, B with gamma group 1 negated}
         // equivalence class (identical likelihood, see `canonicalize_coef`).
         let mut coef = obj.assemble(&best.x);
+        if data.p_total == 1 && mask.iter().all(|&f| f) && data.d >= 4 {
+            // Intercept-only fit: replace gamma by the canonical member of its
+            // equivalence class (same V, same likelihood), so equivalent
+            // solutions report identical gamma in every dimension.
+            let d = data.d;
+            let mu: Vec<f64> = (0..d).map(|k| coef[(k, 0)]).collect();
+            let gamma: Vec<f64> = (d..data.b_dim).map(|k| coef[(k, 0)]).collect();
+            let v = crate::frame::Frame::new(&mu, &gamma).cov_pow(1.0);
+            let canon = crate::param::gamma_from_covariance(&mu, &v);
+            let mut cand = coef.clone();
+            for (k, g) in canon.iter().enumerate() {
+                cand[(d + k, 0)] = *g;
+            }
+            let xs: Vec<f64> = free.iter().map(|&(k, j)| cand[(k, j)]).collect();
+            let mut g = vec![0.0; xs.len()];
+            let f = obj.value_and_gradient(&xs, &mut g);
+            if f.is_finite() && (f - best.f).abs() <= 1e-8 * best.f.abs().max(1.0) {
+                coef = cand;
+                best.x = xs;
+                best.grad_norm_inf = g.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                best.grad = g;
+            }
+        }
         if canonicalize_coef(&mut coef, data.d) {
             for (xi, &(k, _)) in best.x.iter_mut().zip(&free) {
                 if k == data.d || k == data.d + 1 {
