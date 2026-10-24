@@ -139,6 +139,12 @@ impl Esag {
         out
     }
 
+    /// A sampler with the scaled eigenvectors precomputed (fast repeated
+    /// draws).
+    pub fn sampler(&self) -> Sampler {
+        Sampler::new(self)
+    }
+
     /// Draw one sample: `X ~ N_d(mu, V)`, `Y = X/|X|`.
     pub fn sample_one<R: Rng + ?Sized>(&self, frame: &Frame<f64>, rng: &mut R, out: &mut [f64]) {
         let d = self.dim();
@@ -165,11 +171,11 @@ impl Esag {
     /// Draw `n` samples as an n×d matrix (one unit vector per row).
     pub fn sample<R: Rng + ?Sized>(&self, n: usize, rng: &mut R) -> DMatrix<f64> {
         let d = self.dim();
-        let frame = self.frame();
+        let sampler = self.sampler();
         let mut out = DMatrix::zeros(n, d);
         let mut buf = vec![0.0; d];
         for i in 0..n {
-            self.sample_one(&frame, rng, &mut buf);
+            sampler.sample_into(rng, &mut buf);
             for j in 0..d {
                 out[(i, j)] = buf[j];
             }
@@ -227,4 +233,124 @@ pub(crate) fn region_statistic(frame: &Frame<f64>, y: &[f64]) -> f64 {
         }
     }
     q
+}
+
+/// Fast repeated sampling from one ESAG distribution: `X = μ + W z`,
+/// `z ~ N(0, I_d)`, `W = [√λ_1 v_1 | … | √λ_{d−1} v_{d−1} | μ̂]`,
+/// `Y = X/‖X‖`.
+#[derive(Clone, Debug)]
+pub struct Sampler {
+    d: usize,
+    mu: Vec<f64>,
+    mu_norm: f64,
+    /// column-major `d × d` scaled eigenvectors
+    w: Vec<f64>,
+    /// eigenvalues `λ_1..λ_{d−1}`
+    lambda: Vec<f64>,
+    /// `√λ_1..√λ_{d−1}`
+    sqrt_lambda: Vec<f64>,
+}
+
+impl Sampler {
+    /// Precompute the scaled eigen-frame of `dist`.
+    pub fn new(dist: &Esag) -> Self {
+        let frame = dist.frame();
+        let d = frame.d;
+        let sqrt_lambda: Vec<f64> = frame.lambda.iter().map(|l| l.sqrt()).collect();
+        let mut w = frame.basis.clone();
+        for j in 0..d - 1 {
+            for v in &mut w[j * d..(j + 1) * d] {
+                *v *= sqrt_lambda[j];
+            }
+        }
+        Self {
+            d,
+            mu: dist.mu().to_vec(),
+            mu_norm: frame.mu_norm,
+            w,
+            lambda: frame.lambda.clone(),
+            sqrt_lambda,
+        }
+    }
+
+    /// Dimension `d`.
+    pub fn dim(&self) -> usize {
+        self.d
+    }
+
+    /// Draw one unit vector into `out` (length `d`).
+    #[inline]
+    pub fn sample_into<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
+        let d = self.d;
+        out.copy_from_slice(&self.mu);
+        for j in 0..d {
+            let z: f64 = StandardNormal.sample(rng);
+            let col = &self.w[j * d..(j + 1) * d];
+            for (o, c) in out.iter_mut().zip(col) {
+                *o += z * c;
+            }
+        }
+        let inv = 1.0 / out.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for v in out.iter_mut() {
+            *v *= inv;
+        }
+    }
+
+    /// Draw the region statistic `(Y − μ̂)ᵀ V⁻¹ (Y − μ̂)` of one sample
+    /// directly from `z`, in `O(d)` and without forming `Y`:
+    /// with `a = ‖μ‖ + z_d` and `‖X‖² = Σ_{j<d} λ_j z_j² + a²`,
+    /// the statistic is `(Σ_{j<d} z_j²)/‖X‖² + (a/‖X‖ − 1)²`.
+    #[inline]
+    pub fn region_statistic_draw<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
+        let d = self.d;
+        let mut zz = 0.0;
+        let mut x2 = 0.0;
+        for j in 0..d - 1 {
+            let z: f64 = StandardNormal.sample(rng);
+            zz += z * z;
+            x2 += self.lambda[j] * z * z;
+        }
+        let zd: f64 = StandardNormal.sample(rng);
+        let a = self.mu_norm + zd;
+        x2 += a * a;
+        let xn = x2.sqrt();
+        let t = a / xn - 1.0;
+        zz / x2 + t * t
+    }
+
+    /// `√λ_j` (exposed for tests).
+    pub fn sqrt_lambda(&self) -> &[f64] {
+        &self.sqrt_lambda
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+    use rand::SeedableRng;
+    use crate::FastRng;
+
+    #[test]
+    fn region_statistic_from_z_matches_explicit_formula() {
+        // same RNG stream: z drawn by region_statistic_draw equals the z that
+        // sample_into would use, so compare against region_statistic(Y)
+        for (mu, gamma) in [
+            (vec![1.0, 2.0, 1.5], vec![0.7, -0.3]),
+            (vec![0.5, 1.0, -1.0, 2.0], vec![0.6, -0.2, 0.3, 0.9, -0.5]),
+        ] {
+            let dist = Esag::new(&mu, &gamma).unwrap();
+            let s = dist.sampler();
+            let frame = dist.frame();
+            let d = dist.dim();
+            let mut r1 = FastRng::seed_from_u64(1);
+            let mut r2 = FastRng::seed_from_u64(1);
+            let mut y = vec![0.0; d];
+            for _ in 0..1000 {
+                let q1 = s.region_statistic_draw(&mut r1);
+                s.sample_into(&mut r2, &mut y);
+                let q2 = region_statistic(&frame, &y);
+                assert!((q1 - q2).abs() < 1e-12 * q2.max(1.0), "{q1} vs {q2}");
+            }
+        }
+    }
 }

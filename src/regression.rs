@@ -31,10 +31,14 @@ use crate::optim::lbfgs::{LbfgsConfig, Objective, OptimResult, Status, minimize}
 use crate::stats::normal::norm_sf;
 use nalgebra::{DMatrix, DVector};
 use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use crate::FastRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+fn default_true() -> bool {
+    true
+}
 
 /// How the optimiser is initialised.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,10 +47,10 @@ pub enum Init {
     /// the higher likelihood; if neither passes the convergence check, retry
     /// from randomly perturbed starts.
     Auto,
-    /// Intercept `mu` along the sample mean direction with
-    /// `|mu| = sqrt(kappa)`, `kappa` a von-Mises–Fisher-style concentration
-    /// estimate (for an angular Gaussian `kappa ≈ |mu|²`); small `gamma` (0.01,
-    /// to step off the non-differentiable isotropic point); zero slopes.
+    /// Moment-based intercept: `mu` along the sample mean direction with
+    /// `‖mu‖` and `gamma` from the tangent-plane scatter of the responses
+    /// (near the mode `S ≈ V/‖μ‖²`, inverted with
+    /// [`crate::param::gamma_from_covariance`]); zero slopes.
     DataDriven,
     /// The R code's recommendation: `mu` entries 1, `gamma` entries (near) 0,
     /// for every column. (We use 1e-3 instead of exactly 0 for `gamma`.)
@@ -74,8 +78,15 @@ pub struct EsagRegressor {
     pub seed: u64,
     /// Compute the observed-information Hessian (standard errors) (default true).
     pub compute_hessian: bool,
-    /// L-BFGS memory (default 10).
+    /// L-BFGS memory. `0` (default) = automatic: the number of free
+    /// parameters, clamped to `[10, 100]`. Memory below the parameter count
+    /// slows convergence badly on ESAG likelihoods (2–5× more iterations).
     pub lbfgs_memory: usize,
+    /// Evaluate the likelihood in parallel over observations (default
+    /// `true`). Bootstrap procedures switch it off for their refits because
+    /// they already run one refit per thread.
+    #[serde(default = "default_true")]
+    pub parallel: bool,
     /// Print optimisation progress to stderr.
     pub verbose: bool,
     /// Optional free-parameter mask (`eta_len(d) × p_total`); `false` entries
@@ -103,7 +114,8 @@ impl EsagRegressor {
             n_restarts: 0,
             seed: 0,
             compute_hessian: true,
-            lbfgs_memory: 10,
+            lbfgs_memory: 0,
+            parallel: true,
             verbose: false,
             mask: None,
             feature_names: None,
@@ -145,6 +157,11 @@ impl EsagRegressor {
         self.verbose = v;
         self
     }
+    /// Parallel likelihood evaluation over observations.
+    pub fn with_parallel(mut self, v: bool) -> Self {
+        self.parallel = v;
+        self
+    }
     /// Free-parameter mask for restricted fits.
     pub fn with_mask(mut self, mask: Option<DMatrix<bool>>) -> Self {
         self.mask = mask;
@@ -165,18 +182,29 @@ impl EsagRegressor {
             Init::Auto => vec![Init::DataDriven, Init::RStyle],
             other => vec![other.clone()],
         };
-        let mut best: Option<EsagRegressorFit> = None;
-        for init in starts {
-            let mut b0 = self.clone().with_init(init.clone()).initial_coef(&data)?;
-            if !matches!(init, Init::Custom(_)) {
-                // fixed (masked-out) coefficients are held at zero
-                for (v, &free) in b0.iter_mut().zip(mask.iter()) {
-                    if !free {
-                        *v = 0.0;
+        // Concurrent starts share an iteration budget: once one converges after
+        // N iterations, the others get at most max(2N, N + 50) in total, so a
+        // start trapped near a singular point cannot hold up the result.
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let budget_ref = (starts.len() > 1).then_some(&budget);
+        let fits: Vec<Result<EsagRegressorFit>> = starts
+            .par_iter()
+            .map(|init| {
+                let mut b0 = self.clone().with_init(init.clone()).initial_coef(&data)?;
+                if !matches!(init, Init::Custom(_)) {
+                    // fixed (masked-out) coefficients are held at zero
+                    for (v, &free) in b0.iter_mut().zip(mask.iter()) {
+                        if !free {
+                            *v = 0.0;
+                        }
                     }
                 }
-            }
-            let fit = self.fit_from(&data, b0, mask.clone())?;
+                self.fit_from_budget(&data, b0, mask.clone(), budget_ref)
+            })
+            .collect();
+        let mut best: Option<EsagRegressorFit> = None;
+        for fit in fits {
+            let fit = fit?;
             if best.as_ref().is_none_or(|b| better(&fit, b)) {
                 best = Some(fit);
             }
@@ -279,32 +307,12 @@ impl EsagRegressor {
                 }
             }
             Init::DataDriven | Init::Auto => {
-                // mean resultant vector
-                let n = data.n as f64;
-                let mut ybar = vec![0.0; d];
-                for i in 0..data.n {
-                    for k in 0..d {
-                        ybar[k] += data.y[i * d + k];
-                    }
-                }
-                for v in ybar.iter_mut() {
-                    *v /= n;
-                }
-                let rbar = ybar
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-                    .sqrt()
-                    .clamp(1e-3, 0.999);
-                // vMF-style concentration (Banerjee et al. 2005) as a scale for |mu|
-                let kappa =
-                    (rbar * (d as f64 - rbar * rbar) / (1.0 - rbar * rbar)).clamp(0.25, 2500.0);
-                let scale = kappa.sqrt();
+                let (mu0, gamma0) = moment_start(&data.y, data.n, d);
                 for k in 0..d {
-                    b[(k, 0)] = ybar[k] / rbar * scale;
+                    b[(k, 0)] = mu0[k];
                 }
-                for k in d..b_dim {
-                    b[(k, 0)] = 0.01;
+                for (k, g) in gamma0.iter().enumerate() {
+                    b[(d + k, 0)] = *g;
                 }
             }
         }
@@ -317,6 +325,16 @@ impl EsagRegressor {
         b0: DMatrix<f64>,
         mask: DMatrix<bool>,
     ) -> Result<EsagRegressorFit> {
+        self.fit_from_budget(data, b0, mask, None)
+    }
+
+    fn fit_from_budget(
+        &self,
+        data: &RegressionData,
+        b0: DMatrix<f64>,
+        mask: DMatrix<bool>,
+        budget: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Result<EsagRegressorFit> {
         let free: Vec<(usize, usize)> = (0..data.p_total)
             .flat_map(|j| (0..data.b_dim).map(move |k| (k, j)))
             .filter(|&(k, j)| mask[(k, j)])
@@ -325,29 +343,43 @@ impl EsagRegressor {
             data,
             base: b0.clone(),
             free: &free,
+            parallel: self.parallel,
+        };
+        let memory = if self.lbfgs_memory == 0 {
+            free.len().clamp(10, 100)
+        } else {
+            self.lbfgs_memory
         };
         let cfg = LbfgsConfig {
-            memory: self.lbfgs_memory,
+            memory,
             max_iter: self.max_iter,
             tol_grad: self.tol,
             verbose: self.verbose,
+            iter_budget: budget.cloned(),
             ..LbfgsConfig::default()
         };
         let x0: Vec<f64> = free.iter().map(|&(k, j)| b0[(k, j)]).collect();
         let mut best: OptimResult = minimize(&obj, &x0, &cfg);
         if self.n_restarts > 0 {
-            let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
-            for _ in 0..self.n_restarts {
-                let xs: Vec<f64> = free
-                    .iter()
-                    .zip(&x0)
-                    .map(|(&(k, _), &v)| {
-                        let sd = if k < data.d { 0.5 } else { 0.25 };
-                        let z: f64 = StandardNormal.sample(&mut rng);
-                        v + sd * z
-                    })
-                    .collect();
-                let r = minimize(&obj, &xs, &cfg);
+            // perturbed starts drawn sequentially (reproducible), fitted in parallel
+            let mut rng = FastRng::seed_from_u64(self.seed);
+            let starts: Vec<Vec<f64>> = (0..self.n_restarts)
+                .map(|_| {
+                    free.iter()
+                        .zip(&x0)
+                        .map(|(&(k, _), &v)| {
+                            let sd = if k < data.d { 0.5 } else { 0.25 };
+                            let z: f64 = StandardNormal.sample(&mut rng);
+                            v + sd * z
+                        })
+                        .collect()
+                })
+                .collect();
+            let results: Vec<OptimResult> = starts
+                .par_iter()
+                .map(|xs| minimize(&obj, xs, &cfg))
+                .collect();
+            for r in results {
                 if r.f.is_finite() && r.f < best.f {
                     best = r;
                 }
@@ -375,6 +407,10 @@ impl EsagRegressor {
         }
         let converged =
             best.converged() && best.grad_norm_inf <= MAX_MEAN_GRADIENT * data.n.max(1) as f64;
+        if converged && let Some(b) = budget {
+            let n = best.n_iter;
+            b.fetch_min((2 * n).max(n + 50), std::sync::atomic::Ordering::Relaxed);
+        }
 
         let (hessian, cov_params) = if self.compute_hessian {
             let h = hessian_fd(&obj, &best.x, None);
@@ -423,6 +459,97 @@ impl EsagRegressor {
         }
         names
     }
+}
+
+/// Moment-based starting values from unit vectors `y` (row-major `n × d`):
+/// the mean direction `m̂`, the tangent-plane scatter
+/// `S = mean_i (I − m̂m̂ᵀ) y_i y_iᵀ (I − m̂m̂ᵀ)`, and the near-mode
+/// approximation `S ≈ V/‖μ‖²`. Hence `‖μ‖ = (Π σ_j)^{−1/(2(d−1))}` from the
+/// tangent eigenvalues `σ_j` of `S`, and `γ` is the parameter of the shape of
+/// `S` ([`crate::param::gamma_from_covariance`]). Group norms are capped at 25.
+pub(crate) fn moment_start(y: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut ybar = vec![0.0; d];
+    for i in 0..n {
+        for k in 0..d {
+            ybar[k] += y[i * d + k] / n as f64;
+        }
+    }
+    let rbar = ybar.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let g_len = dims::gamma_len(d);
+    if !(rbar > 1e-8) {
+        let mut mu = vec![0.0; d];
+        mu[d - 1] = 0.5;
+        return (mu, vec![0.01; g_len]);
+    }
+    let m: Vec<f64> = ybar.iter().map(|v| v / rbar).collect();
+    // tangent scatter
+    let mut s = vec![0.0; d * d];
+    let mut t = vec![0.0; d];
+    for i in 0..n {
+        let yi = &y[i * d..(i + 1) * d];
+        let c: f64 = yi.iter().zip(&m).map(|(a, b)| a * b).sum();
+        for k in 0..d {
+            t[k] = yi[k] - c * m[k];
+        }
+        for a in 0..d {
+            for b in 0..d {
+                s[a * d + b] += t[a] * t[b] / n as f64;
+            }
+        }
+    }
+    // tangent eigenvalues of S via U_{-d}ᵀ S U_{-d}
+    let u = crate::onb::onb(&m);
+    let k = d - 1;
+    let uk = DMatrix::from_fn(d, k, |r, c| u[c * d + r]);
+    let sm = DMatrix::from_row_slice(d, d, &s);
+    let tm = uk.transpose() * &sm * &uk;
+    let eig = nalgebra::SymmetricEigen::new((&tm + tm.transpose()) * 0.5);
+    let smax = eig.eigenvalues.iter().fold(0.0f64, |a, &b| a.max(b));
+    if !(smax > 0.0) {
+        return (m.iter().map(|v| v * 3.0).collect(), vec![0.01; g_len]);
+    }
+    // floor tiny eigenvalues so group norms stay moderate (ratios ≤ 26)
+    let floor = smax / 26f64.powi(k as i32);
+    let log_gm = eig
+        .eigenvalues
+        .iter()
+        .map(|&x| x.max(floor).ln())
+        .sum::<f64>()
+        / k as f64;
+    let norm = (-0.5 * log_gm).exp().clamp(0.5, 50.0);
+    let mut sreg = sm.clone();
+    // add the floored eigen-part back in the tangent space
+    for (j, &lam) in eig.eigenvalues.iter().enumerate() {
+        if lam < floor {
+            let vj = &uk * eig.eigenvectors.column(j);
+            sreg += (&vj * vj.transpose()) * (floor - lam);
+        }
+    }
+    let sv: Vec<f64> = (0..d)
+        .flat_map(|r| (0..d).map(move |c| (r, c)))
+        .map(|(r, c)| sreg[(r, c)])
+        .collect();
+    let mut gamma = crate::param::gamma_from_covariance(&m, &sv);
+    for gr in 1..=d - 2 {
+        let off = gr * (gr + 1) / 2 - 1;
+        let gnorm = gamma[off..off + gr + 1]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        if gnorm > 25.0 {
+            for v in &mut gamma[off..off + gr + 1] {
+                *v *= 25.0 / gnorm;
+            }
+        }
+        if gnorm < 1e-3 {
+            // step off the isotropic kink
+            for v in &mut gamma[off..off + gr + 1] {
+                *v += 0.01;
+            }
+        }
+    }
+    (m.iter().map(|v| v * norm).collect(), gamma)
 }
 
 /// Prefer converged fits, then higher likelihood.
@@ -527,6 +654,7 @@ struct NegLogLik<'a> {
     /// full coefficient matrix providing the fixed (masked-out) entries
     base: DMatrix<f64>,
     free: &'a [(usize, usize)],
+    parallel: bool,
 }
 
 impl NegLogLik<'_> {
@@ -545,7 +673,7 @@ const PAR_CHUNK: usize = 64;
 impl Objective for NegLogLik<'_> {
     fn value_and_gradient(&self, params: &[f64], grad: &mut [f64]) -> f64 {
         let b = self.assemble(params);
-        let (f, g_full) = joint_loglik_and_grad(self.data, &b);
+        let (f, g_full) = joint_loglik_and_grad(self.data, &b, self.parallel);
         for (gi, &(k, j)) in grad.iter_mut().zip(self.free) {
             *gi = -g_full[(k, j)];
         }
@@ -558,6 +686,7 @@ impl Objective for NegLogLik<'_> {
 pub(crate) fn joint_loglik_and_grad(
     data: &RegressionData,
     b: &DMatrix<f64>,
+    parallel: bool,
 ) -> (f64, DMatrix<f64>) {
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     // B as row-major slice for fast eta_i = B x_i
@@ -588,7 +717,7 @@ pub(crate) fn joint_loglik_and_grad(
         }
         (f, g)
     };
-    let (f, g) = if data.n >= 2 * PAR_CHUNK {
+    let (f, g) = if parallel && data.n >= 2 * PAR_CHUNK {
         let n_chunks = data.n.div_ceil(PAR_CHUNK);
         (0..n_chunks)
             .into_par_iter()
@@ -812,8 +941,7 @@ impl EsagRegressorFit {
         let mut out = DMatrix::zeros(x.nrows(), d);
         let mut buf = vec![0.0; d];
         for (i, dist) in dists.iter().enumerate() {
-            let frame = dist.frame();
-            dist.sample_one(&frame, rng, &mut buf);
+            dist.sampler().sample_into(rng, &mut buf);
             for k in 0..d {
                 out[(i, k)] = buf[k];
             }

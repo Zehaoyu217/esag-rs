@@ -20,7 +20,7 @@ use crate::regression::{
 use crate::stats::chisq::chisq_sf;
 use nalgebra::DMatrix;
 use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use crate::FastRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -153,12 +153,12 @@ fn moment_stat(
         .par_iter()
         .enumerate()
         .map(|(i, dist)| {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
-            let frame = dist.frame();
+            let mut rng = FastRng::seed_from_u64(seed.wrapping_add(i as u64));
+            let sampler = dist.sampler();
             let mut buf = vec![0.0; d];
             let mut ey2 = vec![0.0; d];
             for _ in 0..n_mc {
-                dist.sample_one(&frame, &mut rng, &mut buf);
+                sampler.sample_into(&mut rng, &mut buf);
                 for k in 0..d {
                     ey2[k] += buf[k] * buf[k];
                 }
@@ -231,7 +231,7 @@ pub fn hypothesis_test(
         .into_par_iter()
         .map(|b| {
             let bseed = seed.wrapping_add(1 + b as u64);
-            let mut rng = ChaCha8Rng::seed_from_u64(bseed);
+            let mut rng = FastRng::seed_from_u64(bseed);
             let yb = fit0.sample_responses(x, &mut rng).ok()?;
             let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
             // full-model start: restricted MLE, with the restricted mu entries

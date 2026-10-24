@@ -24,45 +24,118 @@ use crate::dims;
 use crate::dual::{Dual, seed_array};
 use crate::frame::Frame;
 use crate::scalar::Scalar;
-use crate::stats::normal::LN_2PI;
+use crate::stats::normal::{LN_2PI, norm_cdf, norm_pdf};
 
 /// Below this `alpha` the continued fraction is used.
 const CF_BELOW: f64 = -2.0;
-/// Depth of the backward continued fraction (converged to rounding for b ≥ 2).
-const CF_DEPTH: usize = 100;
+
+/// Continued-fraction depth that reaches full double precision for
+/// `b = −alpha ≥ 2` (measured: ≤ 112 terms at b = 2, p = 10; ≤ 32 at b = 8).
+#[inline]
+fn cf_depth(b: f64, p: usize) -> usize {
+    ((170.0 / b).ceil() as usize + 2 * p + 8).min(200)
+}
+
+/// `(log M_p(a), d/da log M_p(a), d²/da² log M_p(a))` in `f64`, stable for all `a`.
+///
+/// Uses `M_k' = k M_{k−1}` (with `M_0 = Φ`), so
+/// `(log M_p)' = p M_{p−1}/M_p` and
+/// `(log M_p)'' = p(p−1) M_{p−2}/M_p − ((log M_p)')²` (for `p = 1`:
+/// `φ/M_1 − (Φ/M_1)²`).
+pub fn log_m_p_derivs(a: f64, p: usize) -> (f64, f64, f64) {
+    assert!(p >= 1, "log_m_p needs p >= 1");
+    if a >= CF_BELOW {
+        let cdf = norm_cdf(a);
+        let pdf = norm_pdf(a);
+        let m1 = a * cdf + pdf;
+        if p == 1 {
+            let d1 = cdf / m1;
+            return (m1.ln(), d1, pdf / m1 - d1 * d1);
+        }
+        // m_{k-2}, m_{k-1}, m_k with m_0 = Φ
+        let (mut m_km2, mut m_km1, mut m_k) = (cdf, m1, (a * a + 1.0) * cdf + a * pdf);
+        for k in 3..=p {
+            let next = a * m_k + (k - 1) as f64 * m_km1;
+            m_km2 = m_km1;
+            m_km1 = m_k;
+            m_k = next;
+        }
+        let r1 = m_km1 / m_k;
+        let r2 = m_km2 / m_k;
+        let d1 = p as f64 * r1;
+        (m_k.ln(), d1, (p * (p - 1)) as f64 * r2 - d1 * d1)
+    } else {
+        // M_k = φ(a) I_k(b), b = −a; r_k = I_k/I_{k−1} = k/(b + r_{k+1}), I_0 = 1/(b + r_1)
+        let b = -a;
+        let depth = cf_depth(b, p);
+        let mut r = ((depth as f64).sqrt() - 0.5 * b).max(1e-3);
+        let mut log_sum = 0.0;
+        let (mut r_p, mut r_pm1) = (1.0, 1.0);
+        for k in (1..depth).rev() {
+            r = k as f64 / (b + r);
+            if k <= p {
+                log_sum += r.ln();
+                if k == p {
+                    r_p = r;
+                }
+                if k + 1 == p {
+                    r_pm1 = r;
+                }
+            }
+        }
+        let i0 = 1.0 / (b + r);
+        let log_m = -0.5 * a * a - 0.5 * LN_2PI + i0.ln() + log_sum;
+        if p == 1 {
+            // M_0/M_1 = 1/r_1, φ/M_1 = 1/I_1 = 1/(I_0 r_1)
+            let d1 = 1.0 / r_p;
+            return (log_m, d1, 1.0 / (i0 * r_p) - d1 * d1);
+        }
+        let d1 = p as f64 / r_p;
+        (log_m, d1, (p * (p - 1)) as f64 / (r_p * r_pm1) - d1 * d1)
+    }
+}
 
 /// `log M_p(alpha)` for `p ≥ 1`, stable for all `alpha`.
+///
+/// Evaluated in `f64` by [`log_m_p_derivs`] and lifted to `S` with the
+/// second-order Taylor expansion in `δ = alpha − alpha.re()`: exact for `f64`
+/// and for first- and second-order dual numbers, and independent of the
+/// number of dual directions.
+#[inline]
 pub fn log_m_p<S: Scalar>(alpha: S, p: usize) -> S {
+    let a0 = alpha.re();
+    if S::DERIV_ORDER == 0 {
+        return S::from_f64(log_m_p_value(a0, p));
+    }
+    let (l, d1, d2) = log_m_p_derivs(a0, p);
+    let delta = alpha - a0;
+    if S::DERIV_ORDER == 1 {
+        delta * d1 + l
+    } else {
+        (delta * (0.5 * d2) + d1) * delta + l
+    }
+}
+
+/// `log M_p(a)` in `f64` without derivatives (see [`log_m_p_derivs`]).
+#[inline]
+pub fn log_m_p_value(a: f64, p: usize) -> f64 {
     assert!(p >= 1, "log_m_p needs p >= 1");
-    if alpha.re() >= CF_BELOW {
-        let cdf = alpha.norm_cdf();
-        let pdf = alpha.norm_pdf();
-        let m1 = alpha * cdf + pdf;
+    if a >= CF_BELOW {
+        let cdf = norm_cdf(a);
+        let pdf = norm_pdf(a);
+        let m1 = a * cdf + pdf;
         if p == 1 {
             return m1.ln();
         }
-        let m2 = (alpha * alpha + 1.0) * cdf + alpha * pdf;
-        let (mut prev, mut cur) = (m1, m2);
+        let (mut m_km1, mut m_k) = (m1, (a * a + 1.0) * cdf + a * pdf);
         for k in 3..=p {
-            let next = alpha * cur + prev * ((k - 1) as f64);
-            prev = cur;
-            cur = next;
+            let next = a * m_k + (k - 1) as f64 * m_km1;
+            m_km1 = m_k;
+            m_k = next;
         }
-        cur.ln()
+        m_k.ln()
     } else {
-        let b = -alpha;
-        // r_N ≈ sqrt(N) − b/2 for large N; the guess only affects the far tail.
-        let guess = ((CF_DEPTH as f64).sqrt() - 0.5 * b.re()).max(1e-3);
-        let mut r = S::from_f64(guess);
-        let mut log_sum = S::zero();
-        for k in (1..CF_DEPTH).rev() {
-            r = S::from_f64(k as f64) / (b + r);
-            if k <= p {
-                log_sum += r.ln();
-            }
-        }
-        let i0 = S::one() / (b + r);
-        -(alpha * alpha) * 0.5 - 0.5 * LN_2PI + i0.ln() + log_sum
+        log_m_p_derivs(a, p).0
     }
 }
 
@@ -70,6 +143,7 @@ pub fn log_m_p<S: Scalar>(alpha: S, p: usize) -> S {
 ///
 /// # Panics
 /// If `eta.len()` is not `(d²+d−2)/2` with `d = y.len()`.
+#[inline]
 pub fn loglik_eta<S: Scalar>(eta: &[S], y: &[f64]) -> S {
     let d = y.len();
     assert_eq!(
@@ -80,11 +154,173 @@ pub fn loglik_eta<S: Scalar>(eta: &[S], y: &[f64]) -> S {
         dims::eta_len(d)
     );
     let (mu, gamma) = eta.split_at(d);
-    let frame = Frame::new(mu, gamma);
-    loglik_frame(&frame, mu, y)
+    loglik_mu_gamma_generic(mu, gamma, y)
 }
 
-/// Log-density given a precomputed frame.
+/// Log-density for separate `mu` and `gamma`, generic over [`Scalar`].
+#[inline]
+pub fn loglik_mu_gamma_generic<S: Scalar>(mu: &[S], gamma: &[S], y: &[f64]) -> S {
+    match mu.len() {
+        3 => loglik_fixed::<S, 3>(mu, gamma, y),
+        4 => loglik_fixed::<S, 4>(mu, gamma, y),
+        5 => loglik_fixed::<S, 5>(mu, gamma, y),
+        6 => loglik_fixed::<S, 6>(mu, gamma, y),
+        7 => loglik_fixed::<S, 7>(mu, gamma, y),
+        8 => loglik_fixed::<S, 8>(mu, gamma, y),
+        d => {
+            let mut z = vec![S::zero(); d];
+            let mut k = vec![S::zero(); d];
+            let mut rt = vec![S::zero(); d];
+            loglik_core(mu, gamma, y, &mut z, &mut k, &mut rt)
+        }
+    }
+}
+
+#[inline(always)]
+fn loglik_fixed<S: Scalar, const D: usize>(mu: &[S], gamma: &[S], y: &[f64]) -> S {
+    let mut z = [S::zero(); D];
+    let mut k = [S::zero(); D];
+    let mut rt = [S::zero(); D];
+    loglik_core(mu, gamma, y, &mut z, &mut k, &mut rt)
+}
+
+/// `(q, y·mu, |mu|²)` with `q = yᵀ V⁻¹ y`, computed without forming `V`, the
+/// basis or any trigonometric function. Scratch slices must have length
+/// `≥ d`.
+///
+/// * `z = U_{1..d−1}ᵀ y` uses the closed form of `onb(mu)` with running sums,
+///   in `O(d)`.
+/// * `p = Rᵀ z` applies the transposed plane rotations of `R` to the vector
+///   `z` (instead of rotating `d`-vectors), in the order of
+///   [`crate::rotation::givens_sequence`]. Each angle enters only through
+///   its cosine and sine, which are ratios of suffix norms of its `gamma`
+///   group: `cos φ_{i,j} = G_j/‖G_{j..}‖`, `sin φ_{i,j} = ‖G_{j+1..}‖/‖G_{j..}‖`,
+///   `(cos θ_i, sin θ_i) = (G_{n−1}, G_n)/‖(G_{n−1}, G_n)‖`.
+/// * `q = Σ_j p_j²/λ_j + (μ̂·y)²` with `1/λ_1 = (Π_i K_i^{d−1−i})^{1/(d−1)}`,
+///   `1/λ_{j+1} = (1/λ_j)/K_j`, `K_i = ‖G_i‖ + 1`.
+#[inline(always)]
+pub fn quad_form_parts<S: Scalar>(
+    mu: &[S],
+    gamma: &[S],
+    y: &[f64],
+    z: &mut [S],
+    k: &mut [S],
+    rt: &mut [S],
+) -> (S, S, S) {
+    let d = mu.len();
+    debug_assert!(d >= 3 && y.len() == d && gamma.len() == dims::gamma_len(d));
+    // ---- projections onto the ONB columns 0..d-2
+    let n2 = mu[0] * mu[0] + mu[1] * mu[1];
+    z[0] = if n2.re() == 0.0 {
+        S::from_f64(y[0])
+    } else {
+        (mu[0] * y[1] - mu[1] * y[0]) / n2.sqrt()
+    };
+    let mut s = n2; // Σ_{k < i0} mu_k²
+    let mut dot = mu[0] * y[0] + mu[1] * y[1]; // Σ_{k < i0} mu_k y_k
+    for i0 in 2..d {
+        let mi = mu[i0];
+        z[i0 - 1] = if s.re() == 0.0 {
+            S::from_f64(y[i0 - 1])
+        } else {
+            (mi * dot - s * y[i0]) / (s * (mi * mi + s)).sqrt()
+        };
+        s += mi * mi;
+        dot += mi * y[i0];
+    }
+    let (mm, ymu) = (s, dot);
+    let t = if mm.re() == 0.0 {
+        S::from_f64(y[d - 1])
+    } else {
+        ymu / mm.sqrt()
+    };
+
+    // ---- rotations: groups d-2, d-3, …, 1 (see `givens_sequence`)
+    let ng = d - 2;
+    for gr in (1..=ng).rev() {
+        let off = gr * (gr + 1) / 2 - 1;
+        let n = gr + 1;
+        let g = &gamma[off..off + n];
+        // suffix norms rt[j] = ‖G_{j..n}‖
+        let mut acc = S::zero();
+        for j in (0..n).rev() {
+            acc += g[j] * g[j];
+            rt[j] = acc.sqrt();
+        }
+        k[gr - 1] = rt[0] + 1.0;
+        // theta_gr acts on plane (0, 1)
+        let (c, sn) = if rt[n - 2].re() == 0.0 {
+            (S::one(), S::zero())
+        } else {
+            let inv = S::one() / rt[n - 2];
+            (g[n - 2] * inv, g[n - 1] * inv)
+        };
+        rotate_t(z, 0, c, sn);
+        if gr >= 2 {
+            // phi_{gr, gr-j} (1-based within the group) on plane (j, j+1), j = 1..gr-1
+            for j in 1..gr {
+                let jj = gr - j - 1; // 0-based phi index within the group
+                let (c, sn) = if rt[jj].re() == 0.0 {
+                    (S::one(), S::zero())
+                } else {
+                    let inv = S::one() / rt[jj];
+                    (g[jj] * inv, rt[jj + 1] * inv)
+                };
+                rotate_t(z, j, c, sn);
+            }
+        }
+    }
+
+    // ---- q = Σ_j p_j² / λ_j + t²
+    let mut prod = S::one();
+    for i in 1..=ng {
+        let e = (d - 1 - i) as i32;
+        prod *= if e == 1 { k[i - 1] } else { k[i - 1].powi(e) };
+    }
+    let mut inv_l = if d == 3 {
+        prod.sqrt()
+    } else {
+        prod.powf(1.0 / (d - 1) as f64)
+    };
+    let mut q = t * t;
+    for j in 0..d - 1 {
+        q += z[j] * z[j] * inv_l;
+        if j < ng {
+            inv_l /= k[j];
+        }
+    }
+    (q, ymu, mm)
+}
+
+/// Apply the transpose of the plane rotation `[[c, −s], [s, c]]` in
+/// coordinates `(a, a+1)` to `z`.
+#[inline(always)]
+fn rotate_t<S: Scalar>(z: &mut [S], a: usize, c: S, s: S) {
+    let (x, y) = (z[a], z[a + 1]);
+    z[a] = c * x + s * y;
+    z[a + 1] = c * y - s * x;
+}
+
+#[inline(always)]
+fn loglik_core<S: Scalar>(
+    mu: &[S],
+    gamma: &[S],
+    y: &[f64],
+    z: &mut [S],
+    k: &mut [S],
+    rt: &mut [S],
+) -> S {
+    let d = mu.len();
+    let p = d - 1;
+    let (q, ymu, mm) = quad_form_parts(mu, gamma, y, z, k, rt);
+    let alpha = ymu / q.sqrt();
+    S::from_f64(-0.5 * p as f64 * LN_2PI) - q.ln() * (0.5 * d as f64)
+        + (alpha * alpha - mm) * 0.5
+        + log_m_p(alpha, p)
+}
+
+/// Log-density given a precomputed frame (reference implementation; the
+/// likelihood itself uses the faster frame-free kernel above).
 #[inline]
 pub fn loglik_frame<S: Scalar>(frame: &Frame<S>, mu: &[S], y: &[f64]) -> S {
     let d = y.len();
@@ -104,8 +340,7 @@ pub fn loglik_frame<S: Scalar>(frame: &Frame<S>, mu: &[S], y: &[f64]) -> S {
 
 /// Log-density for separate `mu` and `gamma` (`f64`).
 pub fn loglik_mu_gamma(mu: &[f64], gamma: &[f64], y: &[f64]) -> f64 {
-    let frame = Frame::new(mu, gamma);
-    loglik_frame(&frame, mu, y)
+    loglik_mu_gamma_generic(mu, gamma, y)
 }
 
 #[inline]
@@ -213,6 +448,31 @@ mod tests {
     }
 
     #[test]
+    fn log_m_p_derivs_match_finite_differences() {
+        for &a in &[
+            -40.0, -9.0, -4.0, -2.0000001, -1.9999999, -0.5, 0.0, 1.5, 7.0,
+        ] {
+            for p in 1..=8 {
+                let (l, d1, d2) = log_m_p_derivs(a, p);
+                let h = 1e-4 * (1.0f64).max(a.abs());
+                let (lp, d1p, _) = log_m_p_derivs(a + h, p);
+                let (lm, d1m, _) = log_m_p_derivs(a - h, p);
+                let fd1 = (lp - lm) / (2.0 * h);
+                let fd2 = (d1p - d1m) / (2.0 * h);
+                assert!(
+                    (d1 - fd1).abs() < 1e-6 * d1.abs().max(1.0),
+                    "a={a} p={p}: d1 {d1} vs {fd1}"
+                );
+                assert!(
+                    (d2 - fd2).abs() < 1e-5 * d2.abs().max(1.0),
+                    "a={a} p={p}: d2 {d2} vs {fd2}"
+                );
+                assert!(l.is_finite());
+            }
+        }
+    }
+
+    #[test]
     fn log_m_p_derivative_in_the_tail() {
         // d/da log M_p = p M_{p-1}/M_p
         for &a in &[-30.0, -8.0, -3.0, -2.5] {
@@ -295,6 +555,58 @@ mod tests {
             total *= (2.0 / nz as f64) * (2.0 * std::f64::consts::PI / nphi as f64);
             assert!((total - 1.0).abs() < 1e-4, "{mu:?} {gamma:?}: {total}");
         }
+    }
+
+    #[test]
+    fn fast_kernel_matches_frame_reference() {
+        let mut st = 0xC0FFEEu64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
+        };
+        let mut worst: f64 = 0.0;
+        for d in 3..=10usize {
+            let g = dims::gamma_len(d);
+            for case in 0..60 {
+                let mut mu: Vec<f64> = (0..d).map(|_| 2.0 * next()).collect();
+                let mut gamma: Vec<f64> = (0..g).map(|_| next()).collect();
+                match case % 6 {
+                    1 => {
+                        mu[0] = 0.0;
+                        mu[1] = 0.0;
+                    }
+                    2 => {
+                        for v in mu.iter_mut().take(d - 1) {
+                            *v = 0.0;
+                        }
+                    }
+                    3 => gamma.iter_mut().for_each(|v| *v = 0.0),
+                    4 => {
+                        // zero tails inside groups
+                        for v in gamma.iter_mut().skip(1).step_by(2) {
+                            *v = 0.0;
+                        }
+                    }
+                    5 => gamma.iter_mut().for_each(|v| *v *= 4.0),
+                    _ => {}
+                }
+                let raw: Vec<f64> = (0..d).map(|_| next()).collect();
+                let nr = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let y: Vec<f64> = raw.iter().map(|v| v / nr).collect();
+                let fast = loglik_mu_gamma(&mu, &gamma, &y);
+                let frame = Frame::new(&mu[..], &gamma[..]);
+                let reference = loglik_frame(&frame, &mu, &y);
+                let rel = (fast - reference).abs() / reference.abs().max(1.0);
+                worst = worst.max(rel);
+                assert!(
+                    rel < 1e-11,
+                    "d={d} case={case}: fast {fast} vs frame {reference}"
+                );
+            }
+        }
+        eprintln!("fast kernel vs frame reference: worst relative difference {worst:.2e}");
     }
 
     #[test]

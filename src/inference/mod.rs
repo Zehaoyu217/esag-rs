@@ -25,6 +25,8 @@ pub(crate) fn refit_config(fit: &EsagRegressorFit) -> EsagRegressor {
     cfg.compute_hessian = false;
     cfg.n_restarts = 0;
     cfg.verbose = false;
+    // one refit per thread already saturates the machine
+    cfg.parallel = false;
     cfg.mask = Some(fit.mask.clone());
     cfg
 }

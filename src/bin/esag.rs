@@ -15,7 +15,7 @@ use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, pr
 use esag::regression::{EsagRegressor, EsagRegressorFit};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use esag::FastRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::error::Error;
 use std::path::PathBuf;
@@ -232,7 +232,7 @@ fn run() -> Res<()> {
                 2,
                 &[1.5, 0.5, 1.0, 0.8, -0.4, -0.6, 1.2, 0.3, 0.5, 0.7],
             );
-            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut rng = FastRng::seed_from_u64(seed);
             let mut w = csv::Writer::from_path(&out)?;
             w.write_record(["x1", "y1", "y2", "y3"])?;
             let mut buf = [0.0; 3];

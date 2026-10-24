@@ -323,6 +323,7 @@ impl<const N: usize> DivAssign<f64> for Dual<N> {
 // ----- Scalar -----------------------------------------------------------------
 
 impl<const N: usize> Scalar for Dual<N> {
+    const DERIV_ORDER: u8 = 1;
     #[inline]
     fn from_f64(v: f64) -> Self {
         Self::constant(v)

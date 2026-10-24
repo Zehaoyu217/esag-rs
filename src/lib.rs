@@ -17,12 +17,14 @@
 // `!(x > 0.0)` is used on purpose: it is also true for NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
+pub mod adjoint;
 pub mod dims;
 pub mod distribution;
 pub mod dual;
 pub mod error;
 pub mod estimator;
 pub mod frame;
+pub mod hdual;
 pub mod inference;
 pub mod loglik;
 pub mod onb;
@@ -35,3 +37,10 @@ pub mod scalar;
 pub mod stats;
 
 pub use scalar::Scalar;
+
+/// The random-number generator used for every internal Monte-Carlo and
+/// bootstrap stream: xoshiro256++ (fast, excellent statistical quality, and
+/// a fixed algorithm, so seeded results are reproducible across versions of
+/// `rand`). Replicate `b` of a bootstrap uses its own generator seeded from
+/// the user's seed, so results do not depend on the number of threads.
+pub type FastRng = rand::rngs::Xoshiro256PlusPlus;

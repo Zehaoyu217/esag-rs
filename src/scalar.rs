@@ -29,6 +29,10 @@ pub trait Scalar:
     + Sync
     + 'static
 {
+    /// Highest derivative order this type carries: 0 for `f64`, 1 for
+    /// first-order duals, 2 (the default) for second-order types. Lets
+    /// kernels skip derivative work the type would discard.
+    const DERIV_ORDER: u8 = 2;
     /// Lift a constant (zero derivative).
     fn from_f64(v: f64) -> Self;
     /// The value (real part).
@@ -62,6 +66,7 @@ pub trait Scalar:
 }
 
 impl Scalar for f64 {
+    const DERIV_ORDER: u8 = 0;
     #[inline]
     fn from_f64(v: f64) -> Self {
         v

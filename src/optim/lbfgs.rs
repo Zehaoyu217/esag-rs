@@ -179,6 +179,11 @@ pub struct LbfgsConfig {
     pub max_ls_iter: usize,
     /// Print one line per iteration to stderr. Default `false`.
     pub verbose: bool,
+    /// Optional shared, dynamically lowerable iteration limit: the solver
+    /// stops with [`Status::MaxIterations`] once `n_iter` reaches
+    /// `min(max_iter, budget)`. Lets concurrent runs from different starts
+    /// cut each other short (see `EsagRegressor`'s `Init::Auto`).
+    pub iter_budget: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for LbfgsConfig {
@@ -194,6 +199,7 @@ impl Default for LbfgsConfig {
             c2: 0.9,
             max_ls_iter: 40,
             verbose: false,
+            iter_budget: None,
         }
     }
 }
@@ -714,7 +720,11 @@ pub fn minimize(obj: &dyn Objective, x0: &[f64], cfg: &LbfgsConfig) -> OptimResu
         if cfg.tol_x > 0.0 && last_dx <= cfg.tol_x {
             break Status::StepConverged;
         }
-        if n_iter >= cfg.max_iter {
+        let limit = match &cfg.iter_budget {
+            Some(b) => cfg.max_iter.min(b.load(std::sync::atomic::Ordering::Relaxed)),
+            None => cfg.max_iter,
+        };
+        if n_iter >= limit {
             break Status::MaxIterations;
         }
         if n_fev >= cfg.max_fev {
