@@ -107,11 +107,46 @@
 //!   `ȳmu = ᾱ/√q`.
 //!
 //! At `S = 0` the eigen-decomposition is skipped: `zᵀ e^{−S} z = ‖z‖²`,
-//! `∂q/∂S = −zzᵀ` and `∂q/∂z = 2z`, exactly. The value returned by the two
-//! functions is bit-identical: they perform the same floating-point
-//! operations up to the log-density. For `d ≤ 8` they work on stack buffers
-//! only, and larger `d` fall back to heap buffers. See `docs/MATH.md`,
-//! "Log-tangent shape parameterization (smooth option)".
+//! `∂q/∂S = −zzᵀ` and `∂q/∂z = 2z`, exactly.
+//!
+//! # The Hessian
+//!
+//! [`loglik_lt_hess`] adds the exact Hessian from the same
+//! eigen-decomposition. `log f = Φ(q, ymu) − ‖μ‖²/2` with
+//! `Φ = −(d/2) log q + ψ(ymu/√q)`, `ψ(a) = a²/2 + log M_p(a)`, so
+//!
+//! ```text
+//! ∇² log f = Φ_q ∇²q + Φ_qq ∇q∇qᵀ + Φ_qy (∇q eᵀ + e∇qᵀ) + Φ_yy eeᵀ − [I 0; 0 0],
+//! ```
+//!
+//! with `e = (y, 0)` and `∇²q` in three blocks:
+//!
+//! * *Shape.* By the second-order Daleckii–Krein formula,
+//!   `zᵀ D²e^{−S}[H, K] z = 2 Σ_abc T_cab w_a w_b H̃_ac K̃_cb` for symmetric
+//!   `H, K` (`H̃ = QᵀHQ`), with `T_cab = e^{−x}[λ_a, λ_c, λ_b]` the second
+//!   divided differences. For gaps of at least ½ they come from the
+//!   recursion on `F`, below that from the series
+//!   `e^{−λ_lo} Σ_n (−1)ⁿ h_{n−2}(δ₁, δ₂)/n!`. In the original coordinates
+//!   the form is `2 Wt(u, y, x, v)` at `H = e_x e_uᵀ`, `K = e_y e_vᵀ`, where
+//!   `Wt = Σ_c Q_uc Q_yc G_c[x][v]` and `G_c = R_w T_c R_wᵀ`,
+//!   `R_w = Q diag(w)`. `Wt` is symmetric within its index pairs, so it is a
+//!   `p(p+1)/2`-square matrix, about `p⁵/4 + 1.5 p⁴` operations in all
+//!   (9k at `p = 7`). Each entry
+//!   of the shape block is a sum of four of its entries, with prefix sums
+//!   for the Helmert coordinates.
+//! * *Cross.* `∂/∂s_i ∂q/∂z = 2Q(F ∘ B̃_i)w`, chained through
+//!   `K = Qᵀ ∂z/∂μ̂` and `∂μ̂/∂μ = P/‖μ‖`, where `P = I − μ̂μ̂ᵀ`.
+//! * *Mean.* `A = ∂²q/∂μ̂² = 2yyᵀ + 2Kᵀ e^{−Λ} K + Σ_k ū_k ∇²u_k`, using the
+//!   Householder second derivatives, then
+//!   `∂²q/∂μ² = (PAP − (g⊥μ̂ᵀ + μ̂g⊥ᵀ + (g·μ̂) P))/‖μ‖²` with `g = ∂q/∂μ̂`,
+//!   `g⊥ = Pg`.
+//!
+//! The value returned by all three functions is bit-identical. They perform
+//! the same floating-point operations up to the log-density, and the
+//! gradients of [`loglik_lt_grad`] and [`loglik_lt_hess`] agree bit for bit.
+//! For `d ≤ 8` they work on stack buffers only, and larger `d` fall back to
+//! heap buffers. See `docs/MATH.md`, "Log-tangent shape parameterization
+//! (smooth option)".
 
 use crate::dims;
 use crate::loglik::{log_m_p_derivs, log_m_p_value};
@@ -152,8 +187,8 @@ const EXACT_SWEEPS: usize = 64;
 
 /// From this eigenvalue gap on, the divided differences of `e^{−x}` are
 /// formed directly as `(e_a − e_b)/(λ_a − λ_b)`, which then loses at most a
-/// factor `1/(1 − e^{−0.5}) ≈ 2.5` to cancellation. Below it they use
-/// `expm1`.
+/// factor `1/(1 − e^{−0.5}) ≈ 2.5` to cancellation. Below it they use a
+/// series.
 const DD_DIRECT: f64 = 0.5;
 
 // =========================================================================
@@ -664,8 +699,23 @@ fn sym_eigen(a: &[f64], p: usize) -> (Vec<f64>, DMatrix<f64>) {
     (lam, DMatrix::from_fn(p, p, |r, c| qt[c * p + r]))
 }
 
+/// Coefficients `(−1)^k/(k+1)!`, `k = 0..16`, of `(1 − e^{−δ})/δ`; for
+/// `0 ≤ δ < ½` the truncation error is below 2e-19.
+const DD1_COEF: [f64; 16] = {
+    let mut c = [1.0; 16];
+    let mut k = 1;
+    while k < 16 {
+        c[k] = c[k - 1] * (-1.0 / (k + 1) as f64);
+        k += 1;
+    }
+    c
+};
+
 /// The first divided difference of `x ↦ e^{−x}` at `(la, lb)`, given
-/// `ea = e^{−la}` and `eb = e^{−lb}`; `−e^{−la}` at `la = lb`.
+/// `ea = e^{−la}` and `eb = e^{−lb}`; `−e^{−la}` at `la = lb`. For gaps
+/// `δ < ½` it is `−e^{−min λ} (1 − e^{−δ})/δ` with the series of the last
+/// factor (Horner), which needs no branch at `δ = 0` and is accurate for
+/// every gap.
 #[inline(always)]
 fn exp_neg_divided_difference(la: f64, lb: f64, ea: f64, eb: f64) -> f64 {
     let delta = lb - la;
@@ -678,11 +728,11 @@ fn exp_neg_divided_difference(la: f64, lb: f64, ea: f64, eb: f64) -> f64 {
         } else {
             (eb, -delta)
         };
-        if dl == 0.0 {
-            -e_lo
-        } else {
-            e_lo * (-dl).exp_m1() / dl
+        let mut acc = DD1_COEF[15];
+        for &c in DD1_COEF[..15].iter().rev() {
+            acc = acc * dl + c;
         }
+        -e_lo * acc
     }
 }
 
@@ -814,7 +864,7 @@ pub fn loglik_lt(frame: &LtFrame, eta: &[f64], y: &[f64]) -> f64 {
         6 => lt_fixed::<6, 5, false>(frame, eta, y, none),
         7 => lt_fixed::<7, 6, false>(frame, eta, y, none),
         8 => lt_fixed::<8, 7, false>(frame, eta, y, none),
-        _ => lt_heap::<false>(frame, eta, y, none),
+        _ => lt_heap::<false, false>(frame, eta, y, none, &mut []),
     }
 }
 
@@ -840,12 +890,56 @@ pub fn loglik_lt_grad(frame: &LtFrame, eta: &[f64], y: &[f64], grad: &mut [f64])
         6 => lt_fixed::<6, 5, true>(frame, eta, y, grad),
         7 => lt_fixed::<7, 6, true>(frame, eta, y, grad),
         8 => lt_fixed::<8, 7, true>(frame, eta, y, grad),
-        _ => lt_heap::<true>(frame, eta, y, grad),
+        _ => lt_heap::<true, false>(frame, eta, y, grad, &mut []),
+    }
+}
+
+/// ESAG log-density at the unit vector `y` for `eta = (mu, s)` (see
+/// [`loglik_lt`]), its gradient (into `grad`, as [`loglik_lt_grad`]) and its
+/// exact Hessian with respect to `eta` (into `hess`, row-major `n × n`,
+/// `n = eta.len()`, exactly symmetric), from one eigen-decomposition of `S`.
+///
+/// The value is bit-identical to [`loglik_lt`] and the gradient to
+/// [`loglik_lt_grad`]. The derivation is in the [module documentation](self).
+///
+/// # Panics
+/// As [`loglik_lt`], and if `grad.len() != n` or `hess.len() != n²`.
+pub fn loglik_lt_hess(
+    frame: &LtFrame,
+    eta: &[f64],
+    y: &[f64],
+    grad: &mut [f64],
+    hess: &mut [f64],
+) -> f64 {
+    let d = check_eta(frame, eta, y);
+    let n = eta.len();
+    assert_eq!(
+        grad.len(),
+        n,
+        "grad has length {} but eta has length {n}",
+        grad.len()
+    );
+    assert_eq!(
+        hess.len(),
+        n * n,
+        "hess has length {} but eta has length {n} (needs {})",
+        hess.len(),
+        n * n
+    );
+    match d {
+        3 => lt_hess_fixed::<3, 2, 2, 5, 3>(frame, eta, y, grad, hess),
+        4 => lt_hess_fixed::<4, 3, 5, 9, 6>(frame, eta, y, grad, hess),
+        5 => lt_hess_fixed::<5, 4, 9, 14, 10>(frame, eta, y, grad, hess),
+        6 => lt_hess_fixed::<6, 5, 14, 20, 15>(frame, eta, y, grad, hess),
+        7 => lt_hess_fixed::<7, 6, 20, 27, 21>(frame, eta, y, grad, hess),
+        8 => lt_hess_fixed::<8, 7, 27, 35, 28>(frame, eta, y, grad, hess),
+        _ => lt_heap::<true, true>(frame, eta, y, grad, hess),
     }
 }
 
 /// Scratch for the kernel: vectors of length `d` and `p`, `p × p` matrices
-/// (row-major), and one round of Jacobi rotations.
+/// (row-major), one round of Jacobi rotations, and the Hessian's buffers
+/// (empty unless the Hessian is wanted).
 struct Work<'a> {
     /// `μ̂`.
     mu_hat: &'a mut [f64],
@@ -871,6 +965,75 @@ struct Work<'a> {
     r: &'a mut [f64],
     /// One round of rotations.
     rot: &'a mut [Rot],
+    /// The Hessian's buffers.
+    h: HessWork<'a>,
+}
+
+/// Buffers of [`loglik_lt_hess`] (`n = d + ns` parameters, `ns` shape
+/// coordinates, `np = p(p+1)/2` index pairs).
+struct HessWork<'a> {
+    /// The output, row-major `n × n`.
+    hess: &'a mut [f64],
+    /// `∇q` (`n`).
+    dq: &'a mut [f64],
+    /// `ū = E z̄` (`d`).
+    ubar: &'a mut [f64],
+    /// `Q` row-major, `qm[j*p + c] = Q_jc` (`p²`).
+    qm: &'a mut [f64],
+    /// The first divided differences `F` (`p²`).
+    fq: &'a mut [f64],
+    /// `T[c][a][b] = e^{−x}[λ_a, λ_c, λ_b]` (`p³`).
+    t2: &'a mut [f64],
+    /// `R_w = Q diag(w)` (`p²`).
+    rw: &'a mut [f64],
+    /// Scratch `p²`: `R_w T[c]`, then `Φ = F R_wᵀ`.
+    xg: &'a mut [f64],
+    /// Scratch `p²`: Helmert sums.
+    hm: &'a mut [f64],
+    /// `G^{(c)}[x][v]` by pair `{x, v}`, `gp[c*np + pair]` (`p·np`).
+    gp: &'a mut [f64],
+    /// `Q_uc Q_yc` by pair `{u, y}`, `aq[pair*p + c]` (`np·p`).
+    aq: &'a mut [f64],
+    /// `Wt` by pairs, `w2[pair(u, y)*np + pair(x, v)]` (`np²`).
+    w2: &'a mut [f64],
+    /// `(F ∘ B̃_i) w` for every shape coordinate, `tt[i*p + α]` (`ns·p`).
+    tt: &'a mut [f64],
+    /// `K = Qᵀ ∂z/∂μ̂` (`p × d`).
+    kk: &'a mut [f64],
+    /// Scratch (`p`).
+    vx: &'a mut [f64],
+    /// `pid[u*p + v]` = the index of the pair `{u, v}` (`p²`).
+    pid: &'a mut [usize],
+    /// Scratch (`d`).
+    xv: &'a mut [f64],
+    /// `∂²q/∂μ̂²` (`d²`).
+    am: &'a mut [f64],
+}
+
+impl HessWork<'static> {
+    /// No Hessian.
+    fn empty() -> Self {
+        HessWork {
+            hess: &mut [],
+            dq: &mut [],
+            ubar: &mut [],
+            qm: &mut [],
+            fq: &mut [],
+            t2: &mut [],
+            rw: &mut [],
+            xg: &mut [],
+            hm: &mut [],
+            gp: &mut [],
+            aq: &mut [],
+            w2: &mut [],
+            tt: &mut [],
+            kk: &mut [],
+            vx: &mut [],
+            pid: &mut [],
+            xv: &mut [],
+            am: &mut [],
+        }
+    }
 }
 
 /// Stack buffers for dimension `D = P + 1 ≤ 8`. Kept out of line so that
@@ -905,13 +1068,14 @@ fn lt_fixed<const D: usize, const P: usize, const GRAD: bool>(
         fm: fm.as_flattened_mut(),
         r: r.as_flattened_mut(),
         rot: &mut rot,
+        h: HessWork::empty(),
     };
     let grad = if GRAD {
         &mut grad[..dims::eta_len(D)]
     } else {
         grad
     };
-    lt_core::<GRAD>(
+    lt_core::<GRAD, false>(
         &frame.m[..D],
         &frame.e[..D * P],
         &mu[..D],
@@ -922,23 +1086,167 @@ fn lt_fixed<const D: usize, const P: usize, const GRAD: bool>(
     )
 }
 
-/// Heap buffers for `d > 8`.
-fn lt_heap<const GRAD: bool>(frame: &LtFrame, eta: &[f64], y: &[f64], grad: &mut [f64]) -> f64 {
+/// Stack buffers for the Hessian at dimension `D = P + 1 ≤ 8`, with
+/// `NS = (D−2)(D+1)/2` shape coordinates, `NE = D + NS` parameters and
+/// `NP = P(P+1)/2` index pairs.
+#[inline(never)]
+fn lt_hess_fixed<
+    const D: usize,
+    const P: usize,
+    const NS: usize,
+    const NE: usize,
+    const NP: usize,
+>(
+    frame: &LtFrame,
+    eta: &[f64],
+    y: &[f64],
+    grad: &mut [f64],
+    hess: &mut [f64],
+) -> f64 {
+    const {
+        assert!(
+            D >= 3
+                && P + 1 == D
+                && NS == (D - 2) * (D + 1) / 2
+                && NE == D + NS
+                && NP == P * (P + 1) / 2
+        )
+    };
+    let (mu, s) = eta.split_at(D);
+    let mut dv = [[0.0; D]; 6];
+    let mut pv = [[0.0; P]; 4];
+    let mut pm = [[[0.0; P]; P]; 9];
+    let mut t2 = [[[0.0; P]; P]; P];
+    let mut gp = [[0.0; NP]; P];
+    let mut aq = [[0.0; P]; NP];
+    let mut w2 = [[0.0; NP]; NP];
+    let mut tt = [[0.0; P]; NS];
+    let mut kk = [[0.0; D]; P];
+    let mut am = [[0.0; D]; D];
+    let mut dq = [0.0; NE];
+    let mut pid = [[0usize; P]; P];
+    let mut rot = [Rot::default(); D];
+    let [mu_hat, v, u, ub, ubar, xv] = &mut dv;
+    let [z, ex, zb, vx] = &mut pv;
+    let [a, qt, fm, r, qm, fq, rw, xg, hm] = &mut pm;
+    let w = Work {
+        mu_hat,
+        v,
+        u,
+        ub,
+        z,
+        ex,
+        zb,
+        a: a.as_flattened_mut(),
+        qt: qt.as_flattened_mut(),
+        fm: fm.as_flattened_mut(),
+        r: r.as_flattened_mut(),
+        rot: &mut rot,
+        h: HessWork {
+            hess: &mut hess[..NE * NE],
+            dq: &mut dq,
+            ubar,
+            qm: qm.as_flattened_mut(),
+            fq: fq.as_flattened_mut(),
+            t2: t2.as_flattened_mut().as_flattened_mut(),
+            rw: rw.as_flattened_mut(),
+            xg: xg.as_flattened_mut(),
+            hm: hm.as_flattened_mut(),
+            gp: gp.as_flattened_mut(),
+            aq: aq.as_flattened_mut(),
+            w2: w2.as_flattened_mut(),
+            tt: tt.as_flattened_mut(),
+            kk: kk.as_flattened_mut(),
+            vx,
+            pid: pid.as_flattened_mut(),
+            xv,
+            am: am.as_flattened_mut(),
+        },
+    };
+    lt_core::<true, true>(
+        &frame.m[..D],
+        &frame.e[..D * P],
+        &mu[..D],
+        &s[..NS],
+        &y[..D],
+        &mut grad[..NE],
+        w,
+    )
+}
+
+/// Heap buffers for `d > 8`; `HESS` needs `hess` of length `n²`.
+fn lt_heap<const GRAD: bool, const HESS: bool>(
+    frame: &LtFrame,
+    eta: &[f64],
+    y: &[f64],
+    grad: &mut [f64],
+    hess: &mut [f64],
+) -> f64 {
     let d = y.len();
     let p = d - 1;
     let (mu, s) = eta.split_at(d);
+    let (ns, pp) = (s.len(), p * p);
     let mut dv = vec![0.0; 4 * d];
     let mut pv = vec![0.0; 3 * p];
-    let mut pm = vec![0.0; 4 * p * p];
+    let mut pm = vec![0.0; 4 * pp];
     let mut rot = vec![Rot::default(); d];
     let (mu_hat, rest) = dv.split_at_mut(d);
     let (v, rest) = rest.split_at_mut(d);
     let (u, ub) = rest.split_at_mut(d);
     let (z, rest) = pv.split_at_mut(p);
     let (ex, zb) = rest.split_at_mut(p);
-    let (a, rest) = pm.split_at_mut(p * p);
-    let (qt, rest) = rest.split_at_mut(p * p);
-    let (fm, r) = rest.split_at_mut(p * p);
+    let (a, rest) = pm.split_at_mut(pp);
+    let (qt, rest) = rest.split_at_mut(pp);
+    let (fm, r) = rest.split_at_mut(pp);
+    let np = p * (p + 1) / 2;
+    let mut pid = vec![0usize; if HESS { pp } else { 0 }];
+    let mut hv = if HESS {
+        vec![
+            0.0;
+            d + ns + 2 * d + 5 * pp + pp * p + 2 * p * np + np * np + ns * p + p * d + p + d * d
+        ]
+    } else {
+        Vec::new()
+    };
+    let h = if HESS {
+        let (dq, rest) = hv.split_at_mut(d + ns);
+        let (ubar, rest) = rest.split_at_mut(d);
+        let (xv, rest) = rest.split_at_mut(d);
+        let (qm, rest) = rest.split_at_mut(pp);
+        let (fq, rest) = rest.split_at_mut(pp);
+        let (rw, rest) = rest.split_at_mut(pp);
+        let (xg, rest) = rest.split_at_mut(pp);
+        let (hm, rest) = rest.split_at_mut(pp);
+        let (t2, rest) = rest.split_at_mut(pp * p);
+        let (gp, rest) = rest.split_at_mut(p * np);
+        let (aq, rest) = rest.split_at_mut(np * p);
+        let (w2, rest) = rest.split_at_mut(np * np);
+        let (tt, rest) = rest.split_at_mut(ns * p);
+        let (kk, rest) = rest.split_at_mut(p * d);
+        let (vx, am) = rest.split_at_mut(p);
+        HessWork {
+            hess,
+            dq,
+            ubar,
+            qm,
+            fq,
+            t2,
+            rw,
+            xg,
+            hm,
+            gp,
+            aq,
+            w2,
+            tt,
+            kk,
+            vx,
+            pid: &mut pid,
+            xv,
+            am,
+        }
+    } else {
+        HessWork::empty()
+    };
     let w = Work {
         mu_hat,
         v,
@@ -952,14 +1260,15 @@ fn lt_heap<const GRAD: bool>(frame: &LtFrame, eta: &[f64], y: &[f64], grad: &mut
         fm,
         r,
         rot: &mut rot,
+        h,
     };
-    lt_core::<GRAD>(&frame.m, &frame.e, mu, s, y, grad, w)
+    lt_core::<GRAD, HESS>(&frame.m, &frame.e, mu, s, y, grad, w)
 }
 
-/// The forward pass, and for `GRAD` the reverse sweep. See the module
-/// documentation.
+/// The forward pass, for `GRAD` the reverse sweep, and for `HESS` the
+/// Hessian. See the module documentation.
 #[inline(always)]
-fn lt_core<const GRAD: bool>(
+fn lt_core<const GRAD: bool, const HESS: bool>(
     m: &[f64],
     e: &[f64],
     mu: &[f64],
@@ -983,6 +1292,7 @@ fn lt_core<const GRAD: bool>(
         fm,
         r,
         rot,
+        h,
     } = w;
     let (mu_hat, v, u, ub) = (&mut mu_hat[..d], &mut v[..d], &mut u[..d], &mut ub[..d]);
     let (z, ex, zb) = (&mut z[..p], &mut ex[..p], &mut zb[..p]);
@@ -1017,7 +1327,10 @@ fn lt_core<const GRAD: bool>(
     // ---- shape: zᵀe^{−S}z = Σ_a e^{−λ_a} w_a², w = Qᵀz (z is rotated in place)
     let ss = s_to_matrix_into(s, p, a);
     let iso = ss == 0.0;
-    let zt = if iso {
+    // the Hessian takes the general path at S = 0 too (Q = I, Λ = 0); it
+    // gives the same value and gradient bit for bit
+    let fast_iso = iso && !HESS;
+    let zt = if fast_iso {
         let mut acc = 0.0;
         for j in 0..p {
             acc += z[j] * z[j];
@@ -1032,9 +1345,11 @@ fn lt_core<const GRAD: bool>(
         }
         // Jacobi on S/‖S‖_F; the eigenvalues are rescaled on the diagonal
         let scale = ss.sqrt();
-        let inv = 1.0 / scale;
-        a.iter_mut().for_each(|x| *x *= inv);
-        jacobi::<GRAD>(a, z, qt, rot, KERNEL_SWEEPS);
+        if !iso {
+            let inv = 1.0 / scale;
+            a.iter_mut().for_each(|x| *x *= inv);
+            jacobi::<GRAD>(a, z, qt, rot, KERNEL_SWEEPS);
+        }
         let mut acc = 0.0;
         for j in 0..p {
             let lj = scale * a[j * p + j];
@@ -1050,11 +1365,10 @@ fn lt_core<const GRAD: bool>(
     let q = b * b + zt;
     let sq = q.sqrt();
     let alpha = ymu / sq;
-    let (lmp, dlmp) = if GRAD {
-        let (l, d1, _) = log_m_p_derivs(alpha, p);
-        (l, d1)
+    let (lmp, dlmp, d2lmp) = if GRAD {
+        log_m_p_derivs(alpha, p)
     } else {
-        (log_m_p_value(alpha, p), 0.0)
+        (log_m_p_value(alpha, p), 0.0, 0.0)
     };
     let ll =
         -0.5 * p as f64 * LN_2PI - q.ln() * (0.5 * d as f64) + (alpha * alpha - rf.mm) * 0.5 + lmp;
@@ -1071,7 +1385,7 @@ fn lt_core<const GRAD: bool>(
     let (gmu, gs) = grad.split_at_mut(d);
 
     // ---- ∂q/∂z into zb, ∂q/∂S (upper triangle) into fm
-    if iso {
+    if fast_iso {
         for j in 0..p {
             zb[j] = 2.0 * z[j];
         }
@@ -1081,6 +1395,13 @@ fn lt_core<const GRAD: bool>(
             }
         }
     } else {
+        if HESS {
+            for c in 0..p {
+                for j in 0..p {
+                    h.qm[j * p + c] = qt[c * p + j];
+                }
+            }
+        }
         // zb = 2Q(e^{−λ} ∘ w); then qt ← diag(w) Qᵀ
         zb.fill(0.0);
         for j in 0..p {
@@ -1100,6 +1421,9 @@ fn lt_core<const GRAD: bool>(
                 fm[i * p + j] = f;
                 fm[j * p + i] = f;
             }
+        }
+        if HESS {
+            h.fq[..p * p].copy_from_slice(fm);
         }
         // r = F diag(w)Qᵀ; ∂q/∂S = (diag(w)Qᵀ)ᵀ r = Q (F ∘ wwᵀ) Qᵀ
         for i in 0..p {
@@ -1124,44 +1448,497 @@ fn lt_core<const GRAD: bool>(
         }
     }
     s_grad_from_upper(fm, p, qb, gs);
+    if HESS {
+        s_grad_from_upper(fm, p, 1.0, &mut h.dq[d..d + gs.len()]);
+    }
 
     // ---- ū = E z̄; v̄ = −κū − (2(ū·v)/(v·v)) u; μ̂̄ = v̄ + 2b y
-    if !rf.mu_free {
+    if rf.mu_free {
+        ub.fill(0.0);
+        for j in 0..p {
+            let c = zb[j];
+            let ej = &e[j * d..(j + 1) * d];
+            for k in 0..d {
+                ub[k] += c * ej[k];
+            }
+        }
+        if HESS {
+            h.ubar[..d].copy_from_slice(ub);
+        }
+        let (ck, cu) = if rf.frame_free {
+            let mut uv = 0.0;
+            for k in 0..d {
+                uv += ub[k] * v[k];
+            }
+            (kappa, 2.0 * uv / rf.vv)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut proj = 0.0;
+        for k in 0..d {
+            let h = 2.0 * b * y[k] - ck * ub[k] - cu * u[k];
+            ub[k] = h;
+            proj += h * mu_hat[k];
+        }
+        // μ̂ = μ/‖μ‖: ∂q/∂μ = (μ̂̄ − (μ̂·μ̂̄) μ̂)/‖μ‖
+        for k in 0..d {
+            let gq = (ub[k] - proj * mu_hat[k]) * rf.inv_n;
+            gmu[k] = qb * gq + ymub * y[k] - mu[k];
+            if HESS {
+                h.dq[k] = gq;
+            }
+        }
+    } else {
         // μ̂ = m is constant
         for k in 0..d {
             gmu[k] = ymub * y[k] - mu[k];
         }
-        return ll;
-    }
-    ub.fill(0.0);
-    for j in 0..p {
-        let c = zb[j];
-        let ej = &e[j * d..(j + 1) * d];
-        for k in 0..d {
-            ub[k] += c * ej[k];
+        if HESS {
+            h.dq[..d].fill(0.0);
         }
     }
-    let (ck, cu) = if rf.frame_free {
-        let mut uv = 0.0;
-        for k in 0..d {
-            uv += ub[k] * v[k];
-        }
-        (kappa, 2.0 * uv / rf.vv)
-    } else {
-        (0.0, 0.0)
-    };
-    let mut proj = 0.0;
-    for k in 0..d {
-        let h = 2.0 * b * y[k] - ck * ub[k] - cu * u[k];
-        ub[k] = h;
-        proj += h * mu_hat[k];
-    }
-    // μ̂ = μ/‖μ‖: ∂q/∂μ = (μ̂̄ − (μ̂·μ̂̄) μ̂)/‖μ‖
-    for k in 0..d {
-        let gq = (ub[k] - proj * mu_hat[k]) * rf.inv_n;
-        gmu[k] = qb * gq + ymub * y[k] - mu[k];
+
+    if HESS {
+        // log f = Φ(q, ymu) − ‖μ‖²/2 with Φ = −(d/2) log q + ψ(alpha),
+        // ψ(a) = a²/2 + log M_p(a), alpha = ymu q^{−1/2}
+        let (psi1, psi2) = (ab, 1.0 + d2lmp);
+        let (a_q, a_y) = (-0.5 * alpha / q, 1.0 / sq);
+        let (a_qq, a_qy) = (0.75 * alpha / (q * q), -0.5 / (q * sq));
+        let fwd = Fwd {
+            e,
+            y,
+            mu_hat,
+            v,
+            u,
+            g: ub,
+            w: z,
+            ex,
+            a,
+            kappa,
+            vv: rf.vv,
+            inv_n: rf.inv_n,
+            mu_free: rf.mu_free,
+            frame_free: rf.frame_free,
+            phi_q: qb,
+            phi_qq: 0.5 * d as f64 / (q * q) + psi2 * a_q * a_q + psi1 * a_qq,
+            phi_qy: psi2 * a_q * a_y + psi1 * a_qy,
+            phi_yy: psi2 * a_y * a_y,
+        };
+        lt_hessian(&fwd, h);
     }
     ll
+}
+
+/// The forward and reverse intermediates that the Hessian needs.
+struct Fwd<'a> {
+    e: &'a [f64],
+    y: &'a [f64],
+    mu_hat: &'a [f64],
+    v: &'a [f64],
+    u: &'a [f64],
+    /// `∂q/∂μ̂` with `μ̂` taken as a free vector (valid when `mu_free`).
+    g: &'a [f64],
+    /// `w = Qᵀz`.
+    w: &'a [f64],
+    ex: &'a [f64],
+    /// `Λ` on the diagonal.
+    a: &'a [f64],
+    kappa: f64,
+    vv: f64,
+    inv_n: f64,
+    mu_free: bool,
+    frame_free: bool,
+    /// `∂Φ/∂q` and the second derivatives of `Φ(q, ymu)`.
+    phi_q: f64,
+    phi_qq: f64,
+    phi_qy: f64,
+    phi_yy: f64,
+}
+
+/// The Hessian of the log-density (see the module documentation):
+///
+/// ```text
+/// ∇² log f = Φ_q ∇²q + Φ_qq ∇q∇qᵀ + Φ_qy (∇q eᵀ + e∇qᵀ) + Φ_yy eeᵀ − [I 0; 0 0],
+/// ```
+///
+/// `e = (y, 0)`, with `∇²q` from the second-order Daleckii–Krein formula
+/// (shape block), the mixed derivative of `∂q/∂z` (cross block) and the
+/// Householder frame (mean block). Only the upper triangle is computed;
+/// the output is exactly symmetric.
+#[inline(always)]
+fn lt_hessian(f: &Fwd<'_>, h: HessWork<'_>) {
+    let (d, p) = (f.y.len(), f.w.len());
+    let pp = p * p;
+    let ns = s_len(p);
+    let np = p * (p + 1) / 2;
+    let n = d + ns;
+    let HessWork {
+        hess,
+        dq,
+        ubar,
+        qm,
+        fq,
+        t2,
+        rw,
+        xg,
+        hm,
+        gp,
+        aq,
+        w2,
+        tt,
+        kk,
+        vx,
+        pid,
+        xv,
+        am,
+    } = h;
+    let (hess, dq, ubar) = (&mut hess[..n * n], &dq[..n], &ubar[..d]);
+    let (qm, fq, t2) = (&qm[..pp], &fq[..pp], &mut t2[..pp * p]);
+    let (rw, xg, hm) = (&mut rw[..pp], &mut xg[..pp], &mut hm[..pp]);
+    let (gp, aq, w2) = (&mut gp[..p * np], &mut aq[..np * p], &mut w2[..np * np]);
+    let (tt, kk, vx) = (&mut tt[..ns * p], &mut kk[..p * d], &mut vx[..p]);
+    let (xv, am, pid) = (&mut xv[..d], &mut am[..d * d], &mut pid[..pp]);
+    let (y, w, mu_hat) = (f.y, f.w, f.mu_hat);
+
+    // ---- T[c][a][b] = e^{−x}[λ_a, λ_c, λ_b], symmetric in all three
+    for i in 0..p {
+        for j in i..p {
+            for k in j..p {
+                let val = exp_neg_dd2(f.a, p, f.ex, fq, i, j, k);
+                for (c, a, b) in [
+                    (i, j, k),
+                    (i, k, j),
+                    (j, i, k),
+                    (j, k, i),
+                    (k, i, j),
+                    (k, j, i),
+                ] {
+                    t2[c * pp + a * p + b] = val;
+                }
+            }
+        }
+    }
+
+    // ---- shape block. With β(H, K) = 2 Σ_abc T[c][a][b] w_a w_b H̃_ac K̃_cb
+    // (H̃ = QᵀHQ) the bilinear form of ∂²q/∂S², β(e_x e_uᵀ, e_y e_vᵀ) =
+    // 2 Wt(u, y, x, v) with Wt(u, y, x, v) = Σ_c Q_uc Q_yc G_c[x][v] and
+    // G_c = R_w T[c] R_wᵀ, R_w = Q diag(w). Wt is symmetric within each of
+    // its index pairs, so it is an np × np matrix W = A Gᵀ.
+    for x in 0..p {
+        for a in 0..p {
+            rw[x * p + a] = qm[x * p + a] * w[a];
+        }
+    }
+    for c in 0..p {
+        let tc = &t2[c * pp..(c + 1) * pp];
+        for x in 0..p {
+            let xr = &mut xg[x * p..(x + 1) * p];
+            xr.fill(0.0);
+            for a in 0..p {
+                let ra = rw[x * p + a];
+                let ta = &tc[a * p..(a + 1) * p];
+                for b in 0..p {
+                    xr[b] += ra * ta[b];
+                }
+            }
+        }
+        let gc = &mut gp[c * np..(c + 1) * np];
+        let mut idx = 0;
+        for x in 0..p {
+            for v in x..p {
+                gc[idx] = dot(&xg[x * p..(x + 1) * p], &rw[v * p..(v + 1) * p]);
+                idx += 1;
+            }
+        }
+    }
+    let mut idx = 0;
+    for uu in 0..p {
+        for yy in uu..p {
+            for c in 0..p {
+                aq[idx * p + c] = qm[uu * p + c] * qm[yy * p + c];
+            }
+            idx += 1;
+        }
+    }
+    for i in 0..np {
+        let wr = &mut w2[i * np..(i + 1) * np];
+        wr.fill(0.0);
+        for c in 0..p {
+            let ac = aq[i * p + c];
+            let gc = &gp[c * np..(c + 1) * np];
+            for (wv, gv) in wr.iter_mut().zip(gc) {
+                *wv += ac * gv;
+            }
+        }
+    }
+    for u in 0..p {
+        for v in 0..p {
+            pid[u * p + v] = pair_index(u, v, p);
+        }
+    }
+    let pid = &*pid;
+    let wt = |u: usize, yy: usize, x: usize, v: usize| w2[pid[u * p + yy] * np + pid[x * p + v]];
+    // off-diagonal pairs (a, b) ≤ (a2, b2): the four terms of
+    // β(B_ab, B_a2b2) with B_ab = (e_a e_bᵀ + e_b e_aᵀ)/√2
+    let mut i = p - 1;
+    for a in 0..p {
+        for b in a + 1..p {
+            let mut j = i;
+            for a2 in a..p {
+                let b0 = if a2 == a { b } else { a2 + 1 };
+                for b2 in b0..p {
+                    hess[(d + i) * n + d + j] =
+                        wt(b, a2, a, b2) + wt(b, b2, a, a2) + wt(a, a2, b, b2) + wt(a, b2, b, a2);
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+    // Helmert rows against the pairs: √2 Σ_x h_k[x] (Wt(x, a, x, b) + Wt(x, b, x, a))
+    let mut j = p - 1;
+    for a in 0..p {
+        for b in a + 1..p {
+            for x in 0..p {
+                vx[x] = wt(x, a, x, b) + wt(x, b, x, a);
+            }
+            let mut prefix = vx[0];
+            for k in 1..p {
+                hess[(d + k - 1) * n + d + j] = SQRT_2 * ((prefix - k as f64 * vx[k]) * helmert(k));
+                prefix += vx[k];
+            }
+            j += 1;
+        }
+    }
+    // Helmert against Helmert: 2 h_kᵀ M h_k', M[x][y] = Wt(x, y, x, y);
+    // hm[x][k'−1] = (M h_k')[x] by prefix sums over y
+    for x in 0..p {
+        let mut prefix = wt(x, 0, x, 0);
+        for k in 1..p {
+            let mk = wt(x, k, x, k);
+            hm[x * p + k - 1] = (prefix - k as f64 * mk) * helmert(k);
+            prefix += mk;
+        }
+    }
+    for k2 in 1..p {
+        let mut prefix = hm[k2 - 1];
+        for k in 1..p {
+            let hk = hm[k * p + k2 - 1];
+            if k <= k2 {
+                hess[(d + k - 1) * n + d + k2 - 1] = 2.0 * ((prefix - k as f64 * hk) * helmert(k));
+            }
+            prefix += hk;
+        }
+    }
+
+    // ---- t_i = (F ∘ B̃_i) w for the cross block: with Φ = F R_wᵀ,
+    // t_ab[α] = (Q_aα Φ[α][b] + Q_bα Φ[α][a])/√2 and
+    // t_k[α] = Σ_x h_k[x] Q_xα Φ[α][x]
+    for al in 0..p {
+        for u in 0..p {
+            xg[al * p + u] = dot(&fq[al * p..(al + 1) * p], &rw[u * p..(u + 1) * p]);
+        }
+    }
+    for al in 0..p {
+        let mut prefix = qm[al] * xg[al * p];
+        for k in 1..p {
+            let pk = qm[k * p + al] * xg[al * p + k];
+            tt[(k - 1) * p + al] = (prefix - k as f64 * pk) * helmert(k);
+            prefix += pk;
+        }
+    }
+    let mut i = p - 1;
+    for a in 0..p {
+        for b in a + 1..p {
+            for al in 0..p {
+                tt[i * p + al] = (qm[a * p + al] * xg[al * p + b]
+                    + qm[b * p + al] * xg[al * p + a])
+                    * FRAC_1_SQRT_2;
+            }
+            i += 1;
+        }
+    }
+
+    // ---- mean blocks
+    for r in 0..d {
+        hess[r * n..(r + 1) * n].fill(0.0);
+    }
+    if f.mu_free {
+        // A = ∂²q/∂μ̂² (μ̂ free), from (μ̂·y)²: 2yyᵀ
+        for r in 0..d {
+            for c in r..d {
+                am[r * d + c] = 2.0 * y[r] * y[c];
+            }
+        }
+        if f.frame_free {
+            // K = Qᵀ ∂z/∂μ̂ with ∂z/∂μ̂ = Eᵀ(−κI − (2/(v·v)) v uᵀ)
+            for c in 0..p {
+                let kc = &mut kk[c * d..(c + 1) * d];
+                kc.fill(0.0);
+                for j in 0..p {
+                    let qjc = qm[j * p + c];
+                    let ej = &f.e[j * d..(j + 1) * d];
+                    for l in 0..d {
+                        kc[l] += qjc * ej[l];
+                    }
+                }
+                let cv = 2.0 * dot(kc, f.v) / f.vv;
+                for l in 0..d {
+                    kc[l] = -f.kappa * kc[l] - cv * f.u[l];
+                }
+            }
+            // cross block: ∂²q/∂μ∂s_i = P(2Kᵀ t_i)/‖μ‖, P = I − μ̂μ̂ᵀ
+            for i in 0..ns {
+                xv.fill(0.0);
+                for c in 0..p {
+                    let t = 2.0 * tt[i * p + c];
+                    let kc = &kk[c * d..(c + 1) * d];
+                    for l in 0..d {
+                        xv[l] += t * kc[l];
+                    }
+                }
+                let pr = dot(xv, mu_hat);
+                for l in 0..d {
+                    hess[l * n + d + i] = (xv[l] - pr * mu_hat[l]) * f.inv_n;
+                }
+            }
+            // A += 2 Σ_c e^{−λ_c} K_c K_cᵀ (from ∂²q/∂z² = 2e^{−S}) + Σ_k ū_k ∇²u_k,
+            // Σ_k ū_k ∇²u_k = (2κ(ū·v)/(v·v)) I + (4(ū·v)/(v·v)²)(vuᵀ + uvᵀ)
+            //                − (2/(v·v))(uūᵀ + ūuᵀ)
+            for c in 0..p {
+                let s2 = 2.0 * f.ex[c];
+                let kc = &kk[c * d..(c + 1) * d];
+                for r in 0..d {
+                    let kr = s2 * kc[r];
+                    for cc in r..d {
+                        am[r * d + cc] += kr * kc[cc];
+                    }
+                }
+            }
+            let uv = dot(ubar, f.v);
+            let ci = 2.0 * f.kappa * uv / f.vv;
+            let cuv = 4.0 * uv / (f.vv * f.vv);
+            let cuu = 2.0 / f.vv;
+            let (u, v) = (f.u, f.v);
+            for r in 0..d {
+                for c in r..d {
+                    am[r * d + c] +=
+                        cuv * (v[r] * u[c] + u[r] * v[c]) - cuu * (u[r] * ubar[c] + ubar[r] * u[c]);
+                }
+                am[r * d + r] += ci;
+            }
+        }
+        // ∂²q/∂μ² = (P A P − (g⊥μ̂ᵀ + μ̂g⊥ᵀ + γP))/‖μ‖², g = ∂q/∂μ̂, γ = g·μ̂,
+        // g⊥ = Pg
+        for r in 0..d {
+            let mut acc = 0.0;
+            for c in 0..d {
+                let arc = if c >= r { am[r * d + c] } else { am[c * d + r] };
+                acc += arc * mu_hat[c];
+            }
+            xv[r] = acc;
+        }
+        let mam = dot(mu_hat, xv);
+        let gam = dot(f.g, mu_hat);
+        let in2 = f.inv_n * f.inv_n;
+        for r in 0..d {
+            let gr = f.g[r] - gam * mu_hat[r];
+            for c in r..d {
+                let gc = f.g[c] - gam * mu_hat[c];
+                let pap = am[r * d + c] - mu_hat[r] * xv[c] - xv[r] * mu_hat[c]
+                    + mam * mu_hat[r] * mu_hat[c];
+                let prc = if r == c { 1.0 } else { 0.0 } - mu_hat[r] * mu_hat[c];
+                hess[r * n + c] = in2 * (pap - (gr * mu_hat[c] + mu_hat[r] * gc + gam * prc));
+            }
+        }
+    }
+
+    // ---- ∇² log f from ∇²q, ∇q and e = (y, 0); upper triangle, then mirror
+    let (fq_, fqq, fqy, fyy) = (f.phi_q, f.phi_qq, f.phi_qy, f.phi_yy);
+    for r in 0..n {
+        let dr = dq[r];
+        let (cqq, cqy) = (fqq * dr, fqy * dr);
+        if r < d {
+            let yr = y[r];
+            let (cyq, cyy) = (fqy * yr, fyy * yr);
+            for c in r..d {
+                let hv =
+                    fq_ * hess[r * n + c] + cqq * dq[c] + (cqy * y[c] + cyq * dq[c]) + cyy * y[c]
+                        - if c == r { 1.0 } else { 0.0 };
+                hess[r * n + c] = hv;
+                hess[c * n + r] = hv;
+            }
+            for c in d..n {
+                let hv = fq_ * hess[r * n + c] + cqq * dq[c] + cyq * dq[c];
+                hess[r * n + c] = hv;
+                hess[c * n + r] = hv;
+            }
+        } else {
+            for c in r..n {
+                let hv = fq_ * hess[r * n + c] + cqq * dq[c];
+                hess[r * n + c] = hv;
+                hess[c * n + r] = hv;
+            }
+        }
+    }
+}
+
+/// Index of the unordered pair `{u, v}` of `0..p` in the row-major upper
+/// triangle with the diagonal (`0..p(p+1)/2`).
+#[inline(always)]
+fn pair_index(u: usize, v: usize, p: usize) -> usize {
+    let (a, b) = if u <= v { (u, v) } else { (v, u) };
+    a * (2 * p - a + 1) / 2 + (b - a)
+}
+
+/// Terms `n = 2..=DD2_TERMS` of the series of the second divided
+/// difference of `e^{−x}` (truncation error below 1e-18 for gaps `< ½`).
+const DD2_TERMS: usize = 17;
+
+/// `(−1)ⁿ/n!` for `n = 0..=DD2_TERMS`.
+const DD2_COEF: [f64; DD2_TERMS + 1] = {
+    let mut c = [1.0; DD2_TERMS + 1];
+    let mut n = 1;
+    while n <= DD2_TERMS {
+        c[n] = c[n - 1] * (-1.0 / n as f64);
+        n += 1;
+    }
+    c
+};
+
+/// The second divided difference `e^{−x}[λ_i, λ_j, λ_k]` (symmetric in its
+/// arguments), with `λ` on the diagonal of `a`, `ex = e^{−λ}` and the first
+/// divided differences `fq`. With `lo ≤ mid ≤ hi` the sorted eigenvalues:
+/// for `hi − lo ≥ ½`, `(F[lo, mid] − F[mid, hi])/(lo − hi)`; below that, the
+/// series `e^{−lo} Σ_{n≥2} (−1)ⁿ h_{n−2}(mid − lo, hi − lo)/n!`, with `h_m`
+/// the complete homogeneous symmetric polynomials (`h_m(x, y) = xᵐ +
+/// y h_{m−1}(x, y)`), which is accurate for every gap, including ties.
+#[inline(always)]
+fn exp_neg_dd2(a: &[f64], p: usize, ex: &[f64], fq: &[f64], i: usize, j: usize, k: usize) -> f64 {
+    let lam = |x: usize| a[x * p + x];
+    let (mut lo, mut mid, mut hi) = (i, j, k);
+    if lam(lo) > lam(mid) {
+        std::mem::swap(&mut lo, &mut mid);
+    }
+    if lam(mid) > lam(hi) {
+        std::mem::swap(&mut mid, &mut hi);
+    }
+    if lam(lo) > lam(mid) {
+        std::mem::swap(&mut lo, &mut mid);
+    }
+    let gap = lam(hi) - lam(lo);
+    if gap >= DD_DIRECT {
+        (fq[lo * p + mid] - fq[mid * p + hi]) / (lam(lo) - lam(hi))
+    } else {
+        let d1 = lam(mid) - lam(lo);
+        let (mut hm, mut xm, mut sum) = (1.0, 1.0, DD2_COEF[2]);
+        for coef in &DD2_COEF[3..] {
+            xm *= d1;
+            hm = gap * hm + xm;
+            sum += coef * hm;
+        }
+        ex[lo] * sum
+    }
 }
 
 #[cfg(test)]
@@ -1392,6 +2169,82 @@ mod tests {
         }
     }
 
+    /// The second divided difference of `e^{−x}` against the integral
+    /// `∫∫_{u+v≤1} e^{−(λ_0 + u(λ_1 − λ_0) + v(λ_2 − λ_0))} du dv` (Gauss–Legendre),
+    /// on both branches, across the switch at a gap of ½, and at ties.
+    #[test]
+    fn second_divided_differences() {
+        // 40-point Gauss–Legendre on [0, 1] via Newton on P_40
+        let m = 40;
+        let mut nodes = Vec::new();
+        for i in 0..m {
+            let mut x = (std::f64::consts::PI * (i as f64 + 0.75) / (m as f64 + 0.5)).cos();
+            let mut dp = 0.0;
+            for _ in 0..100 {
+                let (mut p0, mut p1) = (1.0, x);
+                for k in 2..=m {
+                    let p2 = ((2 * k - 1) as f64 * x * p1 - (k - 1) as f64 * p0) / k as f64;
+                    p0 = p1;
+                    p1 = p2;
+                }
+                dp = m as f64 * (x * p1 - p0) / (x * x - 1.0);
+                let dx = p1 / dp;
+                x -= dx;
+                if dx.abs() < 1e-16 {
+                    break;
+                }
+            }
+            nodes.push((0.5 * (x + 1.0), 1.0 / ((1.0 - x * x) * dp * dp)));
+        }
+        let reference = |l: [f64; 3]| {
+            // u ∈ [0, 1], v ∈ [0, 1 − u]
+            let mut acc = 0.0;
+            for &(u, wu) in &nodes {
+                for &(t, wt) in &nodes {
+                    let v = (1.0 - u) * t;
+                    acc += wu
+                        * wt
+                        * (1.0 - u)
+                        * (-(l[0] + u * (l[1] - l[0]) + v * (l[2] - l[0]))).exp();
+                }
+            }
+            acc
+        };
+        for lam in [
+            [0.0f64, 0.0, 0.0],
+            [0.3, 0.3, 0.3],
+            [-1.0, -1.0, 0.2],
+            [0.1, 0.35, 0.5999],
+            [0.1, 0.35, 0.6001],
+            [-2.0, 0.5, 1.7],
+            [1.2, -0.4, 1.2 + 1e-9],
+            [3.0, -3.0, 0.0],
+        ] {
+            let p = 3;
+            let mut a = vec![0.0; 9];
+            let ex: Vec<f64> = lam.iter().map(|&l: &f64| (-l).exp()).collect();
+            let mut fq = vec![0.0; 9];
+            for i in 0..3 {
+                a[i * 3 + i] = lam[i];
+                for j in 0..3 {
+                    fq[i * 3 + j] = if i == j {
+                        -ex[i]
+                    } else {
+                        exp_neg_divided_difference(lam[i], lam[j], ex[i], ex[j])
+                    };
+                }
+            }
+            let exact = reference(lam);
+            for (i, j, k) in [(0, 1, 2), (2, 0, 1), (1, 2, 0)] {
+                let got = exp_neg_dd2(&a, p, &ex, &fq, i, j, k);
+                assert!(
+                    (got - exact).abs() < 2e-14 * exact,
+                    "{lam:?}: {got} vs {exact}"
+                );
+            }
+        }
+    }
+
     /// The O(d) Householder form of the frame agrees with the closed form
     /// `R = I + K + K²/(1 + mᵀμ̂)`, `K = μ̂mᵀ − mμ̂ᵀ`, and `R` is the minimal
     /// rotation: orthogonal, `R m = μ̂`, identity on `span(m, μ̂)⊥`.
@@ -1503,6 +2356,8 @@ mod tests {
         }
     }
 
+    /// Value, gradient and Hessian agree on every path, including the
+    /// guarded `μ = 0` and `μ̂ = −m`.
     #[test]
     fn value_and_gradient_paths_agree_bitwise() {
         let mut rng = Rng(9);
@@ -1529,11 +2384,16 @@ mod tests {
                     _ => {}
                 }
                 let y = rng.unit(d);
-                let mut g = vec![0.0; eta.len()];
+                let n = eta.len();
+                let (mut g, mut g2, mut h) = (vec![0.0; n], vec![0.0; n], vec![0.0; n * n]);
                 let v1 = loglik_lt(&frame, &eta, &y);
                 let v2 = loglik_lt_grad(&frame, &eta, &y, &mut g);
+                let v3 = loglik_lt_hess(&frame, &eta, &y, &mut g2, &mut h);
                 assert_eq!(v1.to_bits(), v2.to_bits(), "d={d} case={case}");
+                assert_eq!(v1.to_bits(), v3.to_bits(), "d={d} case={case}");
+                assert_eq!(g, g2, "d={d} case={case}");
                 assert!(v1.is_finite() && g.iter().all(|x| x.is_finite()));
+                assert!(h.iter().all(|x| x.is_finite()), "d={d} case={case}");
             }
         }
     }
@@ -1573,8 +2433,9 @@ mod tests {
     }
 
     /// Near the antipode of `m` the frame turns fast, but values and
-    /// gradients stay finite and the gradient matches finite differences at
-    /// a step that resolves the scale `‖μ̂ + m‖`.
+    /// derivatives stay finite, and the gradient and the Hessian's mean
+    /// columns match finite differences at a step that resolves the scale
+    /// `‖μ̂ + m‖`.
     #[test]
     fn near_the_antipode() {
         let mut rng = Rng(77);
@@ -1591,18 +2452,32 @@ mod tests {
                 let f0 = loglik_lt_grad(&frame, &eta, &y, &mut g);
                 assert!(f0.is_finite());
                 let h = 1e-4 * eps;
+                let n = eta.len();
+                let mut hess = vec![0.0; n * n];
+                let mut g0 = vec![0.0; n];
+                loglik_lt_hess(&frame, &eta, &y, &mut g0, &mut hess);
                 for i in 0..d {
                     let mut e = eta.clone();
                     e[i] += h;
-                    let fp = loglik_lt(&frame, &e, &y);
+                    let mut gp = vec![0.0; n];
+                    let fp = loglik_lt_grad(&frame, &e, &y, &mut gp);
                     e[i] -= 2.0 * h;
-                    let fm = loglik_lt(&frame, &e, &y);
+                    let mut gm = vec![0.0; n];
+                    let fm = loglik_lt_grad(&frame, &e, &y, &mut gm);
                     let fd = (fp - fm) / (2.0 * h);
                     assert!(
                         (g[i] - fd).abs() < 1e-5 * fd.abs().max(1.0),
                         "d={d} eps={eps} i={i}: {} vs {fd}",
                         g[i]
                     );
+                    for r in 0..n {
+                        let hd = (gp[r] - gm[r]) / (2.0 * h);
+                        assert!(
+                            (hess[r * n + i] - hd).abs() < 1e-4 * hd.abs().max(1.0),
+                            "d={d} eps={eps}: H[{r},{i}] = {} vs {hd}",
+                            hess[r * n + i]
+                        );
+                    }
                 }
             }
         }

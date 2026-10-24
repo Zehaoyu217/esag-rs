@@ -387,6 +387,54 @@ so it remains to find `∇q`.
   `μ̂ = μ/‖μ‖` gives `∂q/∂μ = (μ̂̄ − (μ̂·μ̂̄) μ̂)/‖μ‖`. On the guarded branches
   the frame terms are zero, and at `μ = 0` all of `∂q/∂μ` is.
 
+**Hessian** (`loglik_lt_hess`, exact, one eigen-decomposition, value and
+gradient bit-identical to the functions above). With
+`Φ(q, ymu) = −(d/2) log q + ψ(alpha)`, `ψ(a) = a²/2 + log M_p(a)` and
+`e = (y, 0)`,
+
+```
+∇² log f = Φ_q ∇²q + Φ_qq ∇q∇qᵀ + Φ_qy (∇q eᵀ + e∇qᵀ) + Φ_yy eeᵀ − [I 0; 0 0],
+Φ_qq = d/(2q²) + ψ'' a_q² + ψ' a_qq,  Φ_qy = ψ'' a_q a_y + ψ' a_qy,  Φ_yy = ψ'' a_y²,
+a_q = −alpha/(2q), a_y = q^{−1/2}, a_qq = 3 alpha/(4q²), a_qy = −q^{−3/2}/2.
+```
+
+* *Shape block.* By the second-order Daleckii–Krein formula, for symmetric
+  `H, K`,
+  `zᵀ D²e^{−S}[H, K] z = 2 Σ_abc T_cab w_a w_b H̃_ac K̃_cb` with
+  `T_cab = f[λ_a, λ_c, λ_b]`, the second divided differences of
+  `f(x) = e^{−x}`. With the eigenvalues sorted, `lo ≤ mid ≤ hi`:
+  * for `hi − lo ≥ ½`, `T = (F[lo, mid] − F[mid, hi])/(lo − hi)`;
+  * below that,
+    `T = e^{−lo} Σ_{n=2}^{17} (−1)ⁿ h_{n−2}(mid − lo, hi − lo)/n!`, using the
+    complete homogeneous polynomials `h_m(x, y) = xᵐ + y h_{m−1}(x, y)`.
+    This holds to `2e-14` against quadrature, ties included.
+
+  Expanding `H = e_x e_uᵀ`, `K = e_y e_vᵀ` gives
+  `2 Wt(u, y, x, v)` with `Wt(u, y, x, v) = Σ_c Q_uc Q_yc G_c[x][v]` and
+  `G_c = R_w T_c R_wᵀ`, `R_w = Q diag(w)`. `Wt` is symmetric within
+  `{u, y}` and within `{x, v}`, so it is a `p(p+1)/2`-square matrix
+  `W = A Gᵀ`. For basis matrices `B_ab`, `B_a'b'`,
+  `∂²q/∂s∂s' = Wt(b, a', a, b') + Wt(b, b', a, a') + Wt(a, a', b, b') + Wt(a, b', b, a')`.
+  Helmert coordinates take `h_k`-weighted sums of `Wt(x, a', x, b')` or
+  `Wt(x, y, x, y)`, by prefix sums. The block costs about
+  `p⁵/4 + 1.5p⁴` operations, 9k at p = 7. Gram products of the transformed
+  basis matrices `QᵀB_iQ` would need about `ns² p²`, which is 36k.
+* *Cross block.* `∂/∂s_i (∂q/∂z) = 2 D e^{−S}[B_i] z = 2Q(F ∘ B̃_i)w`, with
+  `B̃ = QᵀBQ`. Writing `Φ = F R_wᵀ`, the vector `(F ∘ B̃_ab)w` has entries
+  `(Q_aα Φ_αb + Q_bα Φ_αa)/√2`. It is chained through
+  `K = Qᵀ ∂z/∂μ̂ = −κ (EQ)ᵀ − (2/(v·v)) (EQ)ᵀv uᵀ` and `∂μ̂/∂μ = P/‖μ‖`, where
+  `P = I − μ̂μ̂ᵀ`.
+* *Mean block.* With `μ̂` taken as a free vector,
+  `A = 2yyᵀ + 2 Kᵀe^{−Λ}K + Σ_k ū_k ∇²u_k`, where for `u = y − κv`
+  `Σ_k ū_k ∇²u_k = (2κ(ū·v)/(v·v)) I + (4(ū·v)/(v·v)²)(vuᵀ + uvᵀ) − (2/(v·v))(uūᵀ + ūuᵀ)`.
+  Then `μ̂ = μ/‖μ‖` gives
+  `∂²q/∂μ² = (PAP − (g⊥μ̂ᵀ + μ̂g⊥ᵀ + γP))/‖μ‖²`, with `g = ∂q/∂μ̂`,
+  `γ = g·μ̂` and `g⊥ = Pg`.
+
+The Hessian matches fourth-order differences of the gradient to `2e-10` or
+better at the best step, and to `1.5e-8` in the test sweep (d = 3..10, including
+`s = 0` and tied eigenvalues). It is exactly symmetric.
+
 **Relation to `γ`.** It is the same family. For random `(μ, s)`, the
 canonical `γ = gamma_from_covariance(μ, V)` reproduces `loglik_lt` through
 `loglik_eta` to `2e-12` (`tests/logtangent.rs`), and conversely every
@@ -405,18 +453,21 @@ spots that the tests document:
 **Cost** (Apple M5 Pro, ns per call, random `η` with a full `S`;
 `examples/logtangent_bench.rs`):
 
-| d | `loglik_eta` | `loglik_eta_grad` | `loglik_lt` | `loglik_lt_grad` |
-|---|---|---|---|---|
-| 3 | 30 | 38 | 45 | 57 |
-| 4 | 41 | 65 | 154 | 200 |
-| 5 | 49 | 96 | 254 | 334 |
-| 6 | 73 | 118 | 454 | 594 |
-| 7 | 86 | 143 | 622 | 721 |
-| 8 | 102 | 167 | 878 | 1177 |
+| d | `loglik_eta` | `loglik_eta_grad` | `loglik_lt` | `loglik_lt_grad` | `loglik_lt_hess` |
+|---|---|---|---|---|---|
+| 3 | 32 | 39 | 46 | 58 | 116 |
+| 4 | 42 | 67 | 156 | 195 | 362 |
+| 5 | 51 | 99 | 258 | 335 | 674 |
+| 6 | 74 | 119 | 454 | 586 | 1248 |
+| 7 | 88 | 144 | 626 | 720 | 1882 |
+| 8 | 102 | 169 | 881 | 1170 | 3149 |
 
-The eigen-decomposition dominates. At `S = 0` it is skipped: the value then
-costs 1.1 to 1.3 times `loglik_eta`, and the value and gradient 0.8 to 1.2
-times `loglik_eta_grad`.
+The eigen-decomposition dominates the value and the gradient. The Hessian
+costs 2 to 2.7 times the gradient for d ≤ 8. Central differences of the
+gradient would need `2 dim(η)` gradients, 70 at d = 8, about 26 times
+more. At `S = 0` the decomposition is skipped: the value then costs 1.1 to
+1.3 times `loglik_eta`, and the value and gradient 0.8 to 1.2 times
+`loglik_eta_grad`.
 
 ## 8. Penalized fits (Project 3) (`src/penalized.rs`, `src/optim/prox.rs`)
 

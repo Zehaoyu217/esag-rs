@@ -1,6 +1,7 @@
-//! Timing of the log-tangent kernel (`esag::logtangent::loglik_lt`, value,
-//! and `loglik_lt_grad`, value and gradient) next to the `γ` kernel
-//! (`loglik_eta::<f64>` and the adjoint `loglik_eta_grad`), per call.
+//! Timing of the log-tangent kernel (`esag::logtangent::loglik_lt`, value;
+//! `loglik_lt_grad`, value and gradient; `loglik_lt_hess`, value, gradient
+//! and Hessian) next to the `γ` kernel (`loglik_eta::<f64>` and the adjoint
+//! `loglik_eta_grad`), per call.
 //!
 //! `cargo run --release --example logtangent_bench [-- --runs 15]`
 //!
@@ -15,7 +16,7 @@
 
 use esag::dims::{eta_len, gamma_len};
 use esag::loglik::{loglik_eta, loglik_eta_grad};
-use esag::logtangent::{LtFrame, loglik_lt, loglik_lt_grad};
+use esag::logtangent::{LtFrame, loglik_lt, loglik_lt_grad, loglik_lt_hess};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -86,8 +87,18 @@ fn main() {
         .unwrap_or(15usize);
     println!("min over {runs} runs, ns per call");
     println!(
-        "{:<8}{:>3}{:>4}{:>11}{:>11}{:>11}{:>11}{:>10}{:>10}",
-        "set", "d", "N", "eta val", "eta grad", "lt val", "lt grad", "lt/eta v", "lt/eta g"
+        "{:<8}{:>3}{:>4}{:>10}{:>10}{:>10}{:>10}{:>10}{:>9}{:>9}{:>9}",
+        "set",
+        "d",
+        "N",
+        "eta val",
+        "eta grad",
+        "lt val",
+        "lt grad",
+        "lt hess",
+        "lt/eta v",
+        "lt/eta g",
+        "hess/grd"
     );
     for (set, iso) in [
         ("mixed", None),
@@ -100,16 +111,21 @@ fn main() {
             let frame = LtFrame::standard(d);
             let calls = 20_000;
             let mut g = vec![0.0; n];
+            let mut h = vec![0.0; n * n];
             let tv = min_ns(runs, calls, &ins, loglik_eta::<f64>);
             let tg = min_ns(runs, calls, &ins, |e, y| loglik_eta_grad(e, y, &mut g));
             let lv = min_ns(runs, calls, &ins, |e, y| loglik_lt(&frame, e, y));
             let lg = min_ns(runs, calls, &ins, |e, y| {
                 loglik_lt_grad(&frame, e, y, &mut g)
             });
+            let lh = min_ns(runs, calls / 4, &ins, |e, y| {
+                loglik_lt_hess(&frame, e, y, &mut g, &mut h)
+            });
             println!(
-                "{set:<8}{d:>3}{n:>4}{tv:>11.1}{tg:>11.1}{lv:>11.1}{lg:>11.1}{:>10.1}{:>10.1}",
+                "{set:<8}{d:>3}{n:>4}{tv:>10.1}{tg:>10.1}{lv:>10.1}{lg:>10.1}{lh:>10.1}{:>9.1}{:>9.1}{:>9.1}",
                 lv / tv,
-                lg / tg
+                lg / tg,
+                lh / lg
             );
         }
     }

@@ -9,7 +9,9 @@
 //! (d) smoothness at a point where `γ ↦ V` is discontinuous;
 //! (e) the density integrates to 1 over S² (d = 3);
 //! (f) `s_from_covariance ∘ covariance = id`;
-//! (g) continuity of the frame `Ξ(μ̂)` away from `−m`.
+//! (g) continuity of the frame `Ξ(μ̂)` away from `−m`;
+//! (h) the exact Hessian against differences of the gradient, and its
+//!     symmetry.
 
 // index loops mirror the notation of the module
 #![allow(clippy::needless_range_loop)]
@@ -18,7 +20,8 @@ use esag::dims::{eta_len, gamma_len};
 use esag::frame::Frame;
 use esag::loglik::{log_m_p_value, loglik_eta};
 use esag::logtangent::{
-    LtFrame, covariance, loglik_lt, loglik_lt_grad, matrix_to_s, s_from_covariance, s_to_matrix,
+    LtFrame, covariance, loglik_lt, loglik_lt_grad, loglik_lt_hess, matrix_to_s, s_from_covariance,
+    s_to_matrix,
 };
 use esag::param::gamma_from_covariance;
 use nalgebra::{DMatrix, DVector};
@@ -220,6 +223,68 @@ fn gradient_matches_finite_differences() {
         }
     }
     eprintln!("gradient vs central differences: worst relative error {worst:.1e}");
+}
+
+/// Fourth-order central difference of `loglik_lt_grad` in `eta[i]` (column
+/// `i` of the Hessian), step `k = 5e-4` (see [`central_difference`]).
+fn gradient_difference(frame: &LtFrame, eta: &[f64], y: &[f64], i: usize) -> Vec<f64> {
+    let k = 5e-4;
+    let n = eta.len();
+    let mut e = eta.to_vec();
+    let mut g = |t: f64| {
+        e[i] = eta[i] + t;
+        let mut out = vec![0.0; n];
+        loglik_lt_grad(frame, &e, y, &mut out);
+        out
+    };
+    let (p1, m1, p2, m2) = (g(k), g(-k), g(2.0 * k), g(-2.0 * k));
+    (0..n)
+        .map(|r| (8.0 * (p1[r] - m1[r]) - (p2[r] - m2[r])) / (12.0 * k))
+        .collect()
+}
+
+/// (h) The exact Hessian matches differences of the exact gradient for
+/// d = 3..10 (stack kernels and heap fallback) on every kind of input,
+/// including `s = 0` and tied eigenvalues; it is exactly symmetric, and the
+/// value and gradient are bit-identical to `loglik_lt` / `loglik_lt_grad`.
+#[test]
+fn hessian_matches_differences_of_the_gradient() {
+    let mut rng = Rng(0xBEEF);
+    let mut worst: f64 = 0.0;
+    for d in 3..=10 {
+        for rep in 0..3 {
+            for kind in 0..N_KINDS {
+                let (frame, eta, y, label) = make_case(d, kind, rep, &mut rng);
+                let n = eta_len(d);
+                let (mut g, mut g2, mut h) = (vec![0.0; n], vec![0.0; n], vec![0.0; n * n]);
+                let f = loglik_lt_hess(&frame, &eta, &y, &mut g, &mut h);
+                let f2 = loglik_lt_grad(&frame, &eta, &y, &mut g2);
+                assert_eq!(f.to_bits(), f2.to_bits(), "d={d} {label}: value");
+                for i in 0..n {
+                    assert_eq!(g[i], g2[i], "d={d} {label}: gradient {i}");
+                }
+                for r in 0..n {
+                    for c in 0..n {
+                        assert_eq!(h[r * n + c].to_bits(), h[c * n + r].to_bits());
+                    }
+                }
+                for i in 0..n {
+                    let col = gradient_difference(&frame, &eta, &y, i);
+                    for r in 0..n {
+                        let err = (h[r * n + i] - col[r]).abs() / col[r].abs().max(1.0);
+                        worst = worst.max(err);
+                        assert!(
+                            err < 1e-7,
+                            "d={d} {label}: H[{r},{i}] = {} vs difference {}",
+                            h[r * n + i],
+                            col[r]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("Hessian vs differences of the gradient: worst relative error {worst:.1e}");
 }
 
 /// (b) `V` is symmetric with `Vμ = μ` and `det V = 1`, and the log-density
