@@ -181,7 +181,7 @@ fn main() {
     line("prediction region d=3 n=1000, m=5000, 100 refits", t);
     if !quick {
         let t = median(3, || {
-            black_box(hypothesis_test(&fit, &x, &y, Restriction::Isotropy, 200, 1000, 4).unwrap());
+            black_box(hypothesis_test(&fit, &x, &y, Restriction::Isotropy, 200, 0, 4).unwrap());
         });
         line("hypothesis test isotropy d=3 n=1000, 200 reps, exact M", t);
         let hfit = EsagRegressor::new().fit(&hx, &hy).unwrap();
@@ -193,13 +193,13 @@ fn main() {
                     &hy,
                     Restriction::GammaOfFeature(0),
                     300,
-                    2000,
+                    0,
                     4,
                 )
                 .unwrap(),
             );
         });
-        line("hypothesis test hydrochem d=4, 300 reps, mc=2000", t);
+        line("hypothesis test hydrochem d=4, 300 reps, exact M", t);
     }
     println!("threads: {}", rayon::current_num_threads());
 }
