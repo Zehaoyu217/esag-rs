@@ -10,12 +10,12 @@
 //! ```
 
 use clap::{Parser, Subcommand, ValueEnum};
+use esag::FastRng;
 use esag::distribution::Esag;
 use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region};
 use esag::regression::{EsagRegressor, EsagRegressorFit};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
-use esag::FastRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::error::Error;
 use std::path::PathBuf;

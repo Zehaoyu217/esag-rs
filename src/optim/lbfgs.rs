@@ -721,7 +721,9 @@ pub fn minimize(obj: &dyn Objective, x0: &[f64], cfg: &LbfgsConfig) -> OptimResu
             break Status::StepConverged;
         }
         let limit = match &cfg.iter_budget {
-            Some(b) => cfg.max_iter.min(b.load(std::sync::atomic::Ordering::Relaxed)),
+            Some(b) => cfg
+                .max_iter
+                .min(b.load(std::sync::atomic::Ordering::Relaxed)),
             None => cfg.max_iter,
         };
         if n_iter >= limit {

@@ -19,8 +19,7 @@ use crate::error::{EsagError, Result};
 use crate::regression::EsagRegressorFit;
 use crate::stats::quantile::quantiles_type7;
 use nalgebra::DMatrix;
-use rand::{Rng, RngExt, SeedableRng};
-use crate::FastRng;
+use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +55,7 @@ impl PredictionRegion {
 }
 
 /// `n_boot` pairs-bootstrap refits of `fit`, warm-started at its estimate.
-/// Replicate `b` uses seed `seed + 1 + b`. Failed refits are skipped.
+/// Each replicate has its own random stream. Failed refits are skipped.
 pub fn bootstrap_refits(
     fit: &EsagRegressorFit,
     x: &DMatrix<f64>,
@@ -69,7 +68,7 @@ pub fn bootstrap_refits(
     (0..n_boot)
         .into_par_iter()
         .filter_map(|b| {
-            let mut rng = FastRng::seed_from_u64(seed.wrapping_add(1 + b as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::REGION_BOOT, b as u64);
             let idx: Vec<usize> = (0..n).map(|_| rng.random_range(0..n)).collect();
             let xb = DMatrix::from_fn(n, x.ncols(), |i, j| x[(idx[i], j)]);
             let yb = DMatrix::from_fn(n, y.ncols(), |i, j| y[(idx[i], j)]);
@@ -110,8 +109,7 @@ pub fn prediction_regions(
         .into_par_iter()
         .enumerate()
         .map(|(i, dist)| {
-            let mut rng =
-                FastRng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::REGION_MC, i as u64);
             let mut pooled = confidence_region_sample(&dist, n_mc, &mut rng);
             for b in &boot {
                 pooled.extend(confidence_region_sample(&b[i], n_mc, &mut rng));

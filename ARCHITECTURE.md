@@ -177,3 +177,9 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
 * `M` is the squared norm, as in the R code and the published tables.
 * Hypothesis-test refits take the best of two starts, which removed an
   over-rejection of the bootstrap LR test.
+* Performance branch: the frame-free, trig-free kernel
+  (`loglik::quad_form_parts`); a hand-written adjoint gradient
+  (`adjoint.rs`); second-order duals (`hdual.rs`) for the d = 3 Hessian;
+  `Scalar::DERIV_ORDER`; the inverse map `param::gamma_from_covariance`
+  (moment start, canonical γ for intercept-only fits); starts sharing an
+  iteration budget; xoshiro256++ streams from `stream_rng(seed, tag, index)`.

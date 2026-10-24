@@ -1,9 +1,10 @@
+#![allow(clippy::needless_range_loop)]
 //! `loglik_eta_hess` against the exact gradient `loglik_eta_grad`, evaluated
 //! at run time (never against stored numbers, so the log-density internals
 //! may change freely).
 
 use esag::dims::{eta_len, gamma_len};
-use esag::hdual::{HDual, loglik_eta_hess, seed_hdual};
+use esag::hdual::{HDual, loglik_eta_hess, loglik_eta_hess_fd, seed_hdual};
 use esag::loglik::{loglik_eta, loglik_eta_grad};
 
 /// SplitMix64 with Box–Muller normals: deterministic and dependency-free.
@@ -258,6 +259,43 @@ fn hdual_hessian_symmetric_at_isotropic_point() {
             }
         }
     }
+}
+
+#[test]
+fn hdual_fd_hessian_agrees_with_exact_d3_to_d6() {
+    let mut rng = Rng(0xFD);
+    let mut worst = 0.0f64;
+    for d in 3..=6 {
+        let n = eta_len(d);
+        for c in cases(d, &mut rng) {
+            if c.fine.iter().any(|&f| f) {
+                continue; // the fixed 1e-5 step is too coarse next to |G| ≈ 1e-3
+            }
+            let (mut g1, mut h1) = (vec![0.0; n], vec![0.0; n * n]);
+            let (mut g2, mut h2) = (vec![0.0; n], vec![0.0; n * n]);
+            let v1 = loglik_eta_hess(&c.eta, &c.y, &mut g1, &mut h1);
+            let v2 = loglik_eta_hess_fd(&c.eta, &c.y, &mut g2, &mut h2);
+            assert!(
+                (v1 - v2).abs() <= 1e-12 * v2.abs().max(1.0),
+                "value differs"
+            );
+            let hmax = h1.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            for i in 0..n {
+                for j in 0..n {
+                    assert_eq!(h2[i * n + j], h2[j * n + i]);
+                    let (a, b) = (h2[i * n + j], h1[i * n + j]);
+                    let rel = (a - b).abs() / b.abs().max(1e-2 * hmax);
+                    worst = worst.max(rel);
+                    assert!(
+                        rel < 1e-5,
+                        "d={d} {}: H[{i}][{j}] fd {a} vs exact {b}",
+                        c.label
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("worst FD-vs-exact Hessian relative error: {worst:.2e}");
 }
 
 /// The finite-difference fallback (d = 7, eta length 27) against `HDual<27>`

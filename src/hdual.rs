@@ -43,7 +43,18 @@
 //! [`HDual::hess`], [`HDual::hessian_full`] or [`HDual::write_hessian`], which
 //! mirror the upper triangle.
 //!
-//! BENCH_PLACEHOLDER
+//! # Performance notes
+//!
+//! Measured on an Apple M5 Pro (release, fat LTO), one [`loglik_eta_hess`]
+//! call: d = 3 (N = 5) 0.26 µs, d = 4 (N = 9) 1.9 µs, d = 5 (N = 14) 8 µs,
+//! d = 6 (N = 20) 24 µs. With full `N × N` updates instead of the upper
+//! triangle: 0.48, 2.5, 10.0 and 29 µs. A sampling profile at N = 20 shows
+//! about half the time in `memmove`/`memset` of whole `HDual` values (the
+//! by-value [`Scalar`] operators copy 3.4 KB per temporary) and the rest in
+//! the kernels. Unrolling the row loops (constant trip counts) halves the
+//! product kernel in isolation but was slower end to end (the larger kernels
+//! stop being inlined and more copies appear), so the loops are kept rolled.
+//! Timings: `cargo test --release --test hdual_bench -- --ignored --nocapture`.
 //!
 //! # Size
 //!
@@ -748,9 +759,22 @@ fn hess_hdual<const N: usize>(eta: &[f64], y: &[f64], grad: &mut [f64], hess: &m
     v.re
 }
 
-/// Central differences of the exact gradient, symmetrised.
-fn hess_fd(eta: &[f64], y: &[f64], grad: &mut [f64], hess: &mut [f64]) -> f64 {
+/// Log-density, exact gradient and a finite-difference Hessian.
+///
+/// Same outputs as [`loglik_eta_hess`], but the Hessian is the symmetrised
+/// central difference of the exact gradient [`loglik_eta_grad`] (step
+/// `1e-5·max(1, |eta_i|)`, `2N + 1` gradient calls; typically ~1e-7 relative
+/// error). This is the fallback of [`loglik_eta_hess`] for `d > 6`, and is
+/// exposed so callers can pick it where it is cheaper than the exact
+/// [`HDual`] path.
+///
+/// # Panics
+/// If `grad.len() != eta.len()`, `hess.len() != eta.len()²`, or `eta` and `y`
+/// have inconsistent lengths.
+pub fn loglik_eta_hess_fd(eta: &[f64], y: &[f64], grad: &mut [f64], hess: &mut [f64]) -> f64 {
     let n = eta.len();
+    assert_eq!(grad.len(), n, "grad must have length eta.len()");
+    assert_eq!(hess.len(), n * n, "hess must have length eta.len()²");
     let f = loglik_eta_grad(eta, y, grad);
     let mut e = eta.to_vec();
     let mut gp = vec![0.0; n];
@@ -798,7 +822,7 @@ pub fn loglik_eta_hess(eta: &[f64], y: &[f64], grad: &mut [f64], hess: &mut [f64
         9 => hess_hdual::<9>(eta, y, grad, hess),
         14 => hess_hdual::<14>(eta, y, grad, hess),
         20 => hess_hdual::<20>(eta, y, grad, hess),
-        _ => hess_fd(eta, y, grad, hess),
+        _ => loglik_eta_hess_fd(eta, y, grad, hess),
     }
 }
 

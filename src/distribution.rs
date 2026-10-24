@@ -327,8 +327,8 @@ impl Sampler {
 #[cfg(test)]
 mod sampler_tests {
     use super::*;
-    use rand::SeedableRng;
     use crate::FastRng;
+    use rand::SeedableRng;
 
     #[test]
     fn region_statistic_from_z_matches_explicit_formula() {

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Reproduce the real-data ESAG regression of Yu & Huang (2025, CSDA,
 //! Section 7.1; dissertation Section 2.9.1): square-root compositions of
 //! (K, Na, Ca, Mg) in Llobregat-basin water, Anoia tributaries (X = 0, n = 67)

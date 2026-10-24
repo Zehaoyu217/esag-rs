@@ -19,8 +19,6 @@ use crate::regression::{
 };
 use crate::stats::chisq::chisq_sf;
 use nalgebra::DMatrix;
-use rand::SeedableRng;
-use crate::FastRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -146,6 +144,7 @@ fn moment_stat(
     y: &DMatrix<f64>,
     n_mc: usize,
     seed: u64,
+    replicate: u64,
 ) -> Result<f64> {
     let dists = fit0.predict_distribution(x)?;
     let d = fit0.d;
@@ -153,7 +152,11 @@ fn moment_stat(
         .par_iter()
         .enumerate()
         .map(|(i, dist)| {
-            let mut rng = FastRng::seed_from_u64(seed.wrapping_add(i as u64));
+            let mut rng = crate::stream_rng(
+                seed,
+                crate::streams::TEST_MOMENTS + (replicate << 8),
+                i as u64,
+            );
             let sampler = dist.sampler();
             let mut buf = vec![0.0; d];
             let mut ey2 = vec![0.0; d];
@@ -181,7 +184,8 @@ fn moment_stat(
 ///
 /// `n_boot` parametric-bootstrap replicates from the restricted fit (each
 /// refitting both models, warm-started), `n_mc` Monte-Carlo draws per
-/// observation for the `M` statistic. Replicate `b` uses seed `seed + 1 + b`.
+/// observation for the `M` statistic. Every replicate and every Monte-Carlo
+/// moment has its own random stream derived from `seed`.
 pub fn hypothesis_test(
     fit_full: &EsagRegressorFit,
     x: &DMatrix<f64>,
@@ -224,14 +228,13 @@ pub fn hypothesis_test(
     let eta0 = fit0.linear_predictor(x)?;
     let eta_a = fit_full.linear_predictor(x)?;
     let (roc, d_stat) = roc_and_d(&eta0, &eta_a, d);
-    let m_stat = moment_stat(&fit0, x, y, n_mc, seed)?;
+    let m_stat = moment_stat(&fit0, x, y, n_mc, seed, 0)?;
     let lr = -2.0 * (fit0.log_likelihood - fit_full.log_likelihood);
 
     let boot: Vec<Option<(f64, f64, f64, f64)>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
-            let bseed = seed.wrapping_add(1 + b as u64);
-            let mut rng = FastRng::seed_from_u64(bseed);
+            let mut rng = crate::stream_rng(seed, crate::streams::TEST_BOOT, b as u64);
             let yb = fit0.sample_responses(x, &mut rng).ok()?;
             let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
             // full-model start: restricted MLE, with the restricted mu entries
@@ -261,7 +264,7 @@ pub fn hypothesis_test(
             let e0 = f0.linear_predictor(x).ok()?;
             let ea = fa.linear_predictor(x).ok()?;
             let (r, dd) = roc_and_d(&e0, &ea, d);
-            let m = moment_stat(&f0, x, &yb, n_mc, bseed.wrapping_mul(7919)).ok()?;
+            let m = moment_stat(&f0, x, &yb, n_mc, seed, 1 + b as u64).ok()?;
             let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
             Some((r, dd, m, l))
         })

@@ -26,12 +26,10 @@ use crate::distribution::{Esag, residual_q};
 use crate::error::{EsagError, Result};
 use crate::frame::Frame;
 use crate::loglik;
-use crate::optim::hessian::hessian_fd;
 use crate::optim::lbfgs::{LbfgsConfig, Objective, OptimResult, Status, minimize};
 use crate::stats::normal::norm_sf;
 use nalgebra::{DMatrix, DVector};
-use rand::{Rng, SeedableRng};
-use crate::FastRng;
+use rand::Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -362,7 +360,7 @@ impl EsagRegressor {
         let mut best: OptimResult = minimize(&obj, &x0, &cfg);
         if self.n_restarts > 0 {
             // perturbed starts drawn sequentially (reproducible), fitted in parallel
-            let mut rng = FastRng::seed_from_u64(self.seed);
+            let mut rng = crate::stream_rng(self.seed, crate::streams::RESTARTS, 0);
             let starts: Vec<Vec<f64>> = (0..self.n_restarts)
                 .map(|_| {
                     free.iter()
@@ -436,9 +434,58 @@ impl EsagRegressor {
         }
 
         let (hessian, cov_params) = if self.compute_hessian {
-            let h = hessian_fd(&obj, &best.x, None);
+            // Exact Hessian (second-order AD per observation); up to three
+            // Newton steps polish the L-BFGS optimum to ‖∇ℓ‖ ≈ 1e-10, then
+            // the observed information is evaluated at the polished point.
             let nf = free.len();
-            let hm = DMatrix::from_row_slice(nf, nf, &h);
+            let restrict = |h_full: &[f64], pt: usize| -> DMatrix<f64> {
+                let full = data.b_dim * pt;
+                DMatrix::from_fn(nf, nf, |a, b| {
+                    let (ka, ja) = free[a];
+                    let (kb, jb) = free[b];
+                    -h_full[(ja * data.b_dim + ka) * full + jb * data.b_dim + kb]
+                })
+            };
+            // One exact Hessian at the L-BFGS optimum; Newton steps reuse it
+            // (simplified Newton, each step checked with a gradient-only
+            // evaluation). The step is ~‖g‖/λ_min ≲ 1e-4, so the Hessian
+            // changes negligibly and is reported as the observed information.
+            let (f0, g0, h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
+            let hneg = restrict(&h_full, data.p_total);
+            let mut f_ll = f0;
+            let mut g_full = g0.as_slice().to_vec();
+            if let Some(ch) = hneg.clone().cholesky() {
+                for _ in 0..3 {
+                    let g: DVector<f64> = DVector::from_iterator(
+                        nf,
+                        free.iter().map(|&(k, j)| g_full[j * data.b_dim + k]),
+                    );
+                    if g.amax() <= 1e-10 * f_ll.abs().max(1.0) {
+                        break;
+                    }
+                    let step = ch.solve(&g); // ascent step for ℓ: (−∇²ℓ)⁻¹ ∇ℓ
+                    let mut cand = coef.clone();
+                    for (a, &(k, j)) in free.iter().enumerate() {
+                        cand[(k, j)] += step[a];
+                    }
+                    let (f2, g2) = joint_loglik_and_grad(data, &cand, self.parallel);
+                    if !(f2.is_finite() && f2 >= f_ll - 1e-12 * f_ll.abs().max(1.0)) {
+                        break;
+                    }
+                    coef = cand;
+                    f_ll = f2;
+                    g_full = (0..data.p_total)
+                        .flat_map(|j| (0..data.b_dim).map(move |k| (k, j)))
+                        .map(|(k, j)| g2[(k, j)])
+                        .collect();
+                }
+            }
+            best.f = -f_ll;
+            best.grad_norm_inf = free
+                .iter()
+                .map(|&(k, j)| g_full[j * data.b_dim + k].abs())
+                .fold(0.0, f64::max);
+            let hm = restrict(&h_full, data.p_total);
             let cov = hm.clone().try_inverse();
             (Some(hm), cov)
         } else {
@@ -758,6 +805,89 @@ pub(crate) fn joint_loglik_and_grad(
         body(0..data.n)
     };
     (f, DMatrix::from_row_slice(bd, pt, &g))
+}
+
+/// Per-observation value, gradient and Hessian in `eta`. Exact second-order
+/// AD for `d = 3` (0.36 µs); for `d ≥ 4` central differences of the exact
+/// reverse-mode gradient, which are faster (d = 4: 1.25 vs 1.9 µs; d = 6:
+/// 4.0 vs 23 µs) and agree with the exact Hessian to ~1e-8 relative.
+#[inline]
+fn obs_hessian(eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
+    if eta.len() == 5 {
+        crate::hdual::loglik_eta_hess(eta, y, g, h)
+    } else {
+        crate::hdual::loglik_eta_hess_fd(eta, y, g, h)
+    }
+}
+
+/// Joint log-likelihood, gradient and Hessian with respect to the full
+/// coefficient vector, ordered column-major (`j·b_dim + k` for entry
+/// `(k, j)` of `B`). Per observation, `∇²ℓ_i(B) = (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`.
+pub(crate) fn joint_loglik_grad_hess(
+    data: &RegressionData,
+    b: &DMatrix<f64>,
+    parallel: bool,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let full = bd * pt;
+    let b_rm: Vec<f64> = (0..bd)
+        .flat_map(|k| (0..pt).map(move |j| b[(k, j)]))
+        .collect();
+    let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, Vec<f64>) {
+        let mut f = 0.0;
+        let mut g = vec![0.0; full];
+        let mut h = vec![0.0; full * full];
+        let mut eta = vec![0.0; bd];
+        let mut ge = vec![0.0; bd];
+        let mut he = vec![0.0; bd * bd];
+        for i in rows {
+            let xi = &data.x[i * pt..(i + 1) * pt];
+            let yi = &data.y[i * d..(i + 1) * d];
+            for k in 0..bd {
+                eta[k] = b_rm[k * pt..(k + 1) * pt]
+                    .iter()
+                    .zip(xi)
+                    .map(|(a, c)| a * c)
+                    .sum();
+            }
+            f += obs_hessian(&eta, yi, &mut ge, &mut he);
+            for j1 in 0..pt {
+                let x1 = xi[j1];
+                for k1 in 0..bd {
+                    g[j1 * bd + k1] += ge[k1] * x1;
+                    let row = &mut h[(j1 * bd + k1) * full..(j1 * bd + k1 + 1) * full];
+                    let hrow = &he[k1 * bd..(k1 + 1) * bd];
+                    for j2 in 0..pt {
+                        let w = x1 * xi[j2];
+                        for (dst, &src) in row[j2 * bd..(j2 + 1) * bd].iter_mut().zip(hrow) {
+                            *dst += w * src;
+                        }
+                    }
+                }
+            }
+        }
+        (f, g, h)
+    };
+    if parallel && data.n >= 2 * PAR_CHUNK {
+        let n_chunks = data.n.div_ceil(PAR_CHUNK);
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|c| body(c * PAR_CHUNK..((c + 1) * PAR_CHUNK).min(data.n)))
+            .reduce(
+                || (0.0, vec![0.0; full], vec![0.0; full * full]),
+                |(fa, mut ga, mut ha), (fb, gb, hb)| {
+                    for (a, b) in ga.iter_mut().zip(&gb) {
+                        *a += b;
+                    }
+                    for (a, b) in ha.iter_mut().zip(&hb) {
+                        *a += b;
+                    }
+                    (fa + fb, ga, ha)
+                },
+            )
+    } else {
+        body(0..data.n)
+    }
 }
 
 /// Residual diagnostics for a fitted model.

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Behaviour of the scikit-learn-style API on simulated data.
 
 use esag::distribution::Esag;

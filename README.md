@@ -16,7 +16,7 @@ angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
 * a command-line tool for CSV data.
 
 It reproduces the R code's numbers and the papers' published real-data
-results, and runs 300 to 30,000 times faster than the R code.
+results, and runs 7,000 to 69,000 times faster than the R code.
 
 ## Papers
 
@@ -103,15 +103,17 @@ $B region model.json sim.csv --y y1,y2,y3 --x x1 --at 0.5
 | `inference::{prediction_region, prediction_regions, region_coverage}` | CSDA Algorithm 4, with bootstrap refits shared across query points. |
 | `inference::bootstrap_coef` | pairs-bootstrap SEs and percentile intervals. |
 | `regression::canonicalize_coef` | picks the canonical sign of the first γ group (see identifiability below). |
+| `param::gamma_from_covariance` | the inverse of the parameterization: the canonical γ for any μ and V. |
 
-Every bootstrap procedure runs its replicates in parallel with rayon.
-Replicate `b` has its own seeded RNG, so results don't depend on the thread
-count, and a test checks this.
+Every bootstrap procedure runs its replicates in parallel with rayon. Each
+replicate and each Monte Carlo stream has its own xoshiro256++ generator,
+derived from your seed, a purpose tag and an index. Results are therefore
+reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 97 tests, plus 3 slow studies marked
-`#[ignore]`.
+All `cargo test --release` suites pass: 124 tests, plus 7 slow studies and
+benchmarks marked `#[ignore]`.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced
 by running the R code, and their README records the R version, seeds and
@@ -149,9 +151,11 @@ and `tests/paper_hydrochem.rs` checks all of the above.
 
 | test | rejection rate |
 |---|---|
-| goodness of fit (200 replications), two-sample / one-sample variant | 0.055 / 0.045 |
-| γ free of x, a true null (300 replications), RoC / D / M / LR | 0.04 / 0.05 / 0.05 / 0.05 |
+| goodness of fit (200 replications), two-sample / one-sample variant | 0.070 / 0.055 |
+| γ free of x, a true null (1,000 replications), RoC / D / M / LR | 0.041 / 0.042 / 0.046 / 0.044 |
 | the same LR with a χ²₂ reference instead of the bootstrap | 0.123 |
+
+At 1,000 replications the standard error of a rejection rate is 0.007.
 
 The last row shows why the papers use the bootstrap.
 
@@ -163,27 +167,50 @@ as the R timings stored in the fixtures. Run
 
 | task | R 4.6.1 | esag | speed-up |
 |---|---|---|---|
-| MLE + Hessian, regression d=3, n=200, p=2 | 7.02 s | 6.4 ms | 1,100× |
-| MLE + Hessian, regression d=3, n=1000, p=2 | 36.5 s | 8.0 ms | 4,600× |
-| MLE + Hessian, i.i.d. d=3, n=300 | 3.24 s | 4.1 ms | 790× |
-| MLE + Hessian, i.i.d. d=4, n=300 | 12.4 s | 36 ms | 340× |
-| `Bootstrap_GoF`, 20 refits, n=200 | 79 s | 2.5 ms | 31,000× |
-| `Prediction_Region`, m=2000, 5 refits | 21 s | 2.1 ms | 10,000× |
+| MLE + Hessian, regression d=3, n=200, p=2 | 7.02 s | 0.70 ms | 10,000× |
+| MLE + Hessian, regression d=3, n=1000, p=2 | 36.5 s | 1.0 ms | 36,000× |
+| MLE + Hessian, i.i.d. d=3, n=300 | 3.24 s | 0.45 ms | 7,200× |
+| MLE + Hessian, i.i.d. d=4, n=300 | 12.4 s | 0.97 ms | 12,800× |
+| `Bootstrap_GoF`, 20 refits, n=200 | 79 s | 1.2 ms | 69,000× |
+| `Prediction_Region`, m=2000, 5 refits | 21 s | 0.47 ms | 45,000× |
+
+`cargo run --release --example perf_suite` times a wider set of workloads.
+The second column is the first Rust release; minimum of two runs each.
+
+| workload | v0.1 | now | speed-up |
+|---|---|---|---|
+| log-density + gradient, per observation, d = 3 / 6 | 178 ns / 1.4 µs | 37 / 124 ns | 4.8× / 11.7× |
+| fit with SEs, d = 3, n = 1000 | 8.7 ms | 1.4 ms | 6× |
+| fit with SEs, d = 4, n = 2000 | 93 ms | 7.0 ms | 13× |
+| fit with SEs, d = 5, n = 2000 | 2.77 s | 9.0 ms | 307× |
+| the paper's hydrochemistry fit (d = 4) | 18.2 ms | 1.9 ms | 9× |
+| bootstrap GoF, 200 replicates, n = 1000 | 139 ms | 45 ms | 3× |
+| prediction region, 100 refits, n = 1000 | 92 ms | 26 ms | 3.5× |
+| hypothesis test, 200 replicates, d = 3 / d = 4 | 811 / 819 ms | 382 / 221 ms | 2.1× / 3.7× |
 
 Where the speed comes from:
 
-* **Exact gradients.** The log-density is written once, generic over a
-  `Scalar` trait, and evaluated with forward-mode dual numbers. One pass gives
-  the gradient, where R's `optim` spends 2·dim(B) likelihood calls on finite
-  differences. Value plus gradient takes 123 ns per observation at d = 3,
-  287 ns at d = 4 and 658 ns at d = 5.
-* **No matrices in the hot loop.** V is never formed, and the rotation is
-  applied as Givens factors to the basis columns.
-* **A faster optimizer.** L-BFGS with a strong-Wolfe line search, plus
-  Hager–Zhang approximate-Wolfe acceptance so it converges to the accuracy of
-  the gradient.
+* **A trig-free, allocation-free kernel.** `yᵀV⁻¹y` is computed from O(d)
+  projections onto the closed-form basis, followed by plane rotations
+  applied to a (d−1)-vector. Each angle enters only through its cosine and
+  sine, which are ratios of norms of γ entries, so no trigonometric function
+  is evaluated and nothing is allocated.
+* **A hand-written reverse-mode gradient.** It costs 1.3 to 2.3 times the
+  value in every dimension. R's `optim` instead spends 2·dim(B) likelihood
+  calls per gradient on finite differences.
+* **Fewer iterations.** The L-BFGS memory matches the parameter count. A
+  moment-based start uses the tangent-plane scatter, inverted to γ. The
+  default starts run in parallel and share an iteration budget, so a start
+  stuck near a singular point of the parameterization cannot hold up the
+  fit.
+* **Cheap standard errors.** The observed information is exact at d = 3 and
+  uses differences of the exact gradient for d ≥ 4. One Newton step reuses it
+  to polish the optimum to ‖∇ℓ‖ ≈ 1e-10.
+* **Faster Monte Carlo.** xoshiro256++ streams, a sampler with precomputed
+  scaled eigenvectors, an O(d) region statistic, and linear-time quantile
+  selection.
 * **Parallelism.** rayon runs over observations within a fit and over
-  bootstrap replicates.
+  bootstrap replicates, with refits inside bootstraps kept sequential.
 
 ## Improvements over the R code
 
@@ -214,8 +241,11 @@ The full list of R-code issues found while porting is in
 
 v_j and −v_j give the same V, so several γ describe the same distribution.
 Yu & Huang call them *equivalent*. Negating the first γ group is an exact
-linear symmetry for every d, and `esag` canonicalises it. For d ≥ 4 further,
-non-linear equivalences exist: R and Rust can return different raw γ for an
+linear symmetry for every d, and `esag` canonicalises it. Intercept-only fits
+go further: they report the canonical γ of their fitted V, via
+`param::gamma_from_covariance`, so equivalent fits print identical γ in any
+dimension. In a regression, the other equivalences for d ≥ 4 are not linear
+in the covariates, so R and Rust can still return different raw γ for an
 identical fitted distribution. Report and compare `predict_distribution`
 quantities (μ_i, V_i, eigenvalues and ‖γ‖), and use `bootstrap_coef` rather
 than Hessian SEs for γ, as the papers recommend. `docs/MATH.md` has the

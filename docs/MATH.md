@@ -34,10 +34,18 @@ the continued fraction
 r_k = k / (b + r_{k+1}),     I_0 = 1 / (b + r_1),
 ```
 
-whose terms are all positive. Evaluated backwards from depth 100 it is
-accurate to about 1e-14 for every `α ≤ −2` and every `p`, checked against R's
-`integrate`. Hence `log M_p = log φ(α) + log I_0 + Σ_{k≤p} log r_k` never
-underflows.
+whose terms are all positive. It is evaluated backwards from depth
+`⌈170/b⌉ + 2p + 8`, which reaches full double precision for every `b ≥ 2`
+(measured), and agrees with R's `integrate` to about 1e-14. Hence
+`log M_p = log φ(α) + log I_0 + Σ_{k≤p} log r_k` never underflows.
+
+`log M_p` is always computed in `f64`, together with its derivatives
+`(log M_p)' = p M_{p−1}/M_p` and
+`(log M_p)'' = p(p−1) M_{p−2}/M_p − ((log M_p)')²` (from `M_k' = k M_{k−1}`,
+`M_0 = Φ`). Dual numbers receive it through the Taylor step
+`l + d₁δ + ½d₂δ²`, `δ = α − α.re`. This is exact to the order the type
+carries, and costs a few operations whatever the number of derivative
+directions.
 
 ## 2. Yu & Huang's parameterization γ → V (`src/param.rs`, `src/onb.rs`, `src/rotation.rs`, `src/frame.rs`)
 
@@ -57,6 +65,36 @@ underflows.
    formed in the likelihood loop.
 4. `V = P diag(λ_1, …, λ_{d−1}, 1) Pᵀ` with `P = [U_{1..d−1} R | μ/‖μ‖]`.
    Then `yᵀV^s y = Σ_j λ_j^s (v_j·y)² + (μ̂·y)²` costs `O(d²)`.
+
+**Fast evaluation (`loglik::quad_form_parts`).** The likelihood needs only
+`q = yᵀV⁻¹y`, `y·μ` and `‖μ‖²`, and none of them requires forming `U`, `R` or `V`:
+
+* `z = U_{1..d−1}ᵀ y` uses the closed form of the basis with running sums
+  `Σ_{k<i} μ_k²` and `Σ_{k<i} μ_k y_k`, in O(d).
+* `p = Rᵀ z` applies the transposed plane rotations to the (d−1)-vector `z`,
+  in the order of `R`'s factors, in O(d²).
+* Each angle enters only through its cosine and sine, which are ratios of
+  suffix norms of its group: `cos φ_{i,j} = G_j/‖G_{j..}‖`,
+  `sin φ_{i,j} = ‖G_{j+1..}‖/‖G_{j..}‖` and
+  `(cos θ_i, sin θ_i) = (G_{n−1}, G_n)/‖(G_{n−1}, G_n)‖`. No trigonometric
+  function is evaluated.
+* `q = Σ_j p_j²/λ_j + (μ̂·y)²` with `1/λ_1 = (Π_i K_i^{d−1−i})^{1/(d−1)}`
+  and `1/λ_{j+1} = (1/λ_j)/K_j`.
+
+`adjoint::loglik_grad_adjoint` differentiates exactly this sequence in
+reverse mode, at 1.3 to 2.3 times the cost of the value. The rotations are
+differentiated in polar form for accuracy, and the guarded points
+(`sqrt'(0) := 0`, constant branches) match the dual-number reference.
+
+**Inverse map (`param::gamma_from_covariance`).** Given `μ` and a target `V`,
+eigen-decompose `U_{−d}ᵀ V U_{−d}`. Sort the eigenvalues ascending, rescale
+their product to 1, and choose eigenvector signs canonically: the
+largest-magnitude entry positive, then the determinant made +1. Peel the
+rotation group by group from the outside in. The last column of the remaining
+rotation is a unit vector, and its spherical coordinates are that group's
+angles `(φ_{i,·}, θ_i)`. Group norms are `‖G_i‖ = λ_{i+1}/λ_i − 1`. This gives
+the canonical member of an equivalence class, and also the moment-based
+starting value.
 
 **Identifiability.** `v_j` and `−v_j` give the same `V`, so several `γ` map
 to one distribution. Yu & Huang call them *equivalent*; they share the group
@@ -96,15 +134,31 @@ parallel over observations. The R code uses `optim(method = "BFGS")` with
 central finite differences of step 1e-3, which costs `2·dim(B)` likelihood
 evaluations per gradient.
 
-**Starts.** By default `esag` tries a data-driven start and the R code's
-start (`μ` coefficients 1, `γ` ≈ 0), and keeps the better fit. The
-data-driven start sets `μ` along the mean resultant with `‖μ‖ = √κ`,
-`κ` a von Mises–Fisher concentration estimate. If neither start passes the
-convergence check (optimiser converged *and* mean per-observation gradient
-≤ 1e-3), it retries from random perturbations.
+**Starts.** By default `esag` runs two starts in parallel and keeps the
+better fit:
 
-**Standard errors.** `esag` reports the inverse observed information, a
-finite-difference Hessian of the exact gradient. Yu & Huang show this can be
+* a moment start: `μ` along the mean resultant, with
+  `‖μ‖ = (Π σ_j)^{−1/(2(d−1))}` from the eigenvalues of the tangent scatter
+  `S ≈ V/‖μ‖²`, and `γ` from the shape of `S` via the inverse map;
+* the R code's start: `μ` coefficients 1, `γ` ≈ 0.
+
+The starts share an iteration budget. When one converges after `N`
+iterations, the other may run to at most `max(2N, N + 50)` iterations in
+total. A start that converges at a comparable pace can still win, which
+matters because regressions have genuine local maxima. A start trapped near
+the singular set below is cut off. If neither start passes the convergence
+check (the optimiser converged *and* the mean per-observation gradient is
+≤ 1e-3), the fit retries from random perturbations. The L-BFGS memory
+defaults to the number of free parameters, clamped to [10, 100]; with less
+memory than parameters, convergence is 2 to 5 times slower.
+
+**Standard errors.** `esag` reports the inverse observed information. It is
+assembled as `Σ_i (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`, with per-observation Hessians from
+second-order dual numbers (`hdual`) at d = 3, and from central differences
+of the exact gradient for d ≥ 4. The two agree to about 1e-8, and the
+differences are faster there. Up to three simplified Newton steps reuse this
+Hessian to polish the L-BFGS optimum to ‖∇ℓ‖ ≈ 1e-10. Intercept-only fits
+report the canonical γ of their fitted V. Yu & Huang show this can be
 unreliable near `γ = 0`, where the likelihood is non-smooth, and for `γ`
 generally because of equivalence. `inference::bootstrap_coef` gives pairs
 bootstrap SEs and percentile intervals.

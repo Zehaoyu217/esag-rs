@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Inference procedures: parity with the R code where deterministic, Monte
 //! Carlo agreement where stochastic, and reproducibility.
 

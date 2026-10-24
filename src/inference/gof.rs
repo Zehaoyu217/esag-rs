@@ -22,8 +22,7 @@ use crate::error::Result;
 use crate::regression::EsagRegressorFit;
 use crate::stats::ks::{ks_1samp_chisq, ks_2samp};
 use nalgebra::DMatrix;
-use rand::{Rng, SeedableRng};
-use crate::FastRng;
+use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +81,7 @@ fn ks_stat<R: Rng + ?Sized>(
 /// Parametric-bootstrap goodness-of-fit test.
 ///
 /// `n_boot` replicates run in parallel; replicate `b` uses the RNG
-/// `FastRng::seed_from_u64(seed + 1 + b)`, so results do not depend on the
+/// its own random stream derived from `(seed, b)`, so results do not depend on the
 /// number of threads.
 pub fn bootstrap_gof(
     fit: &EsagRegressorFit,
@@ -92,14 +91,14 @@ pub fn bootstrap_gof(
     n_boot: usize,
     seed: u64,
 ) -> Result<GofResult> {
-    let mut rng = FastRng::seed_from_u64(seed);
+    let mut rng = crate::stream_rng(seed, crate::streams::GOF, 0);
     let (d_obs, p_obs) = ks_stat(fit, x, y, method, &mut rng)?;
     let cfg = refit_config(fit);
 
     let boot: Vec<Option<f64>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
-            let mut rng = FastRng::seed_from_u64(seed.wrapping_add(1 + b as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::GOF, 1 + b as u64);
             let yb = fit.sample_responses(x, &mut rng).ok()?;
             let refit = cfg.fit_warm(x, &yb, &fit.coef).ok()?;
             ks_stat(&refit, x, &yb, method, &mut rng)
