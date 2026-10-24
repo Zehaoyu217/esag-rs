@@ -1,0 +1,91 @@
+{
+  "meta": {
+    "R_version": "R version 4.6.1 (2026-06-24)",
+    "platform": "aarch64-apple-darwin25.6.0",
+    "MASS_version": "7.3.65",
+    "RNGkind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "source_files": ["ESAG.R (sourced first, supplies covariance_inv_matrix)", "ESAG_Project2.R (sourced second, primary)"],
+    "number_format": "%.17g (round-trips IEEE double exactly)",
+    "matrix_convention": "all matrices are row-major nested arrays: M[i][j] = R's M[i,j] (1-based in R, 0-based in JSON)",
+    "description": "Prediction_Region() and Confidence_Region() stochastic sanity fixtures",
+    "quantile_note": "all quantiles use R's default quantile(type = 7)"
+  },
+  "prediction_region": {
+    "dataset": "regression_d3_n200.json",
+    "seed": 5,
+    "seed_note": "set.seed(5) immediately before Prediction_Region(X, Y, mles, index = 1, num_boot_m = 2000, num_boot = 5)",
+    "index": 1,
+    "num_boot_m": 2000,
+    "num_boot": 5,
+    "mles_matrix": [[1.5531334466318194, -0.51997772372972273], [0.50117668199806242, 1.2879058071392542], [1.0169233397055968, 0.37230803108917976], [0.87630722186993104, 0.75097333067501493], [-0.49777153891262876, 0.48381004853595838]],
+    "Bx_at_index": [1.0425312273456013, 1.7658607893094107, 1.3825184378352804, 1.6137400613327557, -0.022684870346345358],
+    "mu_at_index": [1.0425312273456013, 1.7658607893094107, 1.3825184378352804],
+    "gamma_at_index": [1.6137400613327557, -0.022684870346345358],
+    "rng_order": "Confidence_Region at the fitted Bx[1,] (ESAG(2000,...) = one mvrnorm(2000) call); then for each of 5 rounds: sample(1:n, n, replace=TRUE), MLE(c(mles), Y_boot, X_boot) with HESS=TRUE (deterministic), Confidence_Region(2000) at the bootstrap Bx[1,]",
+    "quantiles": {
+      "95% PR": 1.0160523672726494,
+      "90% PR": 0.73308919567033093,
+      "85% PR": 0.58567149518611616,
+      "80% PR": 0.48636630340414849,
+      "75% PR": 0.41728174865708523,
+      "70% PR": 0.35709936011393467
+    },
+    "Q_total_summary": {
+      "n": 12000,
+      "mean": 0.31606259726374869,
+      "sd": 0.37350002906239294,
+      "min": 2.772898792953793e-05,
+      "max": 3.9804061972288904,
+      "quantiles_type7": {
+        "0.5": 0.19621998966873969,
+        "0.7": 0.35709936011393467,
+        "0.9": 0.73308919567033093,
+        "0.95": 1.0160523672726494
+      }
+    },
+    "Q_index_only_summary": {
+      "n": 2000,
+      "mean": 0.33336486180606906,
+      "sd": 0.40466706251859619,
+      "min": 7.6582093222347735e-05,
+      "max": 3.8845844261975464,
+      "quantiles_type7": {
+        "0.5": 0.20205077713812258,
+        "0.7": 0.366309187707553,
+        "0.9": 0.7952816244361659,
+        "0.95": 1.0927544459400775
+      }
+    },
+    "timing": {
+      "elapsed_sec": 21.132000000000001,
+      "user_sec": 21.071000000000002
+    }
+  },
+  "confidence_region": {
+    "seed": 3,
+    "seed_note": "set.seed(3) immediately before Confidence_Region(mu_mle = c(1,2,1.5), gamma_mle = c(0.7,-0.3), sample_m = 5000)",
+    "mu_mle": [1, 2, 1.5],
+    "gamma_mle": [0.69999999999999996, -0.29999999999999999],
+    "sample_m": 5000,
+    "quantiles": {
+      "0.5": 0.1794203244970286,
+      "0.9": 0.62915864727607218,
+      "0.95": 0.85692665025816339
+    },
+    "summary": {
+      "n": 5000,
+      "mean": 0.27740964621619668,
+      "sd": 0.32321194612833848,
+      "min": 7.3783427189189711e-05,
+      "max": 3.6710544968473577,
+      "quantiles_type7": {
+        "0.5": 0.1794203244970286,
+        "0.7": 0.31738513893042414,
+        "0.9": 0.62915864727607218,
+        "0.95": 0.85692665025816339
+      }
+    },
+    "V_inv_used": [[1.2733780393717897, -0.045393695745933604, -0.12172709858661504], [-0.045393695745933604, 0.9159420117427346, 0.14233978150697624], [-0.12172709858661504, 0.14233978150697624, 0.89136502371510828]],
+    "definition": "q_l = (Y_l - mu/|mu|)' V^-1 (Y_l - mu/|mu|) for Y_l ~ ESAG(mu, gamma)"
+  }
+}

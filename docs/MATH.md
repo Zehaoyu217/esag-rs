@@ -1,0 +1,146 @@
+# The mathematics implemented by `esag`
+
+References: Paine, Preston, Tsagris & Wood (2018), *Statistics and Computing*
+28:689–697 (ESAG); Yu & Huang (2024), *Electronic Journal of Statistics*
+18:301–334 (parameterization for arbitrary `d`, residuals, goodness of fit);
+Yu & Huang (2025), *Computational Statistics & Data Analysis* 208:108167
+(regression, hypothesis tests, prediction regions); Z. Yu (2024), PhD
+dissertation, University of South Carolina.
+
+## 1. The ESAG distribution
+
+If `X ~ N_d(μ, V)` then `Y = X/‖X‖ ∈ S^{d-1}` has the angular Gaussian
+distribution. ESAG imposes `Vμ = μ` and `|V| = 1`, which makes the density
+
+```
+f(y) = (2π)^{-(d-1)/2} (yᵀV⁻¹y)^{-d/2} exp{½(α² − ‖μ‖²)} M_{d-1}(α),
+α = yᵀμ / (yᵀV⁻¹y)^{1/2},
+M_p(α) = ∫_0^∞ t^p φ(t − α) dt.
+```
+
+`μ/‖μ‖` is the mode, `‖μ‖` controls concentration and `V` the elliptical
+shape. The free parameters are `μ ∈ ℝ^d` and `γ ∈ ℝ^{(d-2)(d+1)/2}`.
+
+### `M_p` and numerical stability (`src/loglik.rs`)
+
+`M_1 = αΦ(α) + φ(α)`, `M_2 = (1+α²)Φ(α) + αφ(α)`,
+`M_k = α M_{k−1} + (k−1) M_{k−2}`. For `α < −2` this forward recursion
+cancels catastrophically. The original R code returns `NaN` or `−Inf` far in
+the tail. `esag` uses instead `M_p(α) = φ(α) I_p(b)`, `b = −α`, with
+`I_k = ∫_0^∞ t^k e^{−bt−t²/2} dt`. The ratios `r_k = I_k / I_{k−1}` satisfy
+the continued fraction
+
+```
+r_k = k / (b + r_{k+1}),     I_0 = 1 / (b + r_1),
+```
+
+whose terms are all positive. Evaluated backwards from depth 100 it is
+accurate to about 1e-14 for every `α ≤ −2` and every `p`, checked against R's
+`integrate`. Hence `log M_p = log φ(α) + log I_0 + Σ_{k≤p} log r_k` never
+underflows.
+
+## 2. Yu & Huang's parameterization γ → V (`src/param.rs`, `src/onb.rs`, `src/rotation.rs`, `src/frame.rs`)
+
+1. **Groups.** `γ` is split into `d−2` groups. Group `i` has `i+1` entries
+   `G = (G_1, …, G_{i+1})`. Each group is a point in spherical coordinates
+   `(r_i, θ_i, φ_{i,1..i−1})`:
+   `r_i = ‖G‖`, `θ_i = atan2(G_{i+1}, G_i)`,
+   `φ_{i,j} = acos(G_j / ‖G_{j..i+1}‖)`.
+2. **Eigenvalues.** `λ_{j+1} = (1 + r_j) λ_j` and `Π λ_j = 1`, so
+   `λ_1 = {Π_j (1+r_j)^{d−1−j}}^{−1/(d−1)}`. The eigenvalue of `μ` is 1.
+   `γ = 0` gives `V = I`, the isotropic angular Gaussian.
+3. **Eigenvectors.** `U = onb(μ)` is a closed-form orthonormal basis with
+   last column `μ/‖μ‖`, with fallbacks `e_j` for degenerate `μ`. The first
+   `d−1` columns are rotated by `R ∈ SO(d−1)`, a product of plane rotations
+   `R = Π_{m=1}^{d−3} [R_{12}(θ_{d−m−1}) Π_{j=1}^{d−m−2} R_{j+1,j+2}(φ_{…})] · R_{12}(θ_1)`.
+   `esag` applies the factors directly to the columns of `U`, so `R` is never
+   formed in the likelihood loop.
+4. `V = P diag(λ_1, …, λ_{d−1}, 1) Pᵀ` with `P = [U_{1..d−1} R | μ/‖μ‖]`.
+   Then `yᵀV^s y = Σ_j λ_j^s (v_j·y)² + (μ̂·y)²` costs `O(d²)`.
+
+**Identifiability.** `v_j` and `−v_j` give the same `V`, so several `γ` map
+to one distribution. Yu & Huang call them *equivalent*; they share the group
+norms `r_j`. Negating the first group shifts `θ_1` by π and negates
+`v_1, v_2`. This is an exact linear symmetry for every `d`, and in a
+regression it means negating rows `d` and `d+1` of the coefficient matrix.
+`esag` canonicalises fits so the first non-zero of those rows is positive
+(`regression::canonicalize_coef`). For `d ≥ 4` further, non-linear
+equivalences exist. Compare fitted distributions (`μ_i`, `V_i`) rather than
+raw `γ` coefficients, and use the bootstrap for uncertainty, as the papers
+recommend.
+
+## 3. Regression (`src/regression.rs`)
+
+`Y_i | x_i ~ ESAG(μ_i, γ_i)`, `(μ_i, γ_i) = B x̃_i` with `x̃_i = (1, x_i)`.
+The identity link is possible because the parameter space is all of
+`ℝ^{d + (d−2)(d+1)/2}`. `B` has rows `(μ_1..μ_d, γ_1..γ_g)` and one column
+per design column.
+
+**Fitting.** `esag` maximises `ℓ(B) = Σ_i log f(y_i; B x̃_i)` with L-BFGS
+(`src/optim/lbfgs.rs`). The line search is strong Wolfe with Hager–Zhang
+approximate-Wolfe acceptance near the optimum. The gradient is **exact**:
+the per-observation log-density is generic over a `Scalar` type, and
+evaluating it with forward-mode dual numbers `Dual<N>`, `N = dim η`, gives
+`g_i = ∂ log f/∂η` in one pass. Then `∂ℓ/∂B = Σ_i g_i x̃_iᵀ`, computed in
+parallel over observations. The R code uses `optim(method = "BFGS")` with
+central finite differences of step 1e-3, which costs `2·dim(B)` likelihood
+evaluations per gradient.
+
+**Starts.** By default `esag` tries a data-driven start and the R code's
+start (`μ` coefficients 1, `γ` ≈ 0), and keeps the better fit. The
+data-driven start sets `μ` along the mean resultant with `‖μ‖ = √κ`,
+`κ` a von Mises–Fisher concentration estimate. If neither start passes the
+convergence check (optimiser converged *and* mean per-observation gradient
+≤ 1e-3), it retries from random perturbations.
+
+**Standard errors.** `esag` reports the inverse observed information, a
+finite-difference Hessian of the exact gradient. Yu & Huang show this can be
+unreliable near `γ = 0`, where the likelihood is non-smooth, and for `γ`
+generally because of equivalence. `inference::bootstrap_coef` gives pairs
+bootstrap SEs and percentile intervals.
+
+**Covariates.** The papers rescale each covariate to `[1, 2]`;
+`preprocessing::MinMaxScaler` does this. The model is linear in `x`, so
+rescaling changes `B` but not the fitted distributions.
+
+## 4. Residuals and goodness of fit (`src/inference/gof.rs`)
+
+`r_i = (I − μ̂_iμ̂_iᵀ) y_i`, `Q_i = r_iᵀ V_i⁻¹ r_i`,
+`T1_i = (‖μ_i‖² + Σ_j λ_{ij} + 1) Q_i = E‖X_i‖² · Q_i`, which is approximately
+`χ²_{d−1}`.
+
+* `GofMethod::TwoSampleReference` (default) follows Yu & Huang 2024,
+  Algorithm 1. `KS_p` is the p-value of a two-sample KS test between the
+  observed `T1` and `T1` of a reference sample drawn from the fit. Its null
+  distribution comes from a parametric bootstrap that refits on every
+  simulated data set, and `p = #{KS_p^(b) < KS_p}/B`.
+* `GofMethod::OneSampleChiSquare` follows the author's regression R code. The
+  statistic is the one-sample KS p-value of `T1` against `χ²_{d−1}`, with the
+  same bootstrap, and `p = #{stat ≥ stat^(b)}/B`.
+
+## 5. Prediction regions (`src/inference/regions.rs`)
+
+`PR_a = {y : (y − μ̂)ᵀ V̂⁻¹ (y − μ̂) ≤ q_a}` where `μ̂ = μ/‖μ‖`. `q_a` is the
+`(1−a)` quantile of the statistic over `m` draws from the plug-in model,
+pooled with `m` draws from each of `B` nonparametric-bootstrap refits
+(CSDA Algorithm 4). Among ellipsoidal regions with `Vμ = μ` and `|V| = 1`,
+this has the smallest volume.
+
+## 6. Hypothesis tests (`src/inference/tests.rs`)
+
+Restricted fit (`μ_{0i}`, `γ_{0i}`) versus full fit (`μ_{ai}`):
+
+```
+RoC = mean_i ‖μ_{ai}‖ / ‖μ_{0i}‖
+D   = mean_i {2 − cos∠(μ_{0i}, μ_{ai})} ‖μ_{ai}‖ / ‖μ_{0i}‖
+M   = ‖ mean_i ( y_i² − Ê_0 y_i² ) ‖      (elementwise squares; Ê_0 by Monte Carlo)
+LR  = −2 (ℓ_0 − ℓ_a)
+```
+
+Null distributions come from a parametric bootstrap under the restricted fit,
+refitting both models each time, and `p = #{stat^(b) > stat}/B`. Supported
+nulls are isotropy (`γ ≡ 0`), `μ` free of feature `j`, `γ` free of feature
+`j`, both, or any custom mask. Two differences from the R code: bootstrap
+responses are drawn from each observation's own null parameters (the R code
+indexes them by the bootstrap counter), and every `d` is supported (the R
+isotropy and γ-restricted fits hard-code `d = 4`).

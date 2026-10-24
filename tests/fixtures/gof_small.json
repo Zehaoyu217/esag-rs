@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "R_version": "R version 4.6.1 (2026-06-24)",
+    "platform": "aarch64-apple-darwin25.6.0",
+    "MASS_version": "7.3.65",
+    "RNGkind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "source_files": ["ESAG.R (sourced first, supplies covariance_inv_matrix)", "ESAG_Project2.R (sourced second, primary)"],
+    "number_format": "%.17g (round-trips IEEE double exactly)",
+    "matrix_convention": "all matrices are row-major nested arrays: M[i][j] = R's M[i,j] (1-based in R, 0-based in JSON)",
+    "description": "Bootstrap_GoF(mles, Y, X, num_boot) on the regression_d3_n200 dataset (same X, Y and MLE par as regression_d3_n200.json)",
+    "seed": 99,
+    "seed_note": "set.seed(99) immediately before the Bootstrap_GoF call; nothing else consumed the RNG after loading the stored dataset",
+    "num_boot": 20,
+    "stochastic_note": "Stochastic sanity fixture only. Each bootstrap round draws n ESAG(1, mu_k, gamma_k) deviates (one MASS::mvrnorm(1,.) each, i.e. rnorm(3)) from the fitted Bx rows, refits MLE(c(mles), Y_b, X) with HESS=TRUE (default), recomputes T1 and ks.test(T1_boot, 'pchisq', 2)$p.value. test_statistics is itself the KS p-value of the observed T1 residuals (not the KS D statistic), and p_value = mean(test_statistics >= stats_boot)."
+  },
+  "dataset": "regression_d3_n200.json",
+  "mles_matrix": [[1.5531334466318194, -0.51997772372972273], [0.50117668199806242, 1.2879058071392542], [1.0169233397055968, 0.37230803108917976], [0.87630722186993104, 0.75097333067501493], [-0.49777153891262876, 0.48381004853595838]],
+  "mles_colmajor": [1.5531334466318194, 0.50117668199806242, 1.0169233397055968, 0.87630722186993104, -0.49777153891262876, -0.51997772372972273, 1.2879058071392542, 0.37230803108917976, 0.75097333067501493, 0.48381004853595838],
+  "test_statistics": 0.11660538012879458,
+  "p_value": 0.94999999999999996,
+  "observed_ks": {
+    "statistic": 0.084289808469639738,
+    "p_value": 0.11660538012879458
+  },
+  "timing": {
+    "elapsed_sec": 79.058000000000007,
+    "user_sec": 78.748000000000005
+  }
+}

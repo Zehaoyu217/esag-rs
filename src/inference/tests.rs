@@ -1,0 +1,280 @@
+//! Bootstrap hypothesis tests (R: `hypothesis_testing_isotropy`,
+//! `hypothesis_testing_mu`, `hypothesis_testing_gamma`, `stats_gamma`,
+//! `mome_stats`).
+//!
+//! A restricted model (null) is compared with the full model using four
+//! statistics: `RoC` (mean ratio of concentrations `|mu_a,i|/|mu_0,i|`), `D`
+//! (`mean_i (2 − cos∠(mu_0,i, mu_a,i)) · RoC_i`), `M` (a second-moment
+//! discrepancy, Monte-Carlo; Yu & Huang use 10⁴ draws) and the likelihood
+//! ratio `LR = −2(ll_0 − ll_a)`.
+//! Null distributions come from a parametric bootstrap under the restricted
+//! fit. Unlike the R code, the bootstrap responses are simulated observation
+//! by observation from their own fitted parameters (the R code indexes the
+//! parameter matrix with the bootstrap counter), and every `d` is supported.
+
+use super::refit_config;
+use crate::error::{EsagError, Result};
+use crate::regression::{
+    EsagRegressorFit, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
+};
+use crate::stats::chisq::chisq_sf;
+use nalgebra::DMatrix;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// The null hypothesis to test against the full model.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Restriction {
+    /// All `gamma` coefficients are zero (isotropic angular Gaussian errors).
+    Isotropy,
+    /// The `mu` coefficients of feature `j` (0-based, excluding intercept) are zero.
+    MuOfFeature(usize),
+    /// The `gamma` coefficients of feature `j` (0-based, excluding intercept) are zero.
+    GammaOfFeature(usize),
+    /// Both `mu` and `gamma` coefficients of feature `j` are zero.
+    Feature(usize),
+    /// A custom free-parameter mask (`eta_len(d) × p_total`).
+    Custom(DMatrix<bool>),
+}
+
+/// Results of a bootstrap hypothesis test.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HypothesisTestResult {
+    /// Observed statistics.
+    pub roc: f64,
+    pub d_stat: f64,
+    pub m_stat: f64,
+    pub lr: f64,
+    /// Bootstrap p-values `mean(stat_obs < stat_boot)`.
+    pub p_roc: f64,
+    pub p_d: f64,
+    pub p_m: f64,
+    pub p_lr: f64,
+    /// Asymptotic χ² p-value for `LR` with `df` restricted parameters
+    /// (indicative only; for the isotropy null the parameter lies on a
+    /// non-differentiable point of the parameterization).
+    pub p_lr_chisq: f64,
+    pub df: usize,
+    /// Log-likelihoods of the restricted and full fits.
+    pub loglik_restricted: f64,
+    pub loglik_full: f64,
+    /// The restricted fit's coefficient matrix.
+    pub coef_restricted: DMatrix<f64>,
+    pub n_boot: usize,
+    pub n_failed: usize,
+    pub boot_roc: Vec<f64>,
+    pub boot_d: Vec<f64>,
+    pub boot_m: Vec<f64>,
+    pub boot_lr: Vec<f64>,
+}
+
+fn restriction_mask(fit: &EsagRegressorFit, r: &Restriction) -> Result<DMatrix<bool>> {
+    let d = fit.d;
+    let pt = fit.p_total();
+    let off = usize::from(fit.fit_intercept);
+    let col = |j: usize| -> Result<usize> {
+        if j >= fit.n_features {
+            Err(EsagError::Shape(format!(
+                "feature index {j} out of range (model has {} features)",
+                fit.n_features
+            )))
+        } else {
+            Ok(j + off)
+        }
+    };
+    let m = match r {
+        Restriction::Isotropy => isotropic_mask(d, pt),
+        Restriction::MuOfFeature(j) => mu_restricted_mask(d, pt, col(*j)?),
+        Restriction::GammaOfFeature(j) => gamma_restricted_mask(d, pt, col(*j)?),
+        Restriction::Feature(j) => {
+            let c = col(*j)?;
+            let mut m = mu_restricted_mask(d, pt, c);
+            for k in d..m.nrows() {
+                m[(k, c)] = false;
+            }
+            m
+        }
+        Restriction::Custom(m) => m.clone(),
+    };
+    // the restriction must be nested in the full fit's free set
+    for k in 0..m.nrows() {
+        for j in 0..m.ncols() {
+            if m[(k, j)] && !fit.mask[(k, j)] {
+                return Err(EsagError::Shape(
+                    "restriction frees a parameter that is fixed in the full model".into(),
+                ));
+            }
+        }
+    }
+    Ok(m)
+}
+
+/// `RoC` and `D` from the `mu` parts of two linear predictors (`n × b_dim`).
+fn roc_and_d(eta0: &DMatrix<f64>, eta_a: &DMatrix<f64>, d: usize) -> (f64, f64) {
+    let n = eta0.nrows();
+    let mut roc = 0.0;
+    let mut ds = 0.0;
+    for i in 0..n {
+        let mut n0 = 0.0;
+        let mut na = 0.0;
+        let mut dot = 0.0;
+        for k in 0..d {
+            let a = eta0[(i, k)];
+            let b = eta_a[(i, k)];
+            n0 += a * a;
+            na += b * b;
+            dot += a * b;
+        }
+        let (n0, na) = (n0.sqrt(), na.sqrt());
+        let r = na / n0;
+        roc += r;
+        ds += (2.0 - dot / (n0 * na)) * r;
+    }
+    (roc / n as f64, ds / n as f64)
+}
+
+/// `M = ‖ mean_i ( y_i² − E[Y_i²; eta_0,i] ) ‖` (elementwise squares, Euclidean
+/// norm; Yu & Huang 2025 eq. (4)) with the second moments estimated by `n_mc`
+/// Monte-Carlo draws per observation. (R's `mome_stats` returns the squared
+/// norm; bootstrap p-values are identical.)
+fn moment_stat(fit0: &EsagRegressorFit, x: &DMatrix<f64>, y: &DMatrix<f64>, n_mc: usize, seed: u64) -> Result<f64> {
+    let dists = fit0.predict_distribution(x)?;
+    let d = fit0.d;
+    let diffs: Vec<Vec<f64>> = dists
+        .par_iter()
+        .enumerate()
+        .map(|(i, dist)| {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+            let frame = dist.frame();
+            let mut buf = vec![0.0; d];
+            let mut ey2 = vec![0.0; d];
+            for _ in 0..n_mc {
+                dist.sample_one(&frame, &mut rng, &mut buf);
+                for k in 0..d {
+                    ey2[k] += buf[k] * buf[k];
+                }
+            }
+            (0..d)
+                .map(|k| y[(i, k)].powi(2) - ey2[k] / n_mc as f64)
+                .collect()
+        })
+        .collect();
+    let n = y.nrows() as f64;
+    let mut m = 0.0;
+    for k in 0..d {
+        let mean_k: f64 = diffs.iter().map(|r| r[k]).sum::<f64>() / n;
+        m += mean_k * mean_k;
+    }
+    Ok(m.sqrt())
+}
+
+/// Run a bootstrap hypothesis test of `restriction` against the full fit.
+///
+/// `n_boot` parametric-bootstrap replicates from the restricted fit (each
+/// refitting both models, warm-started), `n_mc` Monte-Carlo draws per
+/// observation for the `M` statistic. Replicate `b` uses seed `seed + 1 + b`.
+pub fn hypothesis_test(
+    fit_full: &EsagRegressorFit,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    restriction: Restriction,
+    n_boot: usize,
+    n_mc: usize,
+    seed: u64,
+) -> Result<HypothesisTestResult> {
+    let d = fit_full.d;
+    let mask0 = restriction_mask(fit_full, &restriction)?;
+    let df = fit_full
+        .free
+        .iter()
+        .filter(|&&(k, j)| !mask0[(k, j)])
+        .count();
+
+    // restricted start: full MLE with the restricted entries zeroed
+    let mut b0 = fit_full.coef.clone();
+    for k in 0..b0.nrows() {
+        for j in 0..b0.ncols() {
+            if !mask0[(k, j)] {
+                b0[(k, j)] = 0.0;
+            }
+        }
+    }
+    let mut cfg0 = refit_config(fit_full);
+    cfg0.mask = Some(mask0.clone());
+    let cfg_a = refit_config(fit_full);
+    let fit0 = cfg0.fit_warm(x, y, &b0)?;
+
+    let eta0 = fit0.linear_predictor(x)?;
+    let eta_a = fit_full.linear_predictor(x)?;
+    let (roc, d_stat) = roc_and_d(&eta0, &eta_a, d);
+    let m_stat = moment_stat(&fit0, x, y, n_mc, seed)?;
+    let lr = -2.0 * (fit0.log_likelihood - fit_full.log_likelihood);
+
+    let boot: Vec<Option<(f64, f64, f64, f64)>> = (0..n_boot)
+        .into_par_iter()
+        .map(|b| {
+            let bseed = seed.wrapping_add(1 + b as u64);
+            let mut rng = ChaCha8Rng::seed_from_u64(bseed);
+            let yb = fit0.sample_responses(x, &mut rng).ok()?;
+            let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
+            // full-model start: restricted MLE, with the restricted mu entries
+            // set to 1 (the R code's recommendation) and gamma entries small
+            let mut ba = f0.coef.clone();
+            for &(k, j) in &fit_full.free {
+                if !mask0[(k, j)] {
+                    ba[(k, j)] = if k < d { 1.0 } else { 1e-3 };
+                }
+            }
+            let fa = cfg_a.fit_warm(x, &yb, &ba).ok()?;
+            let e0 = f0.linear_predictor(x).ok()?;
+            let ea = fa.linear_predictor(x).ok()?;
+            let (r, dd) = roc_and_d(&e0, &ea, d);
+            let m = moment_stat(&f0, x, &yb, n_mc, bseed.wrapping_mul(7919)).ok()?;
+            let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
+            Some((r, dd, m, l))
+        })
+        .collect();
+
+    let mut br = vec![];
+    let mut bd = vec![];
+    let mut bm = vec![];
+    let mut bl = vec![];
+    let mut n_failed = 0;
+    for r in boot {
+        match r {
+            Some((a, b, c, e)) => {
+                br.push(a);
+                bd.push(b);
+                bm.push(c);
+                bl.push(e);
+            }
+            None => n_failed += 1,
+        }
+    }
+    let nb = br.len().max(1) as f64;
+    let pv = |obs: f64, v: &[f64]| v.iter().filter(|&&s| obs < s).count() as f64 / nb;
+    Ok(HypothesisTestResult {
+        roc,
+        d_stat,
+        m_stat,
+        lr,
+        p_roc: pv(roc, &br),
+        p_d: pv(d_stat, &bd),
+        p_m: pv(m_stat, &bm),
+        p_lr: pv(lr, &bl),
+        p_lr_chisq: chisq_sf(lr.max(0.0), df as f64),
+        df,
+        loglik_restricted: fit0.log_likelihood,
+        loglik_full: fit_full.log_likelihood,
+        coef_restricted: fit0.coef,
+        n_boot: br.len(),
+        n_failed,
+        boot_roc: br,
+        boot_d: bd,
+        boot_m: bm,
+        boot_lr: bl,
+    })
+}
+
