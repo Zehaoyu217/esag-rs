@@ -393,9 +393,7 @@ impl PenalizedEsag {
                 "isotropy group LASSO".to_string()
             }
             Penalty::GroupLasso => "group LASSO".to_string(),
-            Penalty::SparseGroupLasso { l1_ratio } => {
-                format!("sparse group LASSO (l1_ratio={l1_ratio})")
-            }
+            Penalty::SparseGroupLasso { .. } => "sparse group LASSO".to_string(),
             Penalty::EigenGap => "eigen-gap LASSO".to_string(),
         };
         let paper = if self.is_paper() { " [paper mode]" } else { "" };
@@ -448,7 +446,8 @@ impl PenalizedEsag {
         self.start_coef = b;
         self
     }
-    fn is_paper(&self) -> bool {
+    /// Whether this is a paper-reproduction preset ([`Self::paper`]).
+    pub fn is_paper(&self) -> bool {
         self.solver == Solver::PaperReproduction
     }
 
@@ -669,7 +668,7 @@ impl PenalizedPath {
             ),
         };
         let n_active = b.active.iter().filter(|&&a| a).count();
-        let extra = vec![
+        let mut extra = vec![
             ("Penalized:".to_string(), format!("{target} / {grouping}")),
             ("lambda (sum):".to_string(), crate::summary::num(b.lambda)),
             ("Selection:".to_string(), selection),
@@ -691,6 +690,9 @@ impl PenalizedPath {
                 crate::summary::num(b.log_likelihood),
             ),
         ];
+        if let Penalty::SparseGroupLasso { l1_ratio } = c.penalty {
+            extra.push(("l1_ratio:".to_string(), format!("{l1_ratio}")));
+        }
         match &self.relaxed {
             Some(r) => r.summary_titled(
                 "ESAG Regularized Regression Results",

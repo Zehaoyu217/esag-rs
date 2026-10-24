@@ -4,7 +4,8 @@ ESAG regression for directional data, in Rust.
 
 `esag` ports and re-engineers Zehao Yu's ESAG R code
 ([Zehaoyu217/ESAG](https://github.com/Zehaoyu217/ESAG)) as a model-fitting
-library in the style of scikit-learn. ESAG is the elliptically symmetric
+library with a statsmodels-style API and output, in Rust and Python. ESAG
+is the elliptically symmetric
 angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
 
 * the ESAG(μ, γ) distribution in any dimension d ≥ 3, with Yu & Huang's
@@ -17,10 +18,12 @@ angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
 * an opt-in smooth shape parameterization (`Shape::LogTangent`) for the same
   distributions, which removes the discontinuities of `γ ↦ V` that make large
   regressions (d = 7–8, 5–6 covariates) slow and unreliable;
-* LASSO-type penalized fits (Project 3): the paper's six methods as coded in
-  its R scripts, and corrected designs on the smooth shape (isotropy,
-  eigenvalue ties, covariate selection), with λ paths and BIC/AIC/CV
-  selection;
+* the LASSO family (Project 3): LASSO, adaptive LASSO, group, adaptive group
+  and sparse group LASSO on any set of coefficients, isotropy and
+  eigenvalue-tie penalties, and the paper's six methods as coded in its R
+  scripts, with λ paths, BIC/AIC/CV selection and relaxed refits;
+* statsmodels-style results (`params`, `bse`, `pvalues`, `conf_int`,
+  `summary()`), in Rust and in the Python package (`python/`);
 * a command-line tool for CSV data.
 
 It reproduces the R code's numbers and the papers' published real-data
@@ -45,6 +48,42 @@ results, and runs 4,200 to 103,000 times faster than the R code.
 
 ## Quick start
 
+### Python
+
+```sh
+cd python && pip install maturin && maturin develop --release   # or: maturin build --release
+```
+
+```python
+import esag
+
+model = esag.ESAG(Y, X)                 # endog: n x d unit vectors, exog: n x p (const added)
+res = model.fit()
+print(res.summary())                    # statsmodels-style table, one block per equation
+res.params, res.bse, res.pvalues, res.conf_int()
+
+res.test("isotropy", n_boot=500)        # RoC, D, M, LR with bootstrap p-values
+res.test("shape", "temp", n_boot=500)   # nulls: isotropy | mu | shape | feature
+
+reg = model.fit_regularized("adaptive_group_lasso", groups="covariate_part")
+print(reg.summary())                    # relaxed refit of the selected model; dropped terms marked
+reg.path                                # alpha, lambda, df, llf, BIC, active groups per step
+```
+
+Penalties: `lasso`, `adaptive_lasso`, `group_lasso`, `adaptive_group_lasso`,
+`sparse_group_lasso` (`l1_ratio`), `isotropy`, `eigen_gap`, or
+`paper="RoC-LASSO"` (any of the paper's six). `target` picks the
+coefficients (`slopes`, `mean`, `shape_slopes`, `shape`), `groups` the
+grouping (`covariate`, `covariate_part`, `parameter`, `all`, `gamma`, or
+explicit lists of `("mu[1]", "temp")` pairs), `adaptive=True|r|False` the
+weights, and `select` the rule (`bic`, `aic`, `cv`). `alpha=` fixes the
+penalty weight on the per-observation scale, as in statsmodels. Inputs may
+be numpy or pandas, and pandas column names flow into the output.
+`python/README.md` has more, and `python examples/demo.py` runs a full
+session.
+
+### Rust
+
 ```rust
 use esag::regression::EsagRegressor;
 use esag::inference::{bootstrap_gof, hypothesis_test, prediction_region, GofMethod, Restriction};
@@ -68,8 +107,10 @@ std::fs::write("model.json", model.to_json()?)?;     // save; EsagRegressorFit::
 ```
 
 For larger regressions (d ≥ 5 with several covariates) the smooth shape is
-the reliable choice; it describes the same distributions with the same
-number of parameters:
+the reliable choice. Each observation's law is still an ESAG with the same
+number of parameters, but with covariates "shape linear in x" is a
+different regression model in each parameterization, so compare the two by
+AIC/BIC (`docs/MATH.md` §7):
 
 ```rust
 use esag::regression::Shape;
@@ -79,14 +120,29 @@ let model = EsagRegressor::new().with_shape(Shape::LogTangent).fit(&x, &y)?;
 Penalized fits (Project 3) select λ along a path:
 
 ```rust
-use esag::penalized::{Method, PenalizedEsag};
+use esag::penalized::{Grouping, PenalizedEsag, Target};
 // which covariates move the mean direction and which move the shape?
-let path = PenalizedEsag::new(Method::Drivers { mean: true, shape: true }).fit(&x, &y)?;
-println!("{}", path.summary());                     // λ, log-lik, df, BIC, active groups
-let refit = path.relaxed.as_ref().unwrap();         // unpenalized refit with SEs
+let path = PenalizedEsag::adaptive_group_lasso()
+    .grouping(Grouping::CovariatePart)
+    .fit(&x, &y)?;
+println!("{}", path.summary());                     // statsmodels-style, relaxed refit with SEs
+println!("{}", path.path_summary());                // λ, log-lik, df, BIC, active groups
+// other members of the family
+let l1 = PenalizedEsag::lasso().target(Target::MeanSlopes).cv(10, 1).fit(&x, &y)?;
+let sg = PenalizedEsag::sparse_group_lasso(0.5).adaptive(1.0).fit(&x, &y)?;
 // i.i.d. data: partial isotropy (tied eigenvalues), or the paper's methods
-let ties = PenalizedEsag::new(Method::EigenGap).fit(&x0, &y)?;
+let ties = PenalizedEsag::eigen_gap().fit(&x0, &y)?;
 let paper = PenalizedEsag::paper("RoC-LASSO")?.fit(&x0, &y)?;
+```
+
+The statsmodels-style front end wraps the same pieces:
+
+```rust
+use esag::model::EsagModel;
+let model = EsagModel::new(&y, &x).exog_names(&["temp", "ph"]);
+let res = model.fit()?;                             // res.params(), bse(), pvalues(), conf_int(0.05)
+let t = res.test(Restriction::GammaOfFeature(0), 500, 1)?;
+println!("{}\n{}", res.summary(), t.summary());
 ```
 
 To fit a single distribution to i.i.d. data, use `EsagEstimator::new().fit(&y)`.
@@ -124,7 +180,9 @@ $B gof model.json sim.csv --y y1,y2,y3 --x x1 --boot 200
 $B test model.json sim.csv --y y1,y2,y3 --x x1 --null isotropy --boot 200   # also: mu | gamma | feature
 $B region model.json sim.csv --y y1,y2,y3 --x x1 --at 0.5
 $B fit sim.csv --y y1,y2,y3 --x x1 --shape log-tangent
-$B penalize sim.csv --y y1,y2,y3 --x x1 --method drivers                   # also: isotropy | eigen-gap | lasso | group-lasso
+$B penalize sim.csv --y y1,y2,y3 --x x1 --penalty adaptive-group-lasso --groups covariate-part
+$B penalize sim.csv --y y1,y2,y3 --x x1 --penalty sparse-group-lasso --l1-ratio 0.3 --select cv
+$B penalize sim.csv --y y1,y2,y3 --paper RoC-LASSO                          # the paper's methods (i.i.d.)
 ```
 
 ## API overview
@@ -132,7 +190,8 @@ $B penalize sim.csv --y y1,y2,y3 --x x1 --method drivers                   # als
 | item | role |
 |---|---|
 | `regression::EsagRegressor` | configuration and builder: `fit_intercept`, `max_iter`, `tol`, `init` (`Auto`, `DataDriven`, `RStyle`, `Custom`), `with_restarts`, `with_mask` (restricted fits), `with_hessian`, `with_feature_names`, `with_shape` (`Shape::Gamma` or `Shape::LogTangent`). `fit(x, y)` and `fit_warm(x, y, b0)`. |
-| `regression::EsagRegressorFit` | fitted model: `coef`, `intercept()`, `slopes()`, `predict`, `predict_distribution`, `linear_predictor`, `score`, `log_likelihood_rows`, `residuals`, `std_errors`, `cov_params`, `summary`, `aic`, `bic`, `sample_responses`, `to_json` and `from_json`. |
+| `model::{EsagModel, EsagResults}` | statsmodels-style front end: `EsagModel::new(endog, exog)`, `fit()`, `fit_regularized(penalty)`; results deref to the fit and add `test`, `gof`, `prediction_region`. |
+| `regression::EsagRegressorFit` | fitted model: `params`, `bse`, `zvalues`, `pvalues`, `conf_int`, `llf`, `nobs`, `df_model`, `df_resid`, `coef`, `intercept()`, `slopes()`, `predict`, `predict_distribution`, `linear_predictor`, `score`, `log_likelihood_rows`, `residuals`, `std_errors`, `cov_params`, `summary`, `aic`, `bic`, `sample_responses`, `to_json` and `from_json`. |
 | `estimator::{EsagEstimator, EsagFit}` | i.i.d. fit (no covariates), same options. |
 | `estimator::{Fit, Predict, Score}` | scikit-learn-style traits, implemented by the estimators. |
 | `distribution::Esag` | the distribution: `log_pdf`, `pdf`, `sample`, `covariance`, `cov_pow`, `angles`, `mean_direction`, `residuals`, `region_statistic`. |
@@ -144,7 +203,7 @@ $B penalize sim.csv --y y1,y2,y3 --x x1 --method drivers                   # als
 | `regression::canonicalize_coef` | picks the canonical sign of the first γ group (see identifiability below). |
 | `param::gamma_from_covariance` | the inverse of the parameterization: the canonical γ for any μ and V. |
 | `logtangent` | the smooth shape coordinates: `LtFrame`, `covariance`, `s_from_covariance`, `loglik_lt`, `loglik_lt_grad`, `loglik_lt_hess` (exact). |
-| `penalized::PenalizedEsag` | Project 3: `Method::{Isotropy, EigenGap, Drivers, PaperLasso, PaperGroupLasso}`, `Weighting::{Plain, Adaptive, RoC}`, `LambdaGrid`, `Selection::{Bic, Aic, CrossValidation}`; `fit` returns a `PenalizedPath` (per-λ fits, criterion, selected point, relaxed refit). `PenalizedEsag::paper("RoC-LASSO")` etc. preset the paper's methods. |
+| `penalized::PenalizedEsag` | the LASSO family: `Penalty::{Lasso, GroupLasso, SparseGroupLasso, EigenGap}` × `Target::{Slopes, MeanSlopes, ShapeSlopes, Shape}` × `Grouping::{Covariate, CovariatePart, Parameter, All, GammaGroups, Custom}` × `Weighting::{Plain, Adaptive(r), RoC}`; presets `lasso()`, `adaptive_lasso()`, `group_lasso()`, `adaptive_group_lasso()`, `sparse_group_lasso(α)`, `isotropy()`, `eigen_gap()`, `paper(name)`; `LambdaGrid`, `Selection::{Bic, Aic, CrossValidation}`. `fit` returns a `PenalizedPath` (per-λ fits, criterion, selected point, relaxed refit, `summary()`, `path_summary()`). |
 | `distribution::Esag::second_moment` | exact `E[YYᵀ]` (one 1-D integral, ~1 µs). |
 | `optim::prox` | proximal Newton for smooth + group-norm / eigen-gap penalties. |
 
@@ -155,8 +214,9 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 167 tests, plus 12 slow studies,
-diagnostics and benchmarks marked `#[ignore]`.
+All `cargo test --release` suites pass: 171 tests, plus 12 slow studies,
+diagnostics and benchmarks marked `#[ignore]`. The Python package's 20
+pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced
 by running the R code, and their README records the R version, seeds and
@@ -248,6 +308,23 @@ average about 5).
 | hypothesis test, 200 replicates, d = 3, n = 1000 | 811 ms | 382 ms | 106 ms |
 | hypothesis test, 300 replicates, hydrochemistry | 819 ms | 221 ms | 44 ms |
 | `regression_demo`, whole run | 6.3 s | 2.0 s | 0.6 s |
+
+Bootstrap hypothesis tests at B = 500, n = 2000, 5 covariates + const
+(`cargo run --release --example test_bench 3,5,8`; each run computes RoC, D,
+M and LR; the four nulls are isotropy, μ free of x1, shape free of x1, and
+no effect of x5):
+
+| d | log-tangent shape | γ shape |
+|---|---|---|
+| 3 | 0.30–0.34 s | 0.49–0.78 s |
+| 5 | 0.80–1.21 s | 3.1–8.4 s; isotropy 178 s* |
+| 8 | 4.1–5.0 s | 21–74 s |
+
+\* In γ, the isotropy null of a d ≥ 5 regression lies on the singular set
+(§2 of `docs/MATH.md`), so full refits of null replicates do not converge;
+the log-tangent shape has no such problem. The Python session in
+`python/examples/demo.py` (d = 3, γ, five nulls, five penalties) runs each
+test in 1.1–1.8 s and each penalty path in 0.6–1.3 s.
 
 Large regressions (`cargo run --release --example big_fit`, fit with SEs;
 data drawn from the log-tangent model):

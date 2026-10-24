@@ -296,6 +296,18 @@ singular set (§2). `EsagRegressor::with_shape(Shape::LogTangent)` fits it
 (the frame's reference direction defaults to the data's mean direction and
 is stored with the model), and the penalized estimators of §8 use it.
 
+**Same family, different regression.** For one distribution, `γ` and `s`
+are two coordinate systems on the same set of ESAG laws. In a regression
+each is made *linear* in the covariates, `γ_i = Γ x̃_i` or `s_i = S x̃_i`,
+and those are different models for how the shape moves with `x`. They are
+not nested, and the mean model and `μ`'s coefficients are the same in both.
+On data simulated from a `γ`-linear model (d = 3, n = 2000, 5 covariates)
+the `γ` fit has log-likelihood −2312.6 and the log-tangent fit −2381.4.
+Choose between them by AIC/BIC (same number of parameters) or by
+interpretation. The log-tangent model is the default only where the `γ`
+model's likelihood is unreliable to optimise (d ≥ 5 with covariates; the
+Python front end's `shape="auto"`).
+
 **Definition.** Let `p = d − 1`. Fix a reference direction `m ∈ S^{d−1}` and
 an orthonormal basis `E` (`d × p`) of `m⊥` (`LtFrame`; by default `m = e_d`,
 `E = [e_1, …, e_{d−1}]`). For `μ̂ = μ/‖μ‖ ≠ −m` let `R(m→μ̂)` be the minimal
@@ -473,8 +485,8 @@ more. At `S = 0` the decomposition is skipped: the value then costs 1.1 to
 
 Yu & Huang's LASSO-based inference adds a penalty on the shape to the
 negative log-likelihood, on the sum scale of the R code: `−Σℓ_i + λP`, so
-`λ` is the paper's `nλ_n`. `μ` (and the intercept column) is never
-penalized. `docs/project3/SPEC.md` describes exactly what the R code does;
+`λ` is the paper's `nλ_n` (the Python front end's `alpha` is `λ/n`, as in
+statsmodels). The intercept column is penalized only by `Target::Shape`. `docs/project3/SPEC.md` describes exactly what the R code does;
 `docs/project3/METHODOLOGY.md` reviews the method and motivates the
 corrections below.
 
@@ -482,7 +494,7 @@ corrections below.
 pair, sit on the discontinuity set of §2, and `V` is not differentiable at
 any zero group. Both of the paper's simulation truths lie there. The paper's
 six methods are therefore offered as a **reproduction mode**
-(`Method::PaperLasso`, `PaperGroupLasso`; `PenalizedEsag::paper(name)`): the
+(`Solver::PaperReproduction`; `PenalizedEsag::paper(name)`): the
 weights `b_g^r` with `b = 1/|γ̃|`, `r = max(1, ‖μ̃‖/‖μ‖)` inside the
 objective as coded, smoothing continuation (`|x| → √(x²+ε²)`, ε = 1e−2,
 1e−3) with exact gradients from several starts, then the R rule
@@ -492,13 +504,31 @@ R's start the optimum reached depends on the path (the objective often has
 no attained maximum: its supremum is approached on the favourable side of
 a discontinuity), as it does in R across machines.
 
+**The family.** A penalty is `Penalty × Target × Grouping × Weighting`:
+
+* `Penalty`: `Lasso` (`Σ w_j |θ_j|`), `GroupLasso` (`Σ_g w_g ‖θ_g‖₂`,
+  base weight `√|g|`), `SparseGroupLasso{l1_ratio}`
+  (`α Σ w_j|θ_j| + (1 − α) Σ_g w_g ‖θ_g‖₂`, exact prox: soft-threshold,
+  then block soft-threshold), `EigenGap` (below);
+* `Target`: `Slopes` (every non-intercept coefficient; default),
+  `MeanSlopes`, `ShapeSlopes`, `Shape` (shape rows, intercept included);
+* `Grouping`: `Covariate` (a covariate's target coefficients), `CovariatePart`
+  (its mean slopes and its shape slopes separately), `Parameter` (one row
+  of `B`), `All`, `GammaGroups` (the papers' γ groups), `Custom`;
+* `Weighting`: `Plain`, `Adaptive(r)` (`b_g^r`, `b_g = 1/φ_g(θ̃)`), `RoC`.
+
+Slope penalties work in either shape (log-tangent by default). Covariates
+are standardized internally, so the penalty acts on standardized slopes and
+selection does not depend on units; coefficients are reported on the
+original scale.
+
 **Corrected designs (log-tangent shape `S`, §7).**
 
-| method | penalty | zero set |
+| preset | penalty | zero set |
 |---|---|---|
-| `Isotropy` | `w‖s‖₂` over all shape coefficients | isotropic errors (the paper's eq. 4.4) |
-| `EigenGap` (i.i.d.) | `Σ_j w_j (σ_(j+1) − σ_(j))`, sorted eigenvalues of `S` | ties `ξ_j = ξ_{j+1}` anywhere (frame-free partial isotropy) |
-| `Drivers{mean, shape}` (regression) | `Σ_k w_k ‖B_μ[:,k]‖`, `Σ_k w_k ‖B_s[:,k]‖` on standardized covariates | covariate `k` does not move the mean / the shape |
+| `isotropy()` | `w‖s‖₂` over all shape coefficients | isotropic errors (the paper's eq. 4.4) |
+| `eigen_gap()` (i.i.d.) | `Σ_j w_j (σ_(j+1) − σ_(j))`, sorted eigenvalues of `S` | ties `ξ_j = ξ_{j+1}` anywhere (frame-free partial isotropy) |
+| `adaptive_group_lasso().grouping(CovariatePart)` (regression) | `Σ_k w_k ‖B_μ[:,k]‖ + Σ_k w_k ‖B_s[:,k]‖` | covariate `k` does not move the mean / the shape |
 
 The paper's group norm is spectral, `‖γ_(j)‖ = e^{gap_j} − 1`, so `EigenGap`
 is the frame-free version of its group LASSO. Weights are `b_g^r` with

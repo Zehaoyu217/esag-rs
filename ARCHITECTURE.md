@@ -138,10 +138,16 @@ src/optim/         lbfgs.rs (Objective trait, LbfgsConfig, minimize), hessian.rs
 src/error.rs       EsagError (thiserror)
 src/distribution.rs  Esag { mu, gamma } : log_pdf, pdf, sample, covariance, mean_direction, angles, ...
 src/regression.rs  EsagRegressor (config/builder) + EsagRegressorFit (fitted model)
+src/model.rs       statsmodels-style front end: EsagModel::new(endog, exog) → fit() / fit_regularized(); EsagResults
+src/summary.rs     statsmodels-style text tables (header block, per-equation coefficient blocks)
+src/logtangent.rs  smooth shape coordinates (LtFrame, loglik_lt{,_grad,_hess}, eigen_frame)
+src/penalized.rs   LASSO family: Penalty × Target × Grouping × Weighting, λ paths, BIC/AIC/CV, relaxed refits
+src/optim/prox.rs  proximal Newton (GroupNorms, SparseGroupNorms, EigenGaps atoms)
 src/estimator.rs   EsagEstimator (no covariates) + EsagFit; traits Fit/Predict/Score
 src/inference/     gof.rs, regions.rs, tests.rs, bootstrap.rs (residuals live on the fitted model)
 src/preprocessing.rs MinMaxScaler ([1, 2] covariate scaling, as in the papers)
 src/bin/esag.rs    command-line tool
+python/            PyO3 + maturin bindings (`esag._esag`) and the statsmodels-style Python package `esag`
 examples/          regression_demo.rs, …
 tests/             r_parity.rs (fixtures), properties.rs
 ```
@@ -201,9 +207,15 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
   * The `M` statistic uses exact second moments
     (`distribution::second_moment_weights`); `n_mc > 0` keeps the R code's
     Monte Carlo. Bootstrap refits are preconditioned with the original
-    observed information (`EsagRegressor::precondition`), except the full
-    refits of hypothesis tests.
+    observed information (`EsagRegressor::precondition`). The full refits
+    of hypothesis tests are preconditioned with the full model's
+    information at the restricted fit (`precondition_at`), where null
+    replicates end, except on the γ = 0 cone (isotropy in γ).
   * Project 3 (`penalized.rs`, `optim/prox.rs`): proximal Newton over
-    penalty atoms (group norms; eigenvalue gaps of S). The paper's six
-    methods are offered as a reproduction mode in γ. `docs/project3/` holds
+    penalty atoms (group norms, sparse-group mixtures, eigenvalue gaps of
+    S). Penalties compose: `Penalty` (LASSO, group, sparse group, eigen
+    gap) × `Target` × `Grouping` × `Weighting` (plain, adaptive(r), RoC),
+    with presets `lasso()`, `adaptive_lasso()`, `group_lasso()`, … The
+    paper's six methods are offered as a reproduction mode in γ
+    (`PenalizedEsag::paper`). `docs/project3/` holds
     the spec of the R code and the methodology review.

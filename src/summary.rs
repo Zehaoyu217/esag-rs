@@ -51,6 +51,16 @@ pub(crate) fn header(title: &str, left: &[(String, String)], right: &[(String, S
         let cell = |v: &[(String, String)], width: usize| -> String {
             match v.get(i) {
                 Some((k, val)) => {
+                    // values too long for the column are cut with an ellipsis
+                    let room = width.saturating_sub(k.len() + 1);
+                    let val: String = if val.chars().count() > room {
+                        val.chars()
+                            .take(room.saturating_sub(1))
+                            .chain(['…'])
+                            .collect()
+                    } else {
+                        val.clone()
+                    };
                     let pad = width.saturating_sub(k.len() + val.chars().count());
                     format!("{k}{}{val}", " ".repeat(pad.max(1)))
                 }

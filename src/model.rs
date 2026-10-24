@@ -102,9 +102,14 @@ impl EsagModel {
 
     /// Penalized fit along a λ path, λ selected by the estimator's rule
     /// (`PenalizedEsag::lasso()`, `adaptive_lasso()`, `group_lasso()`, …).
-    /// The model's shape and names override the estimator's.
+    /// The model's shape and names override the estimator's (paper presets
+    /// keep the paper's gamma shape).
     pub fn fit_regularized(&self, penalty: PenalizedEsag) -> Result<PenalizedPath> {
-        let mut p = penalty.shape(self.config.shape);
+        let mut p = if penalty.is_paper() {
+            penalty
+        } else {
+            penalty.shape(self.config.shape)
+        };
         if !self.config.fit_intercept {
             return Err(EsagError::Data("penalized fits need the constant".into()));
         }
