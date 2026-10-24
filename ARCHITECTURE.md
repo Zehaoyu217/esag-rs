@@ -183,3 +183,27 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
   `Scalar::DERIV_ORDER`; the inverse map `param::gamma_from_covariance`
   (moment start, canonical γ for intercept-only fits); starts sharing an
   iteration budget; xoshiro256++ streams from `stream_rng(seed, tag, index)`.
+* Large-regression branch:
+  * Fits are bit-for-bit reproducible. Parallel sums run in chunk order,
+    and starts race in lockstep: `optim::lbfgs::Lbfgs` is resumable, and all
+    decisions are taken between 25-iteration rounds. That replaced the
+    timing-dependent shared iteration budget.
+  * The race keeps the highest likelihood. Starts that trail the leader by
+    0.05 per observation, crawl, or are pinned at the singular set (trap
+    monitor) are stopped. Waves of perturbed starts serve as the safety net.
+  * With SEs requested, L-BFGS hands over to Newton steps that reuse one
+    exact Hessian. The Hessian's Kronecker sum is one GEMM per chunk.
+    `η = B·Xᵀ` and the gradient `G·X` are per-chunk matrix products.
+  * `Shape::LogTangent` (`logtangent.rs`): a smooth shape with an exact
+    gradient and Hessian, an opt-in alternative to γ with the same family and
+    parameter count. The frame's reference direction is stored in the fitted
+    model's config.
+  * The `M` statistic uses exact second moments
+    (`distribution::second_moment_weights`); `n_mc > 0` keeps the R code's
+    Monte Carlo. Bootstrap refits are preconditioned with the original
+    observed information (`EsagRegressor::precondition`), except the full
+    refits of hypothesis tests.
+  * Project 3 (`penalized.rs`, `optim/prox.rs`): proximal Newton over
+    penalty atoms (group norms; eigenvalue gaps of S). The paper's six
+    methods are offered as a reproduction mode in γ. `docs/project3/` holds
+    the spec of the R code and the methodology review.
