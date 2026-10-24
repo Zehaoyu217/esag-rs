@@ -246,7 +246,7 @@ Restricted fit (`μ_{0i}`, `γ_{0i}`) versus full fit (`μ_{ai}`):
 ```
 RoC = mean_i ‖μ_{ai}‖ / ‖μ_{0i}‖
 D   = mean_i {2 − cos∠(μ_{0i}, μ_{ai})} ‖μ_{ai}‖ / ‖μ_{0i}‖
-M   = ‖ mean_i ( y_i² − Ê_0 y_i² ) ‖²     (elementwise squares; Ê_0 by Monte Carlo)
+M   = ‖ mean_i ( y_i² − E_0 y_i² ) ‖²     (elementwise squares; E_0 exact, see below)
 LR  = −2 (ℓ_0 − ℓ_a)
 ```
 
@@ -260,11 +260,41 @@ responses are drawn from each observation's own null parameters (the R code
 indexes them by the bootstrap counter), and every `d` is supported (the R
 isotropy and γ-restricted fits hard-code `d = 4`).
 
+**Exact second moments** (`distribution::second_moment_weights`). The R code
+estimates `E_0 y_i²` with Monte-Carlo draws (10⁴ per observation in the
+papers), which adds noise of order `n_mc^{−1/2}` to `M` and dominated the
+cost of a test. They are available in closed form up to one integral. With
+`1/‖x‖² = ∫₀^∞ e^{−t‖x‖²} dt` and `X ~ N(μ, V)`, the Gaussian integral in the
+eigenbasis of `V` (where `μ = ‖μ‖μ̂` has one coordinate, because `μ` is an
+eigenvector) gives `E[YYᵀ] = Σ_j w_j v_j v_jᵀ + w_μ μ̂μ̂ᵀ` with
+
+```
+c(t) = (1+2t)^{−1/2} Π_j (1+2tλ_j)^{−1/2} exp(−t‖μ‖²/(1+2t)),
+w_j  = ∫₀^∞ c(t) λ_j/(1+2tλ_j) dt,
+w_μ  = ∫₀^∞ c(t) [1/(1+2t) + ‖μ‖²/(1+2t)²] dt,      Σ w + w_μ = 1.
+```
+
+After `t = e^s` the integrands are analytic and decay exponentially; the
+factor `exp(−t‖μ‖²/(1+2t))` limits the useful strip to `|Im s| < π/2`, so
+the trapezoid rule converges like `exp(−π²/h)` uniformly in the
+concentration: step 0.35 (0.3 for `‖μ‖ > 20`) gives ≲ 1e−12 with 100–300
+nodes, about 1 µs per observation (1000 Monte-Carlo draws cost ~25 µs).
+`n_mc = 0` selects the exact moments (the default in the examples); the
+published `M` values are reproduced (2.17e−4 vs 2.2e−4, 9.47e−5 vs 9.4e−5).
+
+**Refits.** Bootstrap refits (here, and in the goodness-of-fit and region
+procedures) start near the original optimum, where the observed information
+is nearly the same, so L-BFGS runs in whitened coordinates `θ = θ₀ + Lz`,
+`LLᵀ = I(θ̂)⁻¹`, where the Hessian is close to the identity. Restricted refits
+fall from about 10 to 4 iterations.
+
 ## 7. Log-tangent shape parameterization (smooth option) (`src/logtangent.rs`)
 
 An opt-in alternative to `γ` that maps smoothly onto the same ESAG family,
 for regressions whose likelihood would otherwise have cliffs at the `γ`
-singular set (§2). Nothing else in the crate uses it yet.
+singular set (§2). `EsagRegressor::with_shape(Shape::LogTangent)` fits it
+(the frame's reference direction defaults to the data's mean direction and
+is stored with the model), and the penalized estimators of §8 use it.
 
 **Definition.** Let `p = d − 1`. Fix a reference direction `m ∈ S^{d−1}` and
 an orthonormal basis `E` (`d × p`) of `m⊥` (`LtFrame`; by default `m = e_d`,
@@ -387,3 +417,63 @@ spots that the tests document:
 The eigen-decomposition dominates. At `S = 0` it is skipped: the value then
 costs 1.1 to 1.3 times `loglik_eta`, and the value and gradient 0.8 to 1.2
 times `loglik_eta_grad`.
+
+## 8. Penalized fits (Project 3) (`src/penalized.rs`, `src/optim/prox.rs`)
+
+Yu & Huang's LASSO-based inference adds a penalty on the shape to the
+negative log-likelihood, on the sum scale of the R code: `−Σℓ_i + λP`, so
+`λ` is the paper's `nλ_n`. `μ` (and the intercept column) is never
+penalized. `docs/project3/SPEC.md` describes exactly what the R code does;
+`docs/project3/METHODOLOGY.md` reviews the method and motivates the
+corrections below.
+
+**Why not penalize γ.** Exact zeros of a group `j ≥ 2`, or of a trailing
+pair, sit on the discontinuity set of §2, and `V` is not differentiable at
+any zero group. Both of the paper's simulation truths lie there. The paper's
+six methods are therefore offered as a **reproduction mode**
+(`Method::PaperLasso`, `PaperGroupLasso`; `PenalizedEsag::paper(name)`): the
+weights `b_g^r` with `b = 1/|γ̃|`, `r = max(1, ‖μ̃‖/‖μ‖)` inside the
+objective as coded, smoothing continuation (`|x| → √(x²+ε²)`, ε = 1e−2,
+1e−3) with exact gradients from several starts, then the R rule
+`|x| < 0.01 → 0` and its BIC/AIC/SBIC. On the R fixtures the coded
+objective at R's 18 optima is reproduced to 1e−9 and never decreased; from
+R's start the optimum reached depends on the path (the objective often has
+no attained maximum: its supremum is approached on the favourable side of
+a discontinuity), as it does in R across machines.
+
+**Corrected designs (log-tangent shape `S`, §7).**
+
+| method | penalty | zero set |
+|---|---|---|
+| `Isotropy` | `w‖s‖₂` over all shape coefficients | isotropic errors (the paper's eq. 4.4) |
+| `EigenGap` (i.i.d.) | `Σ_j w_j (σ_(j+1) − σ_(j))`, sorted eigenvalues of `S` | ties `ξ_j = ξ_{j+1}` anywhere (frame-free partial isotropy) |
+| `Drivers{mean, shape}` (regression) | `Σ_k w_k ‖B_μ[:,k]‖`, `Σ_k w_k ‖B_s[:,k]‖` on standardized covariates | covariate `k` does not move the mean / the shape |
+
+The paper's group norm is spectral, `‖γ_(j)‖ = e^{gap_j} − 1`, so `EigenGap`
+is the frame-free version of its group LASSO. Weights are `b_g^r` with
+`b_g = 1/φ_g(θ̃)` from the unpenalized fit: `Plain` (`r = 0`; for `EigenGap`
+the concave baseline `w_j = j(k−j)/k`), `Adaptive` (`r = 1`) or `RoC`
+(`r = max(1, ‖μ̃‖/‖μ‖)`), either solved as a fixed point (freeze `r`, solve,
+update; default) or jointly as in the paper (its `μ`-gradient
+`λ Σ_g φ_g w_g ln(b_g) ∂r/∂μ` pushes `‖μ̂‖` down).
+
+**Solver.** Proximal Newton (`optim::prox`): the model
+`∇h·Δ + ½ΔᵀHΔ + λΣ w_g φ_g` with the exact Hessian (reused while full
+steps match the predicted decrease, and carried along the λ path) is
+minimised by FISTA with restarts using the exact prox of the atoms: block
+soft-thresholding for group norms; eigen-decomposition plus weighted
+isotonic regression (PAVA) for the gaps (exact for any weights, with exact
+ties for infinite weights). Steps are accepted by backtracking on the true
+objective; stationarity is certified by the gradient mapping. Zeros and
+ties are exact, never thresholded.
+
+**Selection.** BIC (default) or AIC at the *relaxed* refit, the
+unpenalized maximum over the selected model, with the model dimension as
+df: all coefficients minus those of zero groups, or for a tie pattern with
+`K` distinct eigenvalues of multiplicities `m_i`,
+`d + (K − 1) + k(k−1)/2 − Σ m_i(m_i−1)/2`. Ties in the criterion go to the
+sparser model, then the smaller λ. Or K-fold cross-validation with shuffled,
+seeded folds of the held-out log-likelihood (the paper's RMSE (5.5) is
+available but ignores `‖μ̂‖`). The relaxed refit at the selected λ is
+returned with standard errors when the selected model is a coefficient
+mask.
