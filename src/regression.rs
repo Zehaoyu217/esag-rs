@@ -16,10 +16,11 @@
 //! ```
 //!
 //! Fitting maximises the joint log-likelihood with L-BFGS using *exact*
-//! gradients (forward-mode automatic differentiation of the per-observation
+//! gradients (a hand-written reverse-mode gradient of the per-observation
 //! log-density, then the chain rule `∂LL/∂B = Σ_i g_i x̃_iᵀ`), parallelised over
-//! observations with rayon. Standard errors come from the observed information
-//! (finite-difference Hessian of the exact gradient).
+//! observations with rayon and bit-for-bit reproducible. Several starts are
+//! raced in lockstep (see `docs/MATH.md`, "Starts"). Standard errors come from
+//! the exact observed information.
 
 use crate::dims;
 use crate::distribution::{Esag, residual_q};

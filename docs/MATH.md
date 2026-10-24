@@ -107,15 +107,33 @@ equivalences exist. Compare fitted distributions (`μ_i`, `V_i`) rather than
 raw `γ` coefficients, and use the bootstrap for uncertainty, as the papers
 recommend.
 
-**Singular set.** Where the trailing coordinates of a group vanish, for
-example `(γ_4, γ_5) = 0` with `γ_3 ≠ 0` for `d = 4`, the angle
+**Singular set.** Where the trailing coordinates of a group `j ≥ 2`
+vanish, for example `(γ_4, γ_5) = 0` with `γ_3 ≠ 0` for `d = 4`, the angle
 `θ = atan2(γ_5, γ_4)` is undefined but still rotates `V`. So `γ ↦ V` is
 discontinuous on this codimension-2 set (Yu & Huang 2024, Appendix B), and
-gradients blow up near it. An optimiser started badly can be drawn towards
-it and stop with a huge gradient and a poor likelihood. `esag` detects this
-with the gradient check (`MAX_MEAN_GRADIENT`). The default `Init::Auto` then
-falls back to its other start or to random restarts, and warm-started refits
-retry from the R-style start.
+gradients blow up near it. The set also contains every point where a
+*whole* group `j ≥ 2` vanishes while another group does not: `K_j = 1` ties
+only `λ_j = λ_{j+1}`, but the group's undefined angles still rotate
+coordinates `1..j+1`, which carry unequal eigenvalues. Approaching such a
+point from different directions gives limits of `V` that differ by O(1)
+however close one gets (measured: 0.27 for group 2 and 0.81 for group 3 at
+`d = 5`, flat for ε = 1e−3 … 1e−9; group 1 and `γ = 0` as a whole are
+continuous). `param::singular_set_tests` and the R script
+`reference/checks/gamma_discontinuity.R`, which uses the original R
+functions, document this. Two consequences:
+
+* **Penalised fits (Project 3).** Both simulation truths of the LASSO paper
+  lie on the set: `γ_(4) = (0, 3, 2, 0, 0)` in the first experiment (nudging
+  its trailing pair by 1e−9 changes `V` by 4.6), and `γ_(2..4) = 0` in the
+  second (nudging them by 1e−9 changes `V` by 0.8–1.0). A penalty that sets
+  a group `j ≥ 2`, or its trailing pair, exactly to zero puts the estimate
+  where `V` is defined only by the convention `atan2(0, 0) = 0`. Penalties
+  whose zero set is all of `γ`, or group 1, are unaffected.
+* **Regression.** With `γ_i = Γ x̃_i`, observations whose `γ_i` lie near the
+  set make `ℓ(B)` jump. At `d ≥ 7` with five or six covariates the
+  likelihood then has many cliffs and local maxima, and L-BFGS can stall
+  against a cliff with a huge gradient (one observation pinned at
+  `‖(γ_{n−1}, γ_n)‖ ≈ 1e−12`). See "Starts" below for how fitting copes.
 
 ## 3. Regression (`src/regression.rs`)
 
@@ -127,37 +145,63 @@ per design column.
 **Fitting.** `esag` maximises `ℓ(B) = Σ_i log f(y_i; B x̃_i)` with L-BFGS
 (`src/optim/lbfgs.rs`). The line search is strong Wolfe with Hager–Zhang
 approximate-Wolfe acceptance near the optimum. The gradient is **exact**:
-the per-observation log-density is generic over a `Scalar` type, and
-evaluating it with forward-mode dual numbers `Dual<N>`, `N = dim η`, gives
-`g_i = ∂ log f/∂η` in one pass. Then `∂ℓ/∂B = Σ_i g_i x̃_iᵀ`, computed in
+`g_i = ∂ log f/∂η` comes from the hand-written reverse-mode kernel
+(`src/adjoint.rs`; the forward-mode dual-number version is kept as the
+test reference). Then `∂ℓ/∂B = Σ_i g_i x̃_iᵀ`, computed in
 parallel over observations. The R code uses `optim(method = "BFGS")` with
 central finite differences of step 1e-3, which costs `2·dim(B)` likelihood
 evaluations per gradient.
 
-**Starts.** By default `esag` runs two starts in parallel and keeps the
-better fit:
+**Evaluation.** Per chunk of 64 observations, `η = B X_cᵀ` and the
+gradient `G X_c` are matrix products; the per-observation kernel is the
+reverse-mode gradient above. Chunk results are summed in chunk order, so
+the likelihood, and therefore every fit, is bit-for-bit reproducible
+whatever the number of threads.
+
+**Starts.** By default (`Init::Auto`) `esag` races two starts:
 
 * a moment start: `μ` along the mean resultant, with
   `‖μ‖ = (Π σ_j)^{−1/(2(d−1))}` from the eigenvalues of the tangent scatter
   `S ≈ V/‖μ‖²`, and `γ` from the shape of `S` via the inverse map;
 * the R code's start: `μ` coefficients 1, `γ` ≈ 0.
 
-The starts share an iteration budget. When one converges after `N`
-iterations, the other may run to at most `max(2N, N + 50)` iterations in
-total. A start that converges at a comparable pace can still win, which
-matters because regressions have genuine local maxima. A start trapped near
-the singular set below is cut off. If neither start passes the convergence
-check (the optimiser converged *and* the mean per-observation gradient is
-≤ 1e-3), the fit retries from random perturbations. The L-BFGS memory
-defaults to the number of free parameters, clamped to [10, 100]; with less
-memory than parameters, convergence is 2 to 5 times slower.
+The race runs in lockstep: every start advances 25 L-BFGS iterations per
+round (in parallel), and all decisions are taken between rounds, so they do
+not depend on thread timing.
+
+* When a start converges after `N` iterations, the others stop at
+  `max(2N, N + 50)` iterations unless they already beat its likelihood.
+* After 100 iterations, a start trailing the leader by more than 0.05
+  log-likelihood units per observation is stopped (a much worse basin).
+* A start that gains less than 1e−3 per observation over 100 iterations
+  while its gradient is still more than 10× the convergence threshold is
+  stopped (crawling against a cliff).
+* A start whose largest per-observation gradient stays above 1e5 times the
+  median for 25 evaluations is stopped (an observation pinned at the
+  singular set; healthy fits stay below ~10²).
+
+The winner is the start with the highest likelihood; a converged start wins
+only ties. A start counts as converged when the optimiser converged *and*
+the mean per-observation gradient is ≤ 1e−3. If the winner has not
+converged, up to two waves of four randomly perturbed starts are raced (600
+iterations each; slope perturbations are divided by each covariate's root
+mean square). A fit that still has not converged is returned with
+`converged = false`: its likelihood is the highest found, but it sits on a
+cliff of the parameterization, so standard errors there are not meaningful.
+The L-BFGS memory defaults to the number of free parameters, clamped to
+[10, 200].
 
 **Standard errors.** `esag` reports the inverse observed information. It is
 assembled as `Σ_i (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`, with per-observation Hessians from
 second-order dual numbers (`hdual`) at d = 3, and from central differences
 of the exact gradient for d ≥ 4. The two agree to about 1e-8, and the
-differences are faster there. Up to three simplified Newton steps reuse this
-Hessian to polish the L-BFGS optimum to ‖∇ℓ‖ ≈ 1e-10. Intercept-only fits
+differences are faster there. The Kronecker sum is one matrix product per
+chunk over the unique entries (`x_{j1}x_{j2}`, `j1 ≤ j2`, times
+`H_i[k1,k2]`, `k1 ≤ k2`). When standard errors are requested, L-BFGS hands
+over once the mean gradient per observation is below 1e−4, and up to eight
+simplified Newton steps reuse this one Hessian to polish the optimum to
+‖∇ℓ‖ ≈ 1e-10 (if the Hessian is not negative definite there, L-BFGS
+finishes at full tolerance first). Intercept-only fits
 report the canonical γ of their fitted V. Yu & Huang show this can be
 unreliable near `γ = 0`, where the likelihood is non-smooth, and for `γ`
 generally because of equivalence. `inference::bootstrap_coef` gives pairs
