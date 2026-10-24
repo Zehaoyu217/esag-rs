@@ -14,7 +14,7 @@
 //! parameter matrix with the bootstrap counter), and every `d` is supported.
 
 use super::refit_config;
-use crate::distribution::second_moment_diag_from_frame;
+use crate::distribution::{second_moment_diag_from_frame, second_moment_diag_into};
 use crate::error::{EsagError, Result};
 use crate::regression::{
     EsagRegressorFit, Shape, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
@@ -235,17 +235,31 @@ fn moment_stat(
         let eta = fit0.linear_predictor(x)?;
         let bd = eta.ncols();
         let lt = fit0.lt_frame();
+        if !parallel {
+            // one replicate per thread: accumulate in place, in index order
+            // (the same sums as the parallel branch)
+            let (mut row, mut ey2, mut w) = (vec![0.0; bd], vec![0.0; d], vec![0.0; d - 1]);
+            let mut sums = vec![0.0; d];
+            for i in 0..n {
+                for (k, v) in row.iter_mut().enumerate() {
+                    *v = eta[(i, k)];
+                }
+                let frame = fit0.frame_at(&row, lt.as_ref());
+                second_moment_diag_into(&frame, &mut ey2, &mut w);
+                for k in 0..d {
+                    sums[k] += y[(i, k)].powi(2) - ey2[k];
+                }
+            }
+            let nf = n as f64;
+            return Ok(sums.iter().map(|s| (s / nf) * (s / nf)).sum());
+        }
         let one = |i: usize| -> Vec<f64> {
             let row: Vec<f64> = (0..bd).map(|k| eta[(i, k)]).collect();
             let frame = fit0.frame_at(&row, lt.as_ref());
             let ey2 = second_moment_diag_from_frame(&frame);
             (0..d).map(|k| y[(i, k)].powi(2) - ey2[k]).collect()
         };
-        if parallel {
-            (0..n).into_par_iter().with_min_len(64).map(one).collect()
-        } else {
-            (0..n).map(one).collect()
-        }
+        (0..n).into_par_iter().with_min_len(64).map(one).collect()
     } else {
         let dists = fit0.predict_distribution(x)?;
         dists

@@ -277,16 +277,58 @@ w_μ  = ∫₀^∞ c(t) [1/(1+2t) + ‖μ‖²/(1+2t)²] dt,      Σ w + w_μ = 
 After `t = e^s` the integrands are analytic and decay exponentially; the
 factor `exp(−t‖μ‖²/(1+2t))` limits the useful strip to `|Im s| < π/2`, so
 the trapezoid rule converges like `exp(−π²/h)` uniformly in the
-concentration: step 0.35 (0.3 for `‖μ‖ > 20`) gives ≲ 1e−12 with 100–300
-nodes, about 1 µs per observation (1000 Monte-Carlo draws cost ~25 µs).
+concentration: step 0.35 (0.3 for `‖μ‖ > 20`) gives ≲ 1e−12.
+
+Most of a plain trapezoid sum is spent in the tails: at `t → 0` the
+integrands are constant in `t`, so in `s` they decay only like `e^s` (about
+60 nodes from `s ≈ −32`), and at `t → ∞` like `e^{−sd/2}` (about 70 more at
+d = 3). Both tails of the *infinite* trapezoid sum are evaluated in closed
+form instead, which keeps its accuracy:
+
+* left, nodes `t_L e^{−kh}` with `t_L K = 10⁻⁴` (`K = max(1 + ‖μ‖² + Σλ,
+  2λ_max, 2)`): with `F(t) = F₀ + F₁t + F₂t² + O(t³)`,
+  `h Σ_{k≥1} F(t_k) t_k = h Σ_m F_m t_L^{m+1} q^{m+1}/(1 − q^{m+1})`, `q = e^{−h}`,
+  with `F₀, F₁, F₂` from `c(t) = 1 − A₁t + (A₁²/2 + A₂)t² + O(t³)`,
+  `A₁ = 1 + ‖μ‖² + Σλ`, `A₂ = 1 + 2‖μ‖² + Σλ²`. The omitted terms are
+  below `(t_L K)⁴/4 ≈ 2.5e−17` relative.
+* right, in `u = 1/(2t)`: `t·c(t)·g(t) = ½ (2t)^{−d/2} (Πλ)^{−1/2}
+  e^{−‖μ‖²/2} G(u)` with `G` analytic at 0 (radius `min(1, λ_min)`): `ln G`
+  has the explicit series `Σ_m (−1)^{m+1} u^m [‖μ‖²/2 − 1/(2m) −
+  Σ_j λ_j^{−m}/(2m)]` plus the series of the weight factor, so the nodes
+  beyond `u ≤ 0.02 min(1, λ_min, 2/‖μ‖²)` sum to
+  `Σ_m G_m u^m r_m/(1 − r_m)`, `r_m = e^{−h(d/2 + m)}`, to order 8 (omitted
+  terms below `0.02⁹`). For `‖μ‖² ≥ 80` the right tail is below `e^{−40}`
+  and is cut instead.
+
+About 50–100 nodes remain. The nodes are stepped by `t ← t e^h`, so a node
+costs one `exp`. A call takes 0.3–0.6 µs (1000 Monte-Carlo draws cost
+~25 µs), and the result agrees with the plain trapezoid rule to 3e−12 over
+d = 3–10, `‖μ‖` up to 80 and eigenvalue ratios up to e⁹.
 `n_mc = 0` selects the exact moments (the default in the examples); the
 published `M` values are reproduced (2.17e−4 vs 2.2e−4, 9.47e−5 vs 9.4e−5).
 
 **Refits.** Bootstrap refits (here, and in the goodness-of-fit and region
 procedures) start near the original optimum, where the observed information
 is nearly the same, so L-BFGS runs in whitened coordinates `θ = θ₀ + Lz`,
-`LLᵀ = I(θ̂)⁻¹`, where the Hessian is close to the identity. Restricted refits
-fall from about 10 to 4 iterations.
+`LLᵀ = I(θ̂)⁻¹`, where the Hessian is close to the identity. Three details
+follow from that scaling:
+
+* the first trial step is 1 (a Newton step), not `min(1, 1/‖g‖₁)`;
+* a refit stops once the predicted remaining gain `½‖g_z‖²` is below 1e−6,
+  so every coefficient is within about 0.0014 standard errors of its
+  maximum and the log-likelihood within 1e−6. That is far below the
+  bootstrap's own noise. Against the 1e−6 gradient tolerance of a fit, it
+  moves no replicate across an observed statistic, and it changes RoC and D
+  replicates by ≤ 2% and M by ≤ 0.4% of their bootstrap SDs, and LR by
+  ≤ 1e−6;
+* the θ-gradient at the end is `L⁻ᵀ g_z`, a triangular solve, not another
+  evaluation.
+
+A refit then needs about 6 likelihood evaluations at d = 3 and 10 at d = 5
+(n = 2000, 5 covariates), against 11 and 17–19 before. The whitened Hessian
+at a replicate's own maximum has eigenvalues in about `(1 ± √(k/n))²` (k
+parameters). That is sampling variation of the information, not a defect of
+the preconditioner, and it is why L-BFGS still takes several iterations.
 
 ## 7. Log-tangent shape parameterization (smooth option) (`src/logtangent.rs`)
 

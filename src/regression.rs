@@ -600,18 +600,33 @@ impl EsagRegressor {
                     theta0: x0.clone(),
                     l,
                 };
-                let rz = minimize(&w, &vec![0.0; free.len()], &cfg);
-                // back to θ, with the θ-gradient for the convergence check
+                // whitened with the inverse information, the Hessian is near
+                // I: start with the Newton step, and stop once the predicted
+                // remaining gain ½‖g_z‖² is below REFIT_DECREMENT
+                let wcfg = LbfgsConfig {
+                    unit_scale: true,
+                    tol_decrement: REFIT_DECREMENT,
+                    ..cfg
+                };
+                let rz = minimize(&w, &vec![0.0; free.len()], &wcfg);
+                // back to θ; g_z = Lᵀ g_θ gives the θ-gradient without
+                // another evaluation
                 let x = w.theta(&rz.x);
-                let mut grad = vec![0.0; x.len()];
-                let f = obj.value_and_gradient(&x, &mut grad);
+                let grad: Vec<f64> = l
+                    .tr_solve_lower_triangular(&DVector::from_column_slice(&rz.grad))
+                    .map(|g| g.iter().copied().collect())
+                    .unwrap_or_else(|| {
+                        let mut g = vec![0.0; x.len()];
+                        obj.value_and_gradient(&x, &mut g);
+                        g
+                    });
                 OptimResult {
                     grad_norm_inf: grad.iter().fold(0.0f64, |m, v| m.max(v.abs())),
                     x,
-                    f,
+                    f: rz.f,
                     grad,
                     n_iter: rz.n_iter,
-                    n_fev: rz.n_fev + 1,
+                    n_fev: rz.n_fev,
                     status: rz.status,
                 }
             }
@@ -1212,6 +1227,11 @@ pub(crate) fn precondition_from_cov(cov: &DMatrix<f64>) -> Option<Arc<DMatrix<f6
 /// a start pinned at a singular point of the gamma parameterization reaches
 /// 10⁴–10¹² and does not recover.
 const TRAP_RATIO: f64 = 1e5;
+/// Stopping rule of whitened (bootstrap) refits: the predicted remaining
+/// log-likelihood gain `½‖g_z‖²` (whitened with the inverse information).
+/// At 1e-6 every coefficient is within ~0.0014 standard errors of the
+/// maximum and the log-likelihood within 1e-6, far below bootstrap noise.
+const REFIT_DECREMENT: f64 = 1e-6;
 /// Consecutive trapped evaluations after which a start is abandoned.
 const TRAP_STREAK: usize = 25;
 

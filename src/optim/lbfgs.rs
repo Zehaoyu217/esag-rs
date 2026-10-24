@@ -21,7 +21,9 @@
 //!   Alg. 3.6 zoom) with safeguarded cubic-Hermite / quadratic interpolation
 //!   and bisection fallback. The initial trial step is 1 once curvature
 //!   information is available and `min(1, 1/‖g‖₁)` on steepest-descent steps
-//!   (the first iteration and after a memory reset). A non-finite trial value
+//!   (the first iteration and after a memory reset), or 1 there too for a
+//!   problem scaled so that its Hessian is near the identity
+//!   ([`LbfgsConfig::unit_scale`]: the first step is then a Newton step). A non-finite trial value
 //!   or gradient is treated as "step too long" and the step is shrunk. If the
 //!   curvature condition cannot be met within `max_ls_iter` evaluations, the
 //!   best point found that satisfies the sufficient-decrease (Armijo) condition
@@ -189,6 +191,15 @@ pub struct LbfgsConfig {
     pub c2: f64,
     /// Maximum number of objective evaluations per line search. Default 40.
     pub max_ls_iter: usize,
+    /// The problem is scaled so that its Hessian is near the identity (e.g.
+    /// whitened with the inverse observed information): the first trial step
+    /// is 1 instead of `min(1, 1/‖g‖₁)`. Default `false`.
+    pub unit_scale: bool,
+    /// Newton-decrement tolerance for a `unit_scale` problem: also stop with
+    /// [`Status::GradientConverged`] once `½‖∇f‖₂² ≤ tol_decrement`, the
+    /// remaining decrease `½ gᵀH⁻¹g` predicted with `H = I`. Default `0.0`
+    /// (off).
+    pub tol_decrement: f64,
     /// Print one line per iteration to stderr. Default `false`.
     pub verbose: bool,
     /// Optional shared, dynamically lowerable iteration limit: the solver
@@ -211,6 +222,8 @@ impl Default for LbfgsConfig {
             c1: 1e-4,
             c2: 0.9,
             max_ls_iter: 40,
+            unit_scale: false,
+            tol_decrement: 0.0,
             verbose: false,
             iter_budget: None,
         }
@@ -787,7 +800,10 @@ impl<'a> Lbfgs<'a> {
         while self.status.is_none() {
             // --- termination tests at the current iterate --------------------
             let gnorm = norm_inf(&self.g);
-            if gnorm <= cfg.tol_grad * norm_inf(&self.x).max(1.0) || gnorm <= cfg.tol_grad_abs {
+            if gnorm <= cfg.tol_grad * norm_inf(&self.x).max(1.0)
+                || gnorm <= cfg.tol_grad_abs
+                || 0.5 * dot(&self.g, &self.g) <= cfg.tol_decrement
+            {
                 self.status = Some(Status::GradientConverged);
                 break;
             }
@@ -842,7 +858,7 @@ impl<'a> Lbfgs<'a> {
             dphi0 = -dot(g, g);
         }
         let steepest_step = (1.0 / norm_1(g)).min(1.0);
-        let alpha_init = if self.mem.is_empty() {
+        let alpha_init = if self.mem.is_empty() && !cfg.unit_scale {
             steepest_step
         } else {
             1.0

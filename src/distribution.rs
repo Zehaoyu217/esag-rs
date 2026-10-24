@@ -421,9 +421,18 @@ mod sampler_tests {
 
 /// `E[Y_k²]` from an eigen-frame of `V`.
 pub(crate) fn second_moment_diag_from_frame(frame: &Frame<f64>) -> Vec<f64> {
+    let mut out = vec![0.0; frame.d];
+    let mut w = vec![0.0; frame.d - 1];
+    second_moment_diag_into(frame, &mut out, &mut w);
+    out
+}
+
+/// [`second_moment_diag_from_frame`] into `out` (length `d`), with `w`
+/// (length `d − 1`) as scratch.
+pub(crate) fn second_moment_diag_into(frame: &Frame<f64>, out: &mut [f64], w: &mut [f64]) {
     let d = frame.d;
-    let (w, w_mu) = second_moment_weights(&frame.lambda, frame.mu_norm);
-    let mut out = vec![0.0; d];
+    let w_mu = second_moment_weights_into(&frame.lambda, frame.mu_norm, w);
+    out.iter_mut().for_each(|v| *v = 0.0);
     for j in 0..d {
         let (v, wj) = if j + 1 < d {
             (frame.col(j), w[j])
@@ -434,16 +443,23 @@ pub(crate) fn second_moment_diag_from_frame(frame: &Frame<f64>) -> Vec<f64> {
             out[k] += wj * v[k] * v[k];
         }
     }
-    out
 }
 
 /// Step of the trapezoid rule in `s = ln t` used by [`second_moment_weights`].
 const MOMENT_STEP: f64 = 0.35;
-/// Start of the grid in `s`, shifted by `−ln(1 + ‖μ‖² + Σλ)` (the part below
-/// then contributes less than `e^{−32}`).
-const MOMENT_S_START: f64 = -32.0;
 /// End of the grid in `s` if the terms have not become negligible earlier.
 const MOMENT_S_END: f64 = 60.0;
+/// The trapezoid nodes with `t·K ≤ MOMENT_LEFT_KT` (`K` bounds the scales of
+/// the integrands at `t → 0`) are summed in closed form from the Taylor
+/// series of the integrands to second order; the omitted terms are below
+/// `MOMENT_LEFT_KT⁴/4` relative.
+const MOMENT_LEFT_KT: f64 = 1e-4;
+/// The nodes with `u = 1/(2t) ≤ MOMENT_RIGHT_U · min(1, λ_min, 2/‖μ‖²)` are
+/// summed in closed form from the series of the integrands in `u` to order
+/// [`MOMENT_RIGHT_ORDER`]; the omitted terms are below
+/// `MOMENT_RIGHT_U^(order+1)` relative.
+const MOMENT_RIGHT_U: f64 = 0.02;
+const MOMENT_RIGHT_ORDER: usize = 8;
 
 /// Eigen-weights of the exact second moment of `Y = X/‖X‖`,
 /// `X ~ N(μ, V)`, `V = Σ_j λ_j v_j v_jᵀ + μ̂μ̂ᵀ`:
@@ -462,26 +478,83 @@ const MOMENT_S_END: f64 = 60.0;
 /// both directions. The factor `exp(−t‖μ‖²/(1+2t))` limits the useful strip
 /// of analyticity to `|Im s| < π/2`, so the trapezoid rule converges like
 /// `exp(−π²/h)` whatever the concentration: step 0.35 (0.3 for
-/// `‖μ‖ > 20`) gives ≲ 1e−12, measured up to `‖μ‖ = 80`, with about 100–300
-/// nodes once negligible terms are cut (≈ 1 µs). This replaces the Monte-Carlo moments of the R code, which
-/// carry sampling noise of order `n_mc^{−1/2}` and cost ~25 µs per 1000 draws.
+/// `‖μ‖ > 20`) gives ≲ 1e−12, measured up to `‖μ‖ = 80`.
+///
+/// The infinite trapezoid sum is evaluated with its two tails in closed
+/// form, so only the nodes where the integrands have structure are visited
+/// (about 50–100 instead of 100–300):
+///
+/// * left (`t → 0`): with `F(t) = F₀ + F₁t + F₂t² + O(t³)` the nodes
+///   `t_L e^{−kh}`, `k ≥ 1`, sum to `h Σ_m F_m t_L^{m+1} q^{m+1}/(1 − q^{m+1})`,
+///   `q = e^{−h}`;
+/// * right (`t → ∞`): in `u = 1/(2t)` each integrand times `t` is
+///   `½ (2t)^{−d/2} (Πλ)^{−1/2} e^{−‖μ‖²/2} G(u)` with `G` analytic at 0
+///   (radius `min(1, λ_min)`), so the nodes past the last one sum as
+///   geometric series in the Taylor coefficients of `G`.
+///
+/// This replaces the Monte-Carlo moments of the R code, which carry sampling
+/// noise of order `n_mc^{−1/2}` and cost ~25 µs per 1000 draws.
 pub fn second_moment_weights(lambda: &[f64], mu_norm: f64) -> (Vec<f64>, f64) {
-    let r2 = mu_norm * mu_norm;
     let mut w = vec![0.0; lambda.len()];
-    let mut w_mu = 0.0;
-    let mut total = 0.0;
-    let mut prev = f64::INFINITY;
-    // near t = 0 the integrands total t·(1 + ‖μ‖² + Σλ): start where the
-    // omitted part is below e^{MOMENT_S_START}
-    let scale = 1.0 + r2 + lambda.iter().sum::<f64>();
+    let w_mu = second_moment_weights_into(lambda, mu_norm, &mut w);
+    (w, w_mu)
+}
+
+/// [`second_moment_weights`] into `w` (length `λ.len()`); returns `w_μ`.
+pub fn second_moment_weights_into(lambda: &[f64], mu_norm: f64, w: &mut [f64]) -> f64 {
+    const M: usize = MOMENT_RIGHT_ORDER;
+    let r2 = mu_norm * mu_norm;
+    let d = lambda.len() + 1;
+    let (mut lam_sum, mut lam_sq, mut lam_max, mut lam_min) = (0.0, 0.0, 0.0f64, f64::INFINITY);
+    for &l in lambda {
+        lam_sum += l;
+        lam_sq += l * l;
+        lam_max = lam_max.max(l);
+        lam_min = lam_min.min(l);
+    }
+    let scale = 1.0 + r2 + lam_sum;
     // very concentrated distributions need a slightly finer step for 1e-12
     let h = if mu_norm > 20.0 { 0.3 } else { MOMENT_STEP };
-    let mut s = MOMENT_S_START - scale.ln();
-    let lam_min = lambda.iter().fold(1.0f64, |a, &b| a.min(b));
-    let s_settled = (0.5 / lam_min).ln() + 1.0;
-    while s <= MOMENT_S_END {
-        let t = s.exp();
-        s += h;
+
+    // --- left tail: nodes t_L e^{-kh}, k >= 1 --------------------------------
+    let k_left = scale.max(2.0 * lam_max).max(2.0);
+    let t_left = MOMENT_LEFT_KT / k_left;
+    let q = (-h).exp();
+    // h Σ_k t_k^{m+1} for m = 0, 1, 2
+    let mut geo = [0.0; 3];
+    let (mut tq, mut qm) = (1.0, 1.0);
+    for g in geo.iter_mut() {
+        tq *= t_left;
+        qm *= q;
+        *g = h * tq * qm / (1.0 - qm);
+    }
+    // c(t) = 1 − A₁t + C₂t² + O(t³)
+    let a1 = scale;
+    let c2 = 0.5 * a1 * a1 + 2.0 * r2 + 1.0 + lam_sq;
+    let left = |h0: f64, h1: f64, h2: f64| {
+        geo[0] * h0 + geo[1] * (h1 - a1 * h0) + geo[2] * (h2 - a1 * h1 + c2 * h0)
+    };
+    let mut w_mu = left(1.0 + r2, -(2.0 + 4.0 * r2), 4.0 + 12.0 * r2);
+    for (wj, &l) in w.iter_mut().zip(lambda) {
+        *wj = left(l, -2.0 * l * l, 4.0 * l * l * l);
+    }
+    let mut total = w_mu + w.iter().sum::<f64>();
+
+    // --- middle: nodes from s_L ----------------------------------------------
+    // the right tail is summed in closed form unless e^{-‖μ‖²/2} makes it
+    // negligible anyway (or it starts beyond the grid)
+    let u_right = MOMENT_RIGHT_U
+        * lam_min
+            .min(1.0)
+            .min(if r2 > 0.0 { 2.0 / r2 } else { f64::INFINITY });
+    let s_right = (0.5 / u_right).ln();
+    let right_tail = r2 < 80.0 && s_right < MOMENT_S_END;
+    let s_settled = (0.5 / lam_min.min(1.0)).ln() + 1.0;
+    let eh = h.exp();
+    let mut s = t_left.ln();
+    let mut t = t_left;
+    let mut prev = f64::INFINITY;
+    loop {
         let a = 1.0 + 2.0 * t;
         let mut prod = a;
         for &l in lambda {
@@ -497,19 +570,162 @@ pub fn second_moment_weights(lambda: &[f64], mu_norm: f64) -> (Vec<f64>, f64) {
             term += v;
         }
         total += term;
-        // past the peak, past every eigen-scale 1/(2λ_j), and negligible:
-        // the rest decays geometrically
-        if term < prev && s > s_settled && term < 1e-17 * total {
+        if right_tail {
+            if s >= s_right {
+                break;
+            }
+        } else if (term < prev && s > s_settled && term < 1e-17 * total) || s > MOMENT_S_END {
+            // past the peak, past every eigen-scale 1/(2λ_j), and negligible:
+            // the rest decays geometrically
             break;
         }
         prev = term;
+        s += h;
+        t *= eh;
     }
-    (w, w_mu)
+    if !right_tail {
+        return w_mu;
+    }
+
+    // --- right tail: nodes t e^{kh}, k >= 1 (t: the last node) ----------------
+    // G(u) = E(u)·g(u), ln E = r²u/(2(1+u)) − ½ln(1+u) − ½Σ ln(1+u/λ_j)
+    let u = 0.5 / t;
+    let mut inv_pow = [0.0; M + 1]; // Σ_j λ_j^{−m}
+    for &l in lambda {
+        let (inv, mut p) = (1.0 / l, 1.0);
+        for v in inv_pow.iter_mut().skip(1) {
+            p *= inv;
+            *v += p;
+        }
+    }
+    let mut ln_e = [0.0; M + 1];
+    for m in 1..=M {
+        let sg = if m % 2 == 1 { 1.0 } else { -1.0 };
+        ln_e[m] = sg * (0.5 * r2 - 0.5 / m as f64 - 0.5 * inv_pow[m] / m as f64);
+    }
+    let mut e = [0.0; M + 1];
+    e[0] = 1.0;
+    for m in 1..=M {
+        e[m] = (1..=m).map(|k| k as f64 * ln_e[k] * e[m - k]).sum::<f64>() / m as f64;
+    }
+    // h Σ_k u_k^m (2t_k)^{−d/2} relative to (2t)^{−d/2}: u^m r_m/(1 − r_m)
+    let mut tail = [0.0; M + 1];
+    let mut um = 1.0;
+    for (m, v) in tail.iter_mut().enumerate() {
+        let rm = (-h * (0.5 * d as f64 + m as f64)).exp();
+        *v = h * um * rm / (1.0 - rm);
+        um *= u;
+    }
+    let ln_pref = 0.5f64.ln()
+        - 0.5 * d as f64 * (2.0 * t).ln()
+        - 0.5 * lambda.iter().map(|l| l.ln()).sum::<f64>()
+        - 0.5 * r2;
+    let pref = ln_pref.exp();
+    // w_μ: g(u) = 1/(1+u) + r²u/(1+u)²
+    let mut acc = 0.0;
+    for m in 0..=M {
+        let g = |k: usize| {
+            let sg = if k.is_multiple_of(2) { 1.0 } else { -1.0 };
+            sg * (1.0 - r2 * k as f64)
+        };
+        acc += (0..=m).map(|k| e[m - k] * g(k)).sum::<f64>() * tail[m];
+    }
+    w_mu += pref * acc;
+    // w_j: g(u) = 1/(1+u/λ_j)
+    for (wj, &l) in w.iter_mut().zip(lambda) {
+        let ninv = -1.0 / l;
+        let mut acc = 0.0;
+        for m in 0..=M {
+            let mut gk = 1.0;
+            let mut conv = 0.0;
+            for k in 0..=m {
+                conv += e[m - k] * gk;
+                gk *= ninv;
+            }
+            acc += conv * tail[m];
+        }
+        *wj += pref * acc;
+    }
+    w_mu
 }
 
 #[cfg(test)]
 mod second_moment_tests {
     use super::*;
+
+    /// The plain trapezoid rule from `s = −32 − ln(1 + ‖μ‖² + Σλ)` (the
+    /// previous implementation), as a reference.
+    fn trapezoid_reference(lambda: &[f64], mu_norm: f64) -> (Vec<f64>, f64) {
+        let r2 = mu_norm * mu_norm;
+        let mut w = vec![0.0; lambda.len()];
+        let mut w_mu = 0.0;
+        let mut total = 0.0;
+        let mut prev = f64::INFINITY;
+        // near t = 0 the integrands total t·(1 + ‖μ‖² + Σλ): start where the
+        // omitted part is below e^{-32.0}
+        let scale = 1.0 + r2 + lambda.iter().sum::<f64>();
+        // very concentrated distributions need a slightly finer step for 1e-12
+        let h = if mu_norm > 20.0 { 0.3 } else { MOMENT_STEP };
+        let mut s = -32.0 - scale.ln();
+        let lam_min = lambda.iter().fold(1.0f64, |a, &b| a.min(b));
+        let s_settled = (0.5 / lam_min).ln() + 1.0;
+        while s <= MOMENT_S_END {
+            let t = s.exp();
+            s += h;
+            let a = 1.0 + 2.0 * t;
+            let mut prod = a;
+            for &l in lambda {
+                prod *= 1.0 + 2.0 * t * l;
+            }
+            // trapezoid weight h times the Jacobian dt = t ds
+            let c = (-t * r2 / a).exp() / prod.sqrt() * t * h;
+            let mut term = c * (1.0 / a + r2 / (a * a));
+            w_mu += term;
+            for (wj, &l) in w.iter_mut().zip(lambda) {
+                let v = c * l / (1.0 + 2.0 * t * l);
+                *wj += v;
+                term += v;
+            }
+            total += term;
+            // past the peak, past every eigen-scale 1/(2λ_j), and negligible:
+            // the rest decays geometrically
+            if term < prev && s > s_settled && term < 1e-17 * total {
+                break;
+            }
+            prev = term;
+        }
+        (w, w_mu)
+    }
+
+    #[test]
+    fn tail_sums_match_the_plain_trapezoid() {
+        let mut worst = 0.0f64;
+        for d in [3usize, 4, 5, 8, 10] {
+            for &r in &[0.0, 0.3, 1.0, 3.0, 8.0, 12.0, 20.0, 50.0, 80.0] {
+                for (spread, seed) in [(0.0, 1u64), (1.0, 2), (3.0, 3), (6.0, 4), (9.0, 5)] {
+                    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed * 100 + d as u64);
+                    let x: Vec<f64> = (0..d - 1)
+                        .map(|_| {
+                            let z: f64 = StandardNormal.sample(&mut rng);
+                            z * spread / 2.0
+                        })
+                        .collect();
+                    let mean = x.iter().sum::<f64>() / x.len() as f64;
+                    let lam: Vec<f64> = x.iter().map(|v| (v - mean).exp()).collect();
+                    let (w, wm) = second_moment_weights(&lam, r);
+                    let (w0, wm0) = trapezoid_reference(&lam, r);
+                    let err = w
+                        .iter()
+                        .zip(&w0)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold((wm - wm0).abs(), f64::max);
+                    worst = worst.max(err);
+                    assert!(err < 3e-12, "d {d} r {r} lam {lam:?}: {err:e}");
+                }
+            }
+        }
+        assert!(worst > 0.0);
+    }
     use rand::SeedableRng;
 
     #[test]

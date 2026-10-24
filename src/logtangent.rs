@@ -761,15 +761,14 @@ fn check_mu_s(frame: &LtFrame, mu: &[f64], s: &[f64]) -> (usize, usize) {
 pub fn eigen_frame(frame: &LtFrame, mu: &[f64], s: &[f64]) -> crate::frame::Frame<f64> {
     let d = frame.dim();
     let p = d - 1;
-    let sm = s_to_matrix(s, p);
-    let eig = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(p, p, &sm));
+    let (eigenvalues, eigenvectors) = sym_eigen(&s_to_matrix(s, p), p);
     let mut idx: Vec<usize> = (0..p).collect();
-    idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+    idx.sort_by(|&a, &b| eigenvalues[a].total_cmp(&eigenvalues[b]));
     let xi = frame.frame_at(mu);
     let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
     let mut basis = vec![0.0; d * d];
     for (c, &j) in idx.iter().enumerate() {
-        let q = eig.eigenvectors.column(j);
+        let q = eigenvectors.column(j);
         for r in 0..d {
             basis[c * d + r] = (0..p).map(|a| xi[(r, a)] * q[a]).sum();
         }
@@ -784,7 +783,7 @@ pub fn eigen_frame(frame: &LtFrame, mu: &[f64], s: &[f64]) -> crate::frame::Fram
     crate::frame::Frame {
         d,
         mu_norm,
-        lambda: idx.iter().map(|&j| eig.eigenvalues[j].exp()).collect(),
+        lambda: idx.iter().map(|&j| eigenvalues[j].exp()).collect(),
         basis,
     }
 }
