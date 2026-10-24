@@ -18,7 +18,7 @@ use crate::distribution::second_moment_diag_from_frame;
 use crate::error::{EsagError, Result};
 use crate::frame::Frame;
 use crate::regression::{
-    EsagRegressorFit, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
+    EsagRegressorFit, Shape, gamma_restricted_mask, isotropic_mask, mu_restricted_mask,
 };
 use crate::stats::chisq::chisq_sf;
 use nalgebra::DMatrix;
@@ -291,7 +291,17 @@ pub fn hypothesis_test(
             // from the original full MLE) so that LR^(b) is not deflated by a
             // refit stuck below the maximum
             let fa1 = cfg_a.fit_warm(x, &yb, &ba).ok();
-            let fa2 = cfg_a.fit_warm(x, &yb, &fit_full.coef).ok();
+            // the second start guards against the local maxima that the gamma
+            // parameterization creates near its singular set (the cone at
+            // gamma = 0 above all); the log-tangent likelihood is smooth
+            // there, so it is only used if the first refit fails
+            let need_second = fit_full.config.shape == Shape::Gamma
+                || !fa1.as_ref().is_some_and(|f| f.converged);
+            let fa2 = if need_second {
+                cfg_a.fit_warm(x, &yb, &fit_full.coef).ok()
+            } else {
+                None
+            };
             let fa = match (fa1, fa2) {
                 (Some(a), Some(b)) => {
                     if a.log_likelihood >= b.log_likelihood {
