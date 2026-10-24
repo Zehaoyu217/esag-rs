@@ -407,7 +407,11 @@ impl<const N: usize> Scalar for Dual<N> {
     #[inline]
     fn cbrt(self) -> Self {
         let c = self.re.cbrt();
-        let scale = if self.re == 0.0 { 0.0 } else { c / (3.0 * self.re) };
+        let scale = if self.re == 0.0 {
+            0.0
+        } else {
+            c / (3.0 * self.re)
+        };
         self.chain(c, scale)
     }
 

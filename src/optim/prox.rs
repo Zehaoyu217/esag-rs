@@ -498,6 +498,9 @@ fn prox_newton_r<A: PenaltyAtoms>(
         _ => (f.value_grad_hess(&theta, &mut grad, &mut hess), 0usize),
     };
     let mut obj = fs + value(&theta);
+    // positive-definite model Hessian and its largest eigenvalue, recomputed
+    // only with the Hessian
+    let mut model_h: Option<(DMatrix<f64>, f64)> = None;
     let mut n_iter = 0;
     let mut kkt = f64::INFINITY;
     let mut converged = false;
@@ -520,8 +523,13 @@ fn prox_newton_r<A: PenaltyAtoms>(
             break;
         }
         n_iter += 1;
-        let h = positive_definite(&hess, n);
-        let z = solve_model(&theta, &gh, &h, pen, &w, cfg.max_inner);
+        if model_h.is_none() {
+            let h = positive_definite(&hess, n);
+            let l = largest_eigenvalue(&h);
+            model_h = Some((h, l));
+        }
+        let (h, l) = model_h.as_ref().unwrap();
+        let z = solve_model(&theta, &gh, h, *l, pen, &w, cfg.max_inner);
         let delta: Vec<f64> = z.iter().zip(&theta).map(|(a, b)| a - b).collect();
         let pen_now = pen.lambda * weighted_atoms(&pen.atoms, &z, &w)
             - pen.lambda * weighted_atoms(&pen.atoms, &theta, &w);
@@ -565,6 +573,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
             // a stale Hessian may be the problem: refresh and retry
             fs = f.value_grad_hess(&theta, &mut grad, &mut hess);
             since_hessian = 0;
+            model_h = None;
             continue;
         }
         let new_obj = f_cand + value(&cand);
@@ -579,6 +588,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
         } else {
             fs = f.value_grad_hess(&theta, &mut grad, &mut hess);
             since_hessian = 0;
+            model_h = None;
         }
         obj = fs + value(&theta);
     }
@@ -627,6 +637,34 @@ fn gradient_mapping<A: PenaltyAtoms>(theta: &[f64], g: &[f64], pen: &Penalty<A>,
         / tau
 }
 
+/// Largest eigenvalue of a symmetric positive-definite matrix by power
+/// iteration (relative change < 1e-6), with a 2% safety margin (an
+/// over-estimate only shortens FISTA's step).
+fn largest_eigenvalue(h: &DMatrix<f64>) -> f64 {
+    let n = h.nrows();
+    if n <= 8 {
+        return SymmetricEigen::new(h.clone()).eigenvalues.max();
+    }
+    let mut v = DVector::from_fn(n, |i, _| 1.0 + 0.1 * ((i * 7 % 11) as f64));
+    v /= v.norm();
+    let mut lam = 0.0;
+    for _ in 0..200 {
+        let hv = h * &v;
+        let new = v.dot(&hv);
+        let nrm = hv.norm();
+        if nrm == 0.0 {
+            break;
+        }
+        v = hv / nrm;
+        if (new - lam).abs() <= 1e-6 * new.abs() {
+            lam = new;
+            break;
+        }
+        lam = new;
+    }
+    1.02 * lam
+}
+
 /// Symmetrised `H`, shifted by `τ I` if needed so that it is positive
 /// definite (`τ` grows geometrically from `1e-8·max|H_ii|`).
 fn positive_definite(hess: &[f64], n: usize) -> DMatrix<f64> {
@@ -658,16 +696,12 @@ fn solve_model<A: PenaltyAtoms>(
     theta: &[f64],
     g: &[f64],
     h: &DMatrix<f64>,
+    l: f64,
     pen: &Penalty<A>,
     w: &[f64],
     max_inner: usize,
 ) -> Vec<f64> {
-    let l = SymmetricEigen::new(h.clone())
-        .eigenvalues
-        .iter()
-        .fold(0.0f64, |a, &b| a.max(b))
-        .max(1e-300);
-    let step = 1.0 / l;
+    let step = 1.0 / l.max(1e-300);
     let t: Vec<f64> = w.iter().map(|&wg| step * pen.lambda * wg).collect();
     let th = DVector::from_column_slice(theta);
     let gv = DVector::from_column_slice(g);

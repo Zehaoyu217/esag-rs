@@ -1365,42 +1365,6 @@ fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> 
     }
 }
 
-/// Value, gradient and central-difference Hessian (step
-/// `1e-5·max(1, |eta_i|)`, symmetrised) of an exact-gradient function.
-fn fd_hessian(
-    eta: &[f64],
-    grad: &mut [f64],
-    hess: &mut [f64],
-    gradient: impl Fn(&[f64], &mut [f64]) -> f64,
-) -> f64 {
-    let n = eta.len();
-    let f = gradient(eta, grad);
-    let mut e = eta.to_vec();
-    let mut gp = vec![0.0; n];
-    let mut gm = vec![0.0; n];
-    for i in 0..n {
-        let h = 1e-5 * eta[i].abs().max(1.0);
-        let (xp, xm) = (eta[i] + h, eta[i] - h);
-        e[i] = xp;
-        gradient(&e, &mut gp);
-        e[i] = xm;
-        gradient(&e, &mut gm);
-        e[i] = eta[i];
-        let inv = 1.0 / (xp - xm);
-        for j in 0..n {
-            hess[j * n + i] = (gp[j] - gm[j]) * inv;
-        }
-    }
-    for i in 0..n {
-        for j in i + 1..n {
-            let s = 0.5 * (hess[i * n + j] + hess[j * n + i]);
-            hess[i * n + j] = s;
-            hess[j * n + i] = s;
-        }
-    }
-    f
-}
-
 /// Per-observation value, gradient and Hessian in `eta`. Exact second-order
 /// AD for `d = 3` (0.36 µs); for `d ≥ 4` central differences of the exact
 /// reverse-mode gradient, which are faster (d = 4: 1.25 vs 1.9 µs; d = 6:
@@ -1408,9 +1372,8 @@ fn fd_hessian(
 #[inline]
 fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
     if let Some(fr) = &data.lt {
-        return fd_hessian(eta, g, h, |e, gr| {
-            crate::logtangent::loglik_lt_grad(fr, e, y, gr)
-        });
+        // exact (one eigen-decomposition; ~2.7× the gradient at d = 8)
+        return crate::logtangent::loglik_lt_hess(fr, eta, y, g, h);
     }
     if eta.len() == 5 {
         crate::hdual::loglik_eta_hess(eta, y, g, h)

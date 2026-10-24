@@ -299,8 +299,8 @@ pub fn hypothesis_test(
             // parameterization creates near its singular set (the cone at
             // gamma = 0 above all); the log-tangent likelihood is smooth
             // there, so it is only used if the first refit fails
-            let need_second = fit_full.config.shape == Shape::Gamma
-                || !fa1.as_ref().is_some_and(|f| f.converged);
+            let need_second =
+                fit_full.config.shape == Shape::Gamma || !fa1.as_ref().is_some_and(|f| f.converged);
             let fa2 = if need_second {
                 cfg_a.fit_warm(x, &yb, &fit_full.coef).ok()
             } else {

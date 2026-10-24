@@ -187,16 +187,8 @@ fn main() {
         let hfit = EsagRegressor::new().fit(&hx, &hy).unwrap();
         let t = median(3, || {
             black_box(
-                hypothesis_test(
-                    &hfit,
-                    &hx,
-                    &hy,
-                    Restriction::GammaOfFeature(0),
-                    300,
-                    0,
-                    4,
-                )
-                .unwrap(),
+                hypothesis_test(&hfit, &hx, &hy, Restriction::GammaOfFeature(0), 300, 0, 4)
+                    .unwrap(),
             );
         });
         line("hypothesis test hydrochem d=4, 300 reps, exact M", t);
