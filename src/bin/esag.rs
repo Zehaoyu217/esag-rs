@@ -7,13 +7,16 @@
 //! esag predict model.json data.csv --x x1 --out pred.csv
 //! esag gof model.json data.csv --y y1,y2,y3 --x x1 --boot 200
 //! esag test model.json data.csv --y y1,y2,y3 --x x1 --null isotropy --boot 200
+//! esag penalize data.csv --y y1,y2,y3 --x x1,x2 --method drivers
 //! ```
 
 use clap::{Parser, Subcommand, ValueEnum};
 use esag::FastRng;
 use esag::distribution::Esag;
 use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region};
-use esag::regression::{EsagRegressor, EsagRegressorFit};
+use esag::optim::prox::RocMode;
+use esag::penalized::{CvScore, LambdaGrid, Method, PenalizedEsag, Selection, Weighting};
+use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -71,6 +74,51 @@ enum NullKind {
     Feature,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ShapeKind {
+    /// Yu & Huang's gamma (the papers' model)
+    Gamma,
+    /// the smooth log-tangent coordinates (no singular set; recommended for
+    /// regressions with several covariates at d >= 5)
+    LogTangent,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PenaltyKind {
+    /// log-tangent: all shape coefficients as one group (isotropy)
+    Isotropy,
+    /// log-tangent, i.i.d.: gaps between eigenvalues of S (partial isotropy)
+    EigenGap,
+    /// log-tangent regression: per-covariate mean and shape groups
+    Drivers,
+    /// log-tangent regression: per-covariate mean groups only
+    DriversMean,
+    /// log-tangent regression: per-covariate shape groups only
+    DriversShape,
+    /// the paper's LASSO on gamma (reproduction mode, i.i.d.)
+    Lasso,
+    /// the paper's group LASSO on gamma_(j) (reproduction mode, i.i.d.)
+    GroupLasso,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum WeightKind {
+    Plain,
+    Adaptive,
+    /// ratio of concentration, fixed point (i.i.d.)
+    Roc,
+    /// ratio of concentration inside the objective, as in the paper (i.i.d.)
+    RocJoint,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SelectKind {
+    Bic,
+    Aic,
+    /// cross-validated held-out log-likelihood
+    Cv,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Write a simulated d = 3 regression data set (columns x1, y1, y2, y3).
@@ -96,6 +144,9 @@ enum Cmd {
         /// Number of random restarts.
         #[arg(long, default_value_t = 0)]
         restarts: usize,
+        /// Shape parameterization.
+        #[arg(long, value_enum, default_value = "gamma")]
+        shape: ShapeKind,
     },
     /// Predict mean directions (and eigenvalues) for new covariates.
     Predict {
@@ -137,9 +188,32 @@ enum Cmd {
         feature: usize,
         #[arg(long, default_value_t = 200)]
         boot: usize,
-        /// Monte-Carlo draws per observation for the M statistic.
-        #[arg(long, default_value_t = 1000)]
+        /// Monte-Carlo draws per observation for the M statistic (0 = exact
+        /// moments, recommended; the R code uses Monte Carlo).
+        #[arg(long, default_value_t = 0)]
         mc: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
+    /// LASSO-type penalized fit along a lambda path with lambda selection
+    /// (Yu & Huang, Project 3; see docs/MATH.md section 8).
+    Penalize {
+        data: PathBuf,
+        #[arg(long)]
+        y: String,
+        #[arg(long, default_value = "")]
+        x: String,
+        #[arg(long, value_enum)]
+        method: PenaltyKind,
+        #[arg(long, value_enum, default_value = "adaptive")]
+        weights: WeightKind,
+        #[arg(long, value_enum, default_value = "bic")]
+        select: SelectKind,
+        /// Use the paper's grid 0, 0.5, 1, 2, ..., 256 (default: automatic).
+        #[arg(long)]
+        paper_grid: bool,
+        #[arg(long, default_value_t = 10)]
+        folds: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
@@ -259,12 +333,17 @@ fn run() -> Res<()> {
             x,
             model,
             restarts,
+            shape,
         } => {
             let (xm, ym, names) = load_xy(&data, &y, &x)?;
             let t0 = Instant::now();
             let fit = EsagRegressor::new()
                 .with_feature_names(names)
                 .with_restarts(restarts, 0)
+                .with_shape(match shape {
+                    ShapeKind::Gamma => Shape::Gamma,
+                    ShapeKind::LogTangent => Shape::LogTangent,
+                })
                 .fit(&xm, &ym)?;
             outln!("{}", fit.summary());
             outln!("fitted in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
@@ -376,6 +455,87 @@ fn run() -> Res<()> {
                 "{} bootstrap replicates ({} failed), {:.1} s",
                 r.n_boot,
                 r.n_failed,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::Penalize {
+            data,
+            y,
+            x,
+            method,
+            weights,
+            select,
+            paper_grid,
+            folds,
+            seed,
+        } => {
+            let (xm, ym, names) = load_xy(&data, &y, &x)?;
+            let m = match method {
+                PenaltyKind::Isotropy => Method::Isotropy,
+                PenaltyKind::EigenGap => Method::EigenGap,
+                PenaltyKind::Drivers => Method::Drivers {
+                    mean: true,
+                    shape: true,
+                },
+                PenaltyKind::DriversMean => Method::Drivers {
+                    mean: true,
+                    shape: false,
+                },
+                PenaltyKind::DriversShape => Method::Drivers {
+                    mean: false,
+                    shape: true,
+                },
+                PenaltyKind::Lasso => Method::PaperLasso,
+                PenaltyKind::GroupLasso => Method::PaperGroupLasso,
+            };
+            let w = match weights {
+                WeightKind::Plain => Weighting::Plain,
+                WeightKind::Adaptive => Weighting::Adaptive,
+                WeightKind::Roc => Weighting::RoC(RocMode::FixedPoint),
+                WeightKind::RocJoint => Weighting::RoC(RocMode::Joint),
+            };
+            let sel = match select {
+                SelectKind::Bic => Selection::Bic,
+                SelectKind::Aic => Selection::Aic,
+                SelectKind::Cv => Selection::CrossValidation {
+                    folds,
+                    seed,
+                    score: CvScore::LogLikelihood,
+                },
+            };
+            let mut est = PenalizedEsag::new(m).with_weighting(w).with_selection(sel);
+            if paper_grid {
+                est = est.with_grid(LambdaGrid::Paper);
+            }
+            let t0 = Instant::now();
+            let path = est.fit(&xm, &ym)?;
+            outln!("{}", path.summary());
+            if let Method::Drivers { mean, shape } = m {
+                let mut labels = vec![];
+                for nm in &names {
+                    if mean {
+                        labels.push(format!("{nm}.mean"));
+                    }
+                    if shape {
+                        labels.push(format!("{nm}.shape"));
+                    }
+                }
+                let kept: Vec<&String> = labels
+                    .iter()
+                    .zip(&path.best().active)
+                    .filter(|(_, a)| **a)
+                    .map(|(l, _)| l)
+                    .collect();
+                outln!("selected drivers: {kept:?}");
+            }
+            if let Some(r) = &path.relaxed {
+                outln!("relaxed refit at the selected lambda:\n{}", r.summary());
+            } else {
+                outln!("selected coefficients:\n{:.4}", path.best().coef);
+            }
+            outln!(
+                "path of {} lambdas in {:.2} s",
+                path.points.len(),
                 t0.elapsed().as_secs_f64()
             );
         }
