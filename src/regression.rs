@@ -26,14 +26,13 @@ use crate::distribution::{Esag, residual_q};
 use crate::error::{EsagError, Result};
 use crate::frame::Frame;
 use crate::loglik;
-use crate::optim::lbfgs::{LbfgsConfig, Objective, Status, minimize};
+use crate::optim::lbfgs::{Lbfgs, LbfgsConfig, Objective, Status, minimize};
 use crate::stats::normal::norm_sf;
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn default_true() -> bool {
@@ -79,7 +78,7 @@ pub struct EsagRegressor {
     /// Compute the observed-information Hessian (standard errors) (default true).
     pub compute_hessian: bool,
     /// L-BFGS memory. `0` (default) = automatic: the number of free
-    /// parameters, clamped to `[10, 100]`. Memory below the parameter count
+    /// parameters, clamped to `[10, 200]`. Memory below the parameter count
     /// slows convergence badly on ESAG likelihoods (2–5× more iterations).
     pub lbfgs_memory: usize,
     /// Evaluate the likelihood in parallel over observations (default
@@ -253,7 +252,7 @@ impl EsagRegressor {
         }
         let mask = self.resolve_mask(&data)?;
         let free = free_params(&mask);
-        let raw = self.optimize(&data, b0, &free, self.max_iter, None);
+        let raw = self.optimize(&data, b0, &free, self.max_iter);
         if raw.converged || self.max_iter == 0 {
             return self.finalize(&data, raw, mask);
         }
@@ -262,7 +261,7 @@ impl EsagRegressor {
         // check; retry from the R-style start and keep the better fit.
         let mut b1 = self.clone().with_init(Init::RStyle).initial_coef(&data)?;
         zero_fixed(&mut b1, &mask);
-        let alt = self.optimize(&data, &b1, &free, self.max_iter, None);
+        let alt = self.optimize(&data, &b1, &free, self.max_iter);
         let best = if alt.beats(&raw) { alt } else { raw };
         self.finalize(&data, best, mask)
     }
@@ -325,11 +324,14 @@ impl EsagRegressor {
         Ok(b)
     }
 
-    /// Run L-BFGS from every start concurrently and pick the winner with
-    /// [`select_start`]. Starts share an iteration budget: once one converges
-    /// after `N` iterations the others get at most `max(2N, N + 50)` in
-    /// total, so starts trapped near a singular point cannot hold up the
-    /// result.
+    /// Run L-BFGS from every start and return the highest likelihood found.
+    ///
+    /// The starts advance in lockstep, [`RACE_ROUND`] iterations per round
+    /// (in parallel), so every decision below is taken at the same points
+    /// whatever the thread timing, and the result is deterministic. Once a
+    /// start converges after `N` iterations, the others stop at
+    /// `max(2N, N + 50)` iterations, unless they already beat the best
+    /// converged likelihood (a better basin; they continue to `max_iter`).
     fn race(
         &self,
         data: &RegressionData,
@@ -338,13 +340,153 @@ impl EsagRegressor {
         max_iter: usize,
     ) -> RawFit {
         let free = free_params(mask);
-        let budget = Arc::new(AtomicUsize::new(usize::MAX));
-        let budget_ref = (starts.len() > 1).then_some(&budget);
-        let raws: Vec<RawFit> = starts
-            .par_iter()
-            .map(|b0| self.optimize(data, b0, &free, max_iter, budget_ref))
+        let objs: Vec<NegLogLik> = starts
+            .iter()
+            .map(|b0| self.objective(data, b0, &free))
             .collect();
-        select_start(raws)
+        let cfg = self.lbfgs_config(data, free.len(), max_iter);
+        let mut runs: Vec<Lbfgs> = objs
+            .par_iter()
+            .zip(starts)
+            .map(|(obj, b0)| {
+                let x0: Vec<f64> = free.iter().map(|&(k, j)| b0[(k, j)]).collect();
+                Lbfgs::new(obj, &x0, &cfg)
+            })
+            .collect();
+        let ok = |r: &Lbfgs| {
+            r.status().is_some_and(Status::is_converged)
+                && r.f().is_finite()
+                && r.grad_norm_inf() <= MAX_MEAN_GRADIENT * data.n.max(1) as f64
+        };
+        let mut cap = usize::MAX;
+        let mut best_converged = f64::INFINITY;
+        let nf = data.n as f64;
+        // objective value at each round boundary, per start
+        let mut history: Vec<Vec<f64>> = runs.iter().map(|r| vec![r.f()]).collect();
+        loop {
+            // A start that has trailed the leader by more than
+            // DOMINATED_PER_OBS·n after PRUNE_AFTER iterations is in a much
+            // worse basin; one that gained less than STALL_PER_OBS·n over the
+            // last STALL_ROUNDS rounds with a gradient far above the
+            // convergence threshold is crawling against a cliff of the gamma
+            // parameterization. Stop both.
+            let leader = runs.iter().map(|r| r.f()).fold(f64::INFINITY, f64::min);
+            for (r, h) in runs.iter_mut().zip(&history) {
+                if r.status().is_some() || r.n_iter() < PRUNE_AFTER {
+                    continue;
+                }
+                let dominated = r.f() > leader + DOMINATED_PER_OBS * nf;
+                let stalled = h.len() > STALL_ROUNDS
+                    && h[h.len() - 1 - STALL_ROUNDS] - r.f() < STALL_PER_OBS * nf
+                    && r.grad_norm_inf() > 10.0 * MAX_MEAN_GRADIENT * nf;
+                if dominated || stalled {
+                    r.stop(Status::Aborted);
+                }
+            }
+            let active: Vec<bool> = runs
+                .iter()
+                .map(|r| r.status().is_none() && (r.n_iter() < cap || r.f() < best_converged))
+                .collect();
+            if !active.iter().any(|&a| a) {
+                break;
+            }
+            runs.par_iter_mut().zip(&active).for_each(|(r, &a)| {
+                if a {
+                    r.advance(RACE_ROUND);
+                }
+            });
+            for (r, h) in runs.iter().zip(history.iter_mut()) {
+                h.push(r.f());
+            }
+            for r in &runs {
+                if ok(r) {
+                    let n = r.n_iter();
+                    cap = cap.min((2 * n).max(n + 50));
+                    best_converged = best_converged.min(r.f());
+                }
+            }
+        }
+        let raws: Vec<RawFit> = runs
+            .into_iter()
+            .zip(&objs)
+            .map(|(r, obj)| {
+                let res = r.into_result();
+                let converged = res.status.is_converged()
+                    && res.f.is_finite()
+                    && res.grad_norm_inf <= MAX_MEAN_GRADIENT * data.n.max(1) as f64;
+                RawFit {
+                    coef: obj.assemble(&res.x),
+                    x: res.x,
+                    neg_ll: res.f,
+                    grad: res.grad,
+                    grad_norm_inf: res.grad_norm_inf,
+                    n_iter: res.n_iter,
+                    n_fev: res.n_fev,
+                    status: res.status,
+                    converged,
+                }
+            })
+            .collect();
+        if self.verbose {
+            eprintln!(
+                "race of {}: {}",
+                raws.len(),
+                raws.iter()
+                    .map(|r| format!(
+                        "[{:?} it={} conv={} ll={:.1}]",
+                        r.status, r.n_iter, r.converged, -r.neg_ll
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        let mut best: Option<RawFit> = None;
+        for r in raws {
+            if best.as_ref().is_none_or(|b| r.beats(b)) {
+                best = Some(r);
+            }
+        }
+        best.expect("at least one start")
+    }
+
+    fn objective<'a>(
+        &self,
+        data: &'a RegressionData,
+        b0: &DMatrix<f64>,
+        free: &'a [(usize, usize)],
+    ) -> NegLogLik<'a> {
+        NegLogLik {
+            data,
+            base: b0.clone(),
+            free,
+            parallel: self.parallel,
+            trap_streak: Some(AtomicUsize::new(0)),
+        }
+    }
+
+    fn lbfgs_config(&self, data: &RegressionData, n_free: usize, max_iter: usize) -> LbfgsConfig {
+        let memory = if self.lbfgs_memory == 0 {
+            n_free.clamp(10, 200)
+        } else {
+            self.lbfgs_memory
+        };
+        // With standard errors requested, `finalize` computes the exact
+        // Hessian anyway and polishes with Newton steps, so L-BFGS can hand
+        // over once the mean gradient per observation is below
+        // NEWTON_SWITCH (≈ a quarter of the iterations saved).
+        let tol_grad_abs = if self.compute_hessian {
+            NEWTON_SWITCH * data.n as f64
+        } else {
+            0.0
+        };
+        LbfgsConfig {
+            memory,
+            max_iter,
+            tol_grad: self.tol,
+            tol_grad_abs,
+            verbose: self.verbose,
+            ..LbfgsConfig::default()
+        }
     }
 
     /// One L-BFGS run from `b0` over the free coefficients.
@@ -354,37 +496,14 @@ impl EsagRegressor {
         b0: &DMatrix<f64>,
         free: &[(usize, usize)],
         max_iter: usize,
-        budget: Option<&Arc<AtomicUsize>>,
     ) -> RawFit {
-        let obj = NegLogLik {
-            data,
-            base: b0.clone(),
-            free,
-            parallel: self.parallel,
-            trap_streak: Some(AtomicUsize::new(0)),
-        };
-        let memory = if self.lbfgs_memory == 0 {
-            free.len().clamp(10, 100)
-        } else {
-            self.lbfgs_memory
-        };
-        let cfg = LbfgsConfig {
-            memory,
-            max_iter,
-            tol_grad: self.tol,
-            verbose: self.verbose,
-            iter_budget: budget.cloned(),
-            ..LbfgsConfig::default()
-        };
+        let obj = self.objective(data, b0, free);
+        let cfg = self.lbfgs_config(data, free.len(), max_iter);
         let x0: Vec<f64> = free.iter().map(|&(k, j)| b0[(k, j)]).collect();
         let r = minimize(&obj, &x0, &cfg);
         let converged = r.converged()
             && r.f.is_finite()
             && r.grad_norm_inf <= MAX_MEAN_GRADIENT * data.n.max(1) as f64;
-        if converged && let Some(b) = budget {
-            let n = r.n_iter;
-            b.fetch_min((2 * n).max(n + 50), Ordering::Relaxed);
-        }
         RawFit {
             coef: obj.assemble(&r.x),
             x: r.x,
@@ -475,12 +594,28 @@ impl EsagRegressor {
             // (simplified Newton, each step checked with a gradient-only
             // evaluation). The step is ~‖g‖/λ_min ≲ 1e-4, so the Hessian
             // changes negligibly and is reported as the observed information.
-            let (f0, g0, h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
-            let hneg = restrict(&h_full, data.p_total);
+            let (mut f0, mut g0, mut h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
+            let mut chol = restrict(&h_full, data.p_total).cholesky();
+            if chol.is_none() && self.compute_hessian && best.status != Status::Aborted {
+                // Not at a strict local maximum yet: finish with L-BFGS at
+                // full tolerance, then recompute the Hessian.
+                let mut fine = self.clone();
+                fine.compute_hessian = false;
+                let raw = fine.optimize(data, &coef, &free, self.max_iter);
+                if raw.neg_ll <= best.neg_ll {
+                    coef = raw.coef.clone();
+                    best = RawFit {
+                        converged: raw.converged || best.converged,
+                        ..raw
+                    };
+                    (f0, g0, h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
+                    chol = restrict(&h_full, data.p_total).cholesky();
+                }
+            }
             let mut f_ll = f0;
             let mut g_full = g0.as_slice().to_vec();
-            if let Some(ch) = hneg.clone().cholesky() {
-                for _ in 0..3 {
+            if let Some(ch) = chol {
+                for _ in 0..NEWTON_STEPS {
                     let g: DVector<f64> = DVector::from_iterator(
                         nf,
                         free.iter().map(|&(k, j)| g_full[j * data.b_dim + k]),
@@ -663,42 +798,19 @@ struct RawFit {
 }
 
 impl RawFit {
-    /// Prefer converged fits, then higher likelihood.
+    /// Higher likelihood wins (we are searching for the maximum); within a
+    /// relative 1e-9 a converged fit beats an unconverged one.
     fn beats(&self, other: &RawFit) -> bool {
-        match (self.converged, other.converged) {
-            (true, false) => true,
-            (false, true) => false,
-            _ => self.neg_ll < other.neg_ll,
+        if !other.neg_ll.is_finite() {
+            return self.neg_ll.is_finite() || (self.converged && !other.converged);
+        }
+        let tie = 1e-9 * other.neg_ll.abs().max(1.0);
+        if (self.neg_ll - other.neg_ll).abs() <= tie {
+            self.converged && !other.converged
+        } else {
+            self.neg_ll < other.neg_ll
         }
     }
-}
-
-/// Pick the winner of a race deterministically. The shared iteration budget
-/// cuts starts off at points that depend on thread timing, so only outcomes
-/// that cannot depend on timing are eligible: if any start converged (the
-/// fastest after `N` iterations), the converged starts that needed at most
-/// `max(2N, N + 50)` iterations (none of them can have been cut off);
-/// otherwise every start (none was cut off, since only convergence lowers
-/// the budget). Among the eligible, the highest likelihood wins, ties going
-/// to the earlier start.
-fn select_start(raws: Vec<RawFit>) -> RawFit {
-    let cap = raws
-        .iter()
-        .filter(|r| r.converged)
-        .map(|r| r.n_iter)
-        .min()
-        .map(|n| (2 * n).max(n + 50));
-    let mut best: Option<RawFit> = None;
-    for r in raws {
-        let eligible = match cap {
-            Some(c) => r.converged && r.n_iter <= c,
-            None => true,
-        };
-        if eligible && best.as_ref().is_none_or(|b| r.neg_ll < b.neg_ll) {
-            best = Some(r);
-        }
-    }
-    best.expect("at least one start")
 }
 
 /// Free coefficients `(row, column)` of a mask, column by column.
@@ -718,13 +830,30 @@ fn zero_fixed(b: &mut DMatrix<f64>, mask: &DMatrix<bool>) {
     }
 }
 
+/// Iterations per lockstep round of [`EsagRegressor::race`].
+const RACE_ROUND: usize = 25;
+/// A raced start trailing the best one by more than this many log-likelihood
+/// units per observation after [`PRUNE_AFTER`] iterations is abandoned.
+const DOMINATED_PER_OBS: f64 = 0.05;
+const PRUNE_AFTER: usize = 100;
+/// A raced start gaining less than this per observation over the last
+/// [`STALL_ROUNDS`] rounds, with a large gradient, has stalled.
+const STALL_PER_OBS: f64 = 1e-3;
+const STALL_ROUNDS: usize = 4;
+
+/// Mean gradient per observation at which L-BFGS hands over to the Newton
+/// polish when standard errors are requested.
+const NEWTON_SWITCH: f64 = 1e-4;
+/// Maximum Newton polishing steps (each reuses the one exact Hessian).
+const NEWTON_STEPS: usize = 8;
+
 /// Perturbed safety-net starts raced by [`EsagRegressor::fit`] (in waves of
 /// [`RESTART_WAVE`]) when no default start converges.
-const AUTO_RESTARTS: usize = 12;
+const AUTO_RESTARTS: usize = 8;
 const RESTART_WAVE: usize = 4;
 /// Iteration cap for those starts: converged ESAG fits need a few hundred
 /// iterations; a start still running after this is stuck at a singular point.
-const RESTART_MAX_ITER: usize = 1000;
+const RESTART_MAX_ITER: usize = 600;
 
 /// `k` random starts, cycling through `centers`. Free coefficients get
 /// Gaussian noise: s.d. 0.5 (`mu` rows) or 0.25 (`gamma` rows) on the
@@ -1023,17 +1152,30 @@ pub(crate) fn joint_loglik_grad_hess(
 ) -> (f64, Vec<f64>, Vec<f64>) {
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     let full = bd * pt;
+    // Unique products x_{j1} x_{j2} (j1 ≤ j2) and unique entries
+    // H_i[k1, k2] (k1 ≤ k2): per chunk of observations, every unique block
+    // entry Σ_i x_{ij1} x_{ij2} H_i[k1, k2] comes out of one matrix product
+    // Wᵀ Hs (pt(pt+1)/2 × bd(bd+1)/2), which is then scattered into the
+    // symmetric full Hessian.
+    let xpairs: Vec<(usize, usize)> = (0..pt)
+        .flat_map(|j1| (j1..pt).map(move |j2| (j1, j2)))
+        .collect();
+    let hpairs: Vec<(usize, usize)> = (0..bd)
+        .flat_map(|k1| (k1..bd).map(move |k2| (k1, k2)))
+        .collect();
     let b_rm: Vec<f64> = (0..bd)
         .flat_map(|k| (0..pt).map(move |j| b[(k, j)]))
         .collect();
-    let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, Vec<f64>) {
+    let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, DMatrix<f64>) {
+        let m = rows.len();
         let mut f = 0.0;
         let mut g = vec![0.0; full];
-        let mut h = vec![0.0; full * full];
+        let mut hs = DMatrix::<f64>::zeros(m, hpairs.len());
+        let mut w = DMatrix::<f64>::zeros(m, xpairs.len());
         let mut eta = vec![0.0; bd];
         let mut ge = vec![0.0; bd];
         let mut he = vec![0.0; bd * bd];
-        for i in rows {
+        for (r, i) in rows.enumerate() {
             let xi = &data.x[i * pt..(i + 1) * pt];
             let yi = &data.y[i * d..(i + 1) * d];
             for k in 0..bd {
@@ -1044,47 +1186,54 @@ pub(crate) fn joint_loglik_grad_hess(
                     .sum();
             }
             f += obs_hessian(&eta, yi, &mut ge, &mut he);
-            for j1 in 0..pt {
-                let x1 = xi[j1];
-                for k1 in 0..bd {
-                    g[j1 * bd + k1] += ge[k1] * x1;
-                    let row = &mut h[(j1 * bd + k1) * full..(j1 * bd + k1 + 1) * full];
-                    let hrow = &he[k1 * bd..(k1 + 1) * bd];
-                    for j2 in 0..pt {
-                        let w = x1 * xi[j2];
-                        for (dst, &src) in row[j2 * bd..(j2 + 1) * bd].iter_mut().zip(hrow) {
-                            *dst += w * src;
-                        }
-                    }
+            for j in 0..pt {
+                for k in 0..bd {
+                    g[j * bd + k] += ge[k] * xi[j];
                 }
             }
+            for (q, &(k1, k2)) in hpairs.iter().enumerate() {
+                hs[(r, q)] = he[k1 * bd + k2];
+            }
+            for (a, &(j1, j2)) in xpairs.iter().enumerate() {
+                w[(r, a)] = xi[j1] * xi[j2];
+            }
         }
-        (f, g, h)
+        (f, g, w.tr_mul(&hs))
     };
-    if parallel && data.n >= 2 * PAR_CHUNK {
-        // At most 32 chunks (each holds a full Hessian), summed in order.
-        let chunk = PAR_CHUNK.max(data.n.div_ceil(32));
+    let (f, g, c) = if parallel && data.n >= 2 * PAR_CHUNK {
+        // At most 64 chunks, summed in order.
+        let chunk = PAR_CHUNK.max(data.n.div_ceil(64));
         let n_chunks = data.n.div_ceil(chunk);
-        let parts: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n_chunks)
+        let parts: Vec<(f64, Vec<f64>, DMatrix<f64>)> = (0..n_chunks)
             .into_par_iter()
             .map(|c| body(c * chunk..((c + 1) * chunk).min(data.n)))
             .collect();
         let mut f = 0.0;
         let mut g = vec![0.0; full];
-        let mut h = vec![0.0; full * full];
-        for (fc, gc, hc) in parts {
+        let mut c = DMatrix::<f64>::zeros(xpairs.len(), hpairs.len());
+        for (fc, gc, cc) in parts {
             f += fc;
             for (a, b) in g.iter_mut().zip(&gc) {
                 *a += b;
             }
-            for (a, b) in h.iter_mut().zip(&hc) {
-                *a += b;
-            }
+            c += cc;
         }
-        (f, g, h)
+        (f, g, c)
     } else {
         body(0..data.n)
+    };
+    let mut h = vec![0.0; full * full];
+    for (a, &(j1, j2)) in xpairs.iter().enumerate() {
+        for (q, &(k1, k2)) in hpairs.iter().enumerate() {
+            let v = c[(a, q)];
+            // H is symmetric and each H_i is symmetric: four mirror images
+            h[(j1 * bd + k1) * full + j2 * bd + k2] = v;
+            h[(j1 * bd + k2) * full + j2 * bd + k1] = v;
+            h[(j2 * bd + k1) * full + j1 * bd + k2] = v;
+            h[(j2 * bd + k2) * full + j1 * bd + k1] = v;
+        }
     }
+    (f, g, h)
 }
 
 /// Residual diagnostics for a fitted model.
