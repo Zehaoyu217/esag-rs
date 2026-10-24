@@ -240,3 +240,8 @@ tests/                          R parity, paper reproduction, API, inference
 reference/r/                    the original R sources
 docs/MATH.md                    the mathematics, with references
 ```
+
+## License
+
+MIT, the same license as the original R code. `data/hydrochem_At_LLt.csv`
+comes from the R package `compositions` (GPL ≥ 2); see `data/README.md`.

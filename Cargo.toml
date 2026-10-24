@@ -2,6 +2,12 @@
 name = "esag"
 version = "0.1.0"
 edition = "2024"
+description = "Elliptically symmetric angular Gaussian (ESAG) distributions and regression for directional data"
+license = "MIT"
+repository = "https://github.com/Zehaoyu217/esag-rs"
+readme = "README.md"
+keywords = ["statistics", "directional", "regression", "sphere", "esag"]
+categories = ["science", "mathematics"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
