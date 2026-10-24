@@ -338,3 +338,50 @@ mod inverse_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod singular_set_tests {
+    use crate::distribution::Esag;
+
+    /// Largest change of `V` over four directions of approach when the
+    /// entries `idx` of `gamma` shrink to `eps` times a unit-ish direction.
+    fn jump(mu: &[f64], base: &[f64], idx: std::ops::Range<usize>, eps: f64) -> f64 {
+        let v_at = |s: usize| {
+            let mut g = base.to_vec();
+            for (c, k) in idx.clone().enumerate() {
+                g[k] = eps * (((s * 7 + c * 3) as f64) * 1.3).sin();
+            }
+            Esag::new(mu, &g).unwrap().covariance()
+        };
+        let v0 = v_at(0);
+        (1..4)
+            .map(|s| (v_at(s) - &v0).abs().max())
+            .fold(0.0, f64::max)
+    }
+
+    /// The map `gamma → V` (identical to the R code's `parameter`/`rotation`)
+    /// is discontinuous wherever an angle is undefined while it still moves
+    /// unequal eigen-directions: where the last two entries of a group
+    /// `j ≥ 2` vanish, and where a whole group `j ≥ 2` vanishes while other
+    /// groups do not. The limit of `V` then depends on the direction of
+    /// approach, however close. Group 1 and `gamma = 0` as a whole are
+    /// continuous. (This traps optimisers in regression fits with several
+    /// covariates, and puts exact zeros of group `j ≥ 2` on a jump; see
+    /// `docs/MATH.md`.)
+    #[test]
+    fn gamma_map_discontinuities() {
+        let mu = [1.0, 2.0, -1.0, 0.5, 1.5];
+        let base = [0.4, -0.7, 1.2, 0.6, -0.3, 0.3, 0.2, 0.5, -0.4];
+        for eps in [1e-3, 1e-6, 1e-9] {
+            // group 1 → 0: continuous
+            assert!(jump(&mu, &base, 0..2, eps) < 1.0 * eps);
+            // whole group 2 or 3 → 0: a jump of fixed size
+            assert!(jump(&mu, &base, 2..5, eps) > 0.2);
+            assert!(jump(&mu, &base, 5..9, eps) > 0.5);
+            // trailing pair of group 2 → 0 (group still nonzero): a jump
+            assert!(jump(&mu, &base, 3..5, eps) > 0.1);
+            // all of gamma → 0: continuous (V → I)
+            assert!(jump(&mu, &base, 0..9, eps) < 10.0 * eps);
+        }
+    }
+}

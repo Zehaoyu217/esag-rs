@@ -120,6 +120,14 @@ pub trait Objective: Sync {
         let mut grad = vec![0.0; x.len()];
         self.value_and_gradient(x, &mut grad)
     }
+
+    /// Checked once per iteration: returning `true` stops the solver with
+    /// [`Status::Aborted`] (the best point so far is returned). Lets an
+    /// objective that can diagnose a hopeless run (e.g. an iterate pinned at
+    /// a discontinuity) end it early. The default never aborts.
+    fn should_stop(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter that turns a closure `|x, grad| -> f` into an [`Objective`].
@@ -223,6 +231,8 @@ pub enum Status {
     LineSearchFailed,
     /// The objective or its gradient was non-finite at the starting point.
     NonFinite,
+    /// The objective asked to stop ([`Objective::should_stop`]).
+    Aborted,
 }
 
 impl Status {
@@ -245,6 +255,7 @@ impl fmt::Display for Status {
             Status::MaxEvaluations => "maximum function evaluations reached",
             Status::LineSearchFailed => "line search failed",
             Status::NonFinite => "non-finite objective at the starting point",
+            Status::Aborted => "stopped by the objective",
         };
         f.write_str(s)
     }
@@ -731,6 +742,9 @@ pub fn minimize(obj: &dyn Objective, x0: &[f64], cfg: &LbfgsConfig) -> OptimResu
         }
         if n_fev >= cfg.max_fev {
             break Status::MaxEvaluations;
+        }
+        if obj.should_stop() {
+            break Status::Aborted;
         }
 
         // --- search direction --------------------------------------------
