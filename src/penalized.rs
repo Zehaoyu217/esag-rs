@@ -234,13 +234,18 @@ impl PenalizedEsag {
                 v
             }
         };
-        // smallest criterion; ties → larger λ (sparser)
+        // smallest criterion; ties (e.g. equal relaxed fits) → fewer active
+        // atoms, then the smallest λ (least shrinkage; R's which.min)
+        let n_active = |p: &PathPoint| p.active.iter().filter(|&&a| a).count();
         let mut selected = 0;
         for (i, &c) in criterion.iter().enumerate() {
             let best = criterion[selected];
-            if c < best - 1e-12 * best.abs().max(1.0)
-                || ((c - best).abs() <= 1e-12 * best.abs().max(1.0)
-                    && points[i].lambda > points[selected].lambda)
+            let tol = 1e-9 * best.abs().max(1.0);
+            let tie = (c - best).abs() <= tol;
+            let (pi, ps) = (&points[i], &points[selected]);
+            if c < best - tol
+                || (tie && n_active(pi) < n_active(ps))
+                || (tie && n_active(pi) == n_active(ps) && pi.lambda < ps.lambda)
             {
                 selected = i;
             }
