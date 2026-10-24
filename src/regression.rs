@@ -1062,34 +1062,31 @@ fn joint_eval(
     ratio: bool,
 ) -> (f64, DMatrix<f64>, f64) {
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
-    // B as row-major slice for fast eta_i = B x_i
-    let b_rm: Vec<f64> = (0..bd)
-        .flat_map(|k| (0..pt).map(move |j| b[(k, j)]))
-        .collect();
+    // Per chunk of observations: eta = B X_cᵀ (bd × m, one contiguous
+    // column per observation) and the gradient Σ_i g_i x̃_iᵀ = G X_c, both
+    // as matrix products.
     let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, Vec<f64>) {
+        let m = rows.len();
+        // row-major m × pt block of the design = column-major pt × m (X_cᵀ)
+        let xt = nalgebra::DMatrixView::from_slice(&data.x[rows.start * pt..rows.end * pt], pt, m);
+        let eta = b * xt;
+        let mut ge = DMatrix::<f64>::zeros(bd, m);
         let mut f = 0.0;
-        let mut g = vec![0.0; bd * pt];
-        let mut norms = Vec::with_capacity(if ratio { rows.len() } else { 0 });
-        let mut eta = vec![0.0; bd];
-        let mut ge = vec![0.0; bd];
-        for i in rows {
-            let xi = &data.x[i * pt..(i + 1) * pt];
+        let mut norms = Vec::with_capacity(if ratio { m } else { 0 });
+        for (r, i) in rows.enumerate() {
             let yi = &data.y[i * d..(i + 1) * d];
-            for k in 0..bd {
-                let row = &b_rm[k * pt..(k + 1) * pt];
-                eta[k] = row.iter().zip(xi).map(|(a, b)| a * b).sum();
-            }
-            let ll = loglik::loglik_eta_grad(&eta, yi, &mut ge);
-            f += ll;
+            let gcol = &mut ge.as_mut_slice()[r * bd..(r + 1) * bd];
+            f += loglik::loglik_eta_grad(&eta.as_slice()[r * bd..(r + 1) * bd], yi, gcol);
             if ratio {
-                norms.push(ge.iter().map(|v| v * v).sum::<f64>());
+                norms.push(gcol.iter().map(|v| v * v).sum::<f64>());
             }
-            for k in 0..bd {
-                let gk = ge[k];
-                let grow = &mut g[k * pt..(k + 1) * pt];
-                for j in 0..pt {
-                    grow[j] += gk * xi[j];
-                }
+        }
+        // bd × pt gradient, returned row-major (k * pt + j)
+        let gm = ge * xt.transpose();
+        let mut g = vec![0.0; bd * pt];
+        for k in 0..bd {
+            for j in 0..pt {
+                g[k * pt + j] = gm[(k, j)];
             }
         }
         (f, g, norms)
@@ -1658,6 +1655,62 @@ mod timing {
                     t.elapsed().as_secs_f64() * 1e3
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_timing {
+    use std::time::Instant;
+
+    /// `cargo test --release --lib kernel_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn kernel_vs_joint() {
+        for d in [7usize, 8] {
+            let bd = crate::dims::eta_len(d);
+            let etas: Vec<Vec<f64>> = (0..64)
+                .map(|s| {
+                    (0..bd)
+                        .map(|i| 0.3 + ((i * 7 + s) as f64 * 0.77).sin())
+                        .collect()
+                })
+                .collect();
+            let ys: Vec<Vec<f64>> = (0..64)
+                .map(|s| {
+                    let r: Vec<f64> = (0..d).map(|i| ((i * 3 + s) as f64 * 1.9).cos()).collect();
+                    let n = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    r.iter().map(|v| v / n).collect()
+                })
+                .collect();
+            let mut g = vec![0.0; bd];
+            let reps = 200_000;
+            let t = Instant::now();
+            let mut acc = 0.0;
+            for r in 0..reps {
+                acc += crate::loglik::loglik_eta_grad(
+                    std::hint::black_box(&etas[r % 64]),
+                    &ys[r % 64],
+                    &mut g,
+                );
+            }
+            std::hint::black_box(acc);
+            println!(
+                "d={d}: kernel value+grad {:.0} ns",
+                t.elapsed().as_secs_f64() * 1e9 / reps as f64
+            );
+            let t = Instant::now();
+            for r in 0..reps {
+                acc += crate::loglik::loglik_eta::<f64>(
+                    std::hint::black_box(&etas[r % 64]),
+                    &ys[r % 64],
+                );
+            }
+            std::hint::black_box(acc);
+            println!(
+                "d={d}: kernel value {:.0} ns",
+                t.elapsed().as_secs_f64() * 1e9 / reps as f64
+            );
         }
     }
 }
