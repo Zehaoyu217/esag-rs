@@ -215,6 +215,10 @@ pub struct PenalizedEsag {
     /// Response (column) names for summaries.
     #[serde(default)]
     pub response_names: Option<Vec<String>>,
+    /// Reference direction of the log-tangent frame (default: the data's
+    /// mean direction); see [`EsagRegressor::lt_reference`].
+    #[serde(default)]
+    pub lt_reference: Option<Vec<f64>>,
 }
 
 impl PenalizedEsag {
@@ -239,6 +243,7 @@ impl PenalizedEsag {
             start_coef: None,
             feature_names: None,
             response_names: None,
+            lt_reference: None,
         }
     }
     /// LASSO on every slope coefficient.
@@ -376,6 +381,11 @@ impl PenalizedEsag {
     /// Response names for summaries.
     pub fn response_names(mut self, names: Vec<String>) -> Self {
         self.response_names = Some(names);
+        self
+    }
+    /// Reference direction of the log-tangent frame.
+    pub fn lt_reference(mut self, m: Vec<f64>) -> Self {
+        self.lt_reference = Some(m);
         self
     }
     /// A short name of the method ("adaptive group LASSO", …).
@@ -865,6 +875,7 @@ impl Prepared {
         let xs = DMatrix::from_fn(x.nrows(), p, |i, j| (x[(i, j)] - center[j]) / scale[j]);
         let mut config = EsagRegressor::new()
             .with_shape(cfg.shape)
+            .with_lt_reference(cfg.lt_reference.clone())
             .with_parallel(cfg.parallel)
             .with_hessian(false);
         if let Some(n) = &cfg.feature_names {

@@ -239,6 +239,53 @@ pooled with `m` draws from each of `B` nonparametric-bootstrap refits
 (CSDA Algorithm 4). Among ellipsoidal regions with `Vμ = μ` and `|V| = 1`,
 this has the smallest volume.
 
+## 5b. Estimating V(x) (`src/inference/covariance.rs`)
+
+The object of interest is often the covariance `V(x)` itself, not the
+coefficients: `V` depends on every coefficient (through `μ(x)` and the
+shape coordinates) in a nonlinear way, and per-coefficient standard errors
+from the observed information say little about it. `V̂(x) = V(B̂ x̃)` is the
+plug-in MLE (`predict_covariance`), and `covariance_intervals` adds
+pairs-bootstrap uncertainty at chosen covariate vectors:
+
+* the shape eigenvalues (those of `V̂` on `μ̂⊥`; the one along `μ̂` is 1)
+  and principal axes;
+* *basic* intervals `[2θ̂ − q_{1−α/2}, 2θ̂ − q_{α/2}]` for each eigenvalue and
+  entry, with bootstrap standard errors;
+* a geodesic ball `{V : ‖log(V̂^{−1/2} V V̂^{−1/2})‖_F ≤ r}`, `r` the
+  level-quantile of `δ(V̂*, V̂)`.
+
+**Validation** (`examples/v_recovery.rs`; data from a known regression with
+5 covariates + const; V̂(x) against the true V(x) on 200 covariate points;
+geodesic distance, mean over 20 replications):
+
+| model | d | n = 500 | n = 2000 | n = 10000 | √n × error | converged at n = 500 |
+|---|---|---|---|---|---|---|
+| γ | 3 | 0.30 | 0.11 | 0.048 | 6.8 → 5.0 → 4.8 | 20/20 |
+| γ | 5 | 0.75 | 0.27 | 0.11 | 16.8 → 11.9 → 10.7 | 16/20 |
+| γ | 8 | 1.40 | 0.46 | 0.19 | 31.2 → 20.7 → 18.7 | 3/20 |
+| log-tangent | 3 | 0.24 | 0.12 | 0.055 | 5.3 → 5.3 → 5.5 | 20/20 |
+| log-tangent | 5 | 0.53 | 0.24 | 0.11 | 11.8 → 10.9 → 10.9 | 20/20 |
+| log-tangent | 8 | 0.91 | 0.42 | 0.18 | 20.4 → 18.9 → 18.0 | 20/20 |
+
+Both are consistent at the `1/√n` rate. At n = 2000, the shape eigenvalues
+are within 4–12% (log scale) and the mean direction within 1.3–1.6°.
+
+Coverage of the 95% intervals at x₀ = 0 and x₀ = e₁ (n = 2000, B = 200, 200
+replications; Monte-Carlo SE 0.015):
+
+| model | d | eigenvalues, percentile | eigenvalues, basic | geodesic ball |
+|---|---|---|---|---|
+| γ | 3 | 0.90–0.94 | 0.93–0.96 | 0.95–0.96 |
+| log-tangent | 3 | 0.93–0.96 | 0.95 | 0.935–0.945 |
+| γ | 5 | 0.56–0.93 | 0.95–0.98 | 0.975 |
+| log-tangent | 5 | 0.93–0.99 | 0.93–0.98 | 0.955–0.97 |
+
+The γ MLE of the smallest eigenvalue at d = 5 is biased by about one
+standard error (−0.0103 against a sampling SD of 0.0110; the bootstrap SD,
+0.0112, is right). Percentile intervals double that bias, so their
+coverage falls to 0.56; basic intervals correct it to first order.
+
 ## 6. Hypothesis tests (`src/inference/tests.rs`)
 
 Restricted fit (`μ_{0i}`, `γ_{0i}`) versus full fit (`μ_{ai}`):
@@ -337,6 +384,21 @@ for regressions whose likelihood would otherwise have cliffs at the `γ`
 singular set (§2). `EsagRegressor::with_shape(Shape::LogTangent)` fits it
 (the frame's reference direction defaults to the data's mean direction and
 is stored with the model), and the penalized estimators of §8 use it.
+
+**The model depends on the frame.** `s` is defined relative to the frame
+`(m, E)`, and transporting from another reference rotates the tangent basis
+by a `μ̂`-dependent amount. So "`s` linear in x" in one frame is not linear
+in another, and each reference direction defines its own regression model.
+The default `m` is the data's mean direction, which keeps `μ̂` far from the
+one singular point `−m`. It is stored with the fit and kept fixed by every
+refit, but it is chosen from the data. On data from a log-tangent model
+defined with `m = e_d` (§5b), the fit with the default `m` has an error in
+`V̂` that stops shrinking at the `1/√n` rate. At d = 3, n = 10000 the
+geodesic error is 0.108, against 0.055 with `m = e_d`; at d = 8 it is 0.44
+against 0.18. To compare with a model defined in a given frame, set
+`EsagRegressor::with_lt_reference` (Python: `lt_reference=`). The `γ`
+model has the analogous dependence on the coordinate axes of `y`, through
+`ONB(μ)`, but there it is a fixed convention.
 
 **Same family, different regression.** For one distribution, `γ` and `s`
 are two coordinate systems on the same set of ESAG laws. In a regression

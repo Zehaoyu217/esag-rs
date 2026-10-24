@@ -232,3 +232,39 @@ def test_errors(data):
         m.fit().test("mu")  # needs a covariate
     with pytest.raises(ValueError):
         m.fit().test("mu", "nope")
+
+
+def test_covariance_estimates(res, data):
+    X, _ = data
+    V = res.covariance(X.iloc[:4])
+    assert V.shape == (4, 3, 3)
+    np.testing.assert_allclose(np.linalg.det(V), 1.0)
+    np.testing.assert_allclose(V, np.transpose(V, (0, 2, 1)), atol=1e-12)
+    ci = res.covariance_ci(n_boot=200)
+    assert ci.n_boot == 200 and ci.covariance.shape == (3, 3)
+    assert (ci.eig_lower < ci.eigenvalues).all() and (ci.eigenvalues < ci.eig_upper).all()
+    assert (ci.entry_se >= 0).all() and 0 < ci.radius < 1
+    np.testing.assert_allclose(ci.covariance @ ci.mean_direction, ci.mean_direction, atol=1e-9)
+    assert "ESAG Covariance Estimate V(x)" in str(ci.summary())
+    assert list(ci.eigen_table.columns) == ["estimate", "std err", "lower", "upper"]
+    # the true V at the mean covariates is inside a few bootstrap radii
+    x0 = X.mean().values
+    eta = np.r_[1.0, x0] @ b_true().T
+    vt = esag.Distribution(list(eta[:3]), list(eta[3:])).covariance
+    w = np.linalg.cholesky(ci.covariance)
+    m = np.linalg.solve(w, np.linalg.solve(w, vt).T)
+    geo = np.sqrt(np.sum(np.log(np.linalg.eigvalsh((m + m.T) / 2)) ** 2))
+    assert geo < 3 * ci.radius
+    two = res.covariance_ci(X.iloc[:2].values, n_boot=50)
+    assert len(two) == 2
+
+
+def test_lt_reference_is_respected():
+    rng = np.random.default_rng(3)
+    y = rng.normal(size=(300, 4)) + np.array([0.0, 0.0, 0.0, 2.0])
+    y /= np.linalg.norm(y, axis=1, keepdims=True)
+    x = rng.normal(size=(300, 1))
+    a = esag.ESAG(y, x, shape="log-tangent", lt_reference=[0, 0, 0, 1.0]).fit()
+    b = esag.ESAG(y, x, shape="log-tangent").fit()
+    assert json.loads(a.to_json())["config"]["lt_reference"] == [0, 0, 0, 1.0]
+    assert json.loads(b.to_json())["config"]["lt_reference"] != [0, 0, 0, 1.0]

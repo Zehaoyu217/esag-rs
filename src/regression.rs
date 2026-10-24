@@ -1683,6 +1683,17 @@ impl EsagRegressorFit {
             .collect()
     }
 
+    /// `V̂(x)` (`d × d`) for each row of `x`: the estimated ESAG covariance
+    /// at those covariates. [`crate::inference::covariance_intervals`] adds
+    /// bootstrap uncertainty.
+    pub fn predict_covariance(&self, x: &DMatrix<f64>) -> Result<Vec<DMatrix<f64>>> {
+        Ok(self
+            .predict_distribution(x)?
+            .iter()
+            .map(|d| d.covariance())
+            .collect())
+    }
+
     /// The eigen-frame of `V` for one linear predictor `eta` (pass
     /// `self.lt_frame()` for log-tangent fits): cheaper than building an
     /// [`Esag`] for sampling, moments and residuals.

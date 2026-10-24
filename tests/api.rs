@@ -185,3 +185,39 @@ fn higher_dimensions_fit() {
         assert!(dv < 0.2, "d={d}: dV = {dv}");
     }
 }
+
+#[test]
+fn covariance_estimates_with_bootstrap_intervals() {
+    use esag::inference::{covariance_intervals, geodesic_distance};
+    let b = b_true();
+    let (x, y) = simulate(1500, &b, 21);
+    let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+    let x_new = DMatrix::from_column_slice(2, 1, &[0.0, 1.0]);
+    let est = covariance_intervals(&fit, &x, &y, &x_new, 200, 0.95, 3).unwrap();
+    let plain = fit.predict_covariance(&x_new).unwrap();
+    assert_eq!(est.len(), 2);
+    for (i, e) in est.iter().enumerate() {
+        let v = &e.covariance;
+        assert!((v - &plain[i]).abs().max() < 1e-12);
+        assert!((v - v.transpose()).abs().max() < 1e-12);
+        assert!((v.determinant() - 1.0).abs() < 1e-9);
+        // V μ̂ = μ̂
+        let mu = nalgebra::DVector::from_column_slice(&e.mean_direction);
+        assert!((v * &mu - &mu).abs().max() < 1e-9);
+        assert_eq!(e.n_boot, 200);
+        for k in 0..2 {
+            assert!(e.eig_lower[k] < e.eigenvalues[k] && e.eigenvalues[k] < e.eig_upper[k]);
+            assert!(e.eig_se[k] > 0.0);
+        }
+        assert!(e.entry_se.iter().all(|s| s.is_finite() && *s >= 0.0));
+        assert!(e.radius > 0.0 && e.radius < 1.0);
+        // the truth is within a few radii of the estimate
+        let eta: Vec<f64> = (0..5)
+            .map(|k| b[(k, 0)] + b[(k, 1)] * x_new[(i, 0)])
+            .collect();
+        let vt = Esag::from_eta(&eta).unwrap().covariance();
+        assert!(geodesic_distance(v, &vt) < 3.0 * e.radius);
+        let s = e.summary();
+        assert!(s.contains("ESAG Covariance Estimate V(x)") && s.contains("lambda[2]"));
+    }
+}

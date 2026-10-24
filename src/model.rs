@@ -19,8 +19,8 @@
 
 use crate::error::{EsagError, Result};
 use crate::inference::{
-    GofMethod, GofResult, HypothesisTestResult, PredictionRegion, Restriction, bootstrap_gof,
-    hypothesis_test, prediction_region,
+    CovarianceEstimate, GofMethod, GofResult, HypothesisTestResult, PredictionRegion, Restriction,
+    bootstrap_gof, covariance_intervals, hypothesis_test, prediction_region,
 };
 use crate::penalized::{PenalizedEsag, PenalizedPath};
 use crate::regression::{EsagRegressor, EsagRegressorFit, Shape};
@@ -63,6 +63,15 @@ impl EsagModel {
         self.config.shape = shape;
         self
     }
+    /// Reference direction `m` of the log-tangent frame (default: the
+    /// data's mean direction). The log-tangent regression model depends on
+    /// it: `s` linear in `x` in one frame is not linear in another. Set it to
+    /// compare with a model defined in a given frame (e.g. a simulation
+    /// truth).
+    pub fn lt_reference(mut self, m: Vec<f64>) -> Self {
+        self.config.lt_reference = Some(m);
+        self
+    }
     /// Add a constant column (default `true`).
     pub fn has_constant(mut self, v: bool) -> Self {
         self.config.fit_intercept = v;
@@ -71,17 +80,21 @@ impl EsagModel {
     /// Replace the estimator settings (iterations, starts, …); names, shape
     /// and the constant are kept from the model.
     pub fn with_config(mut self, cfg: EsagRegressor) -> Self {
-        let (f, r, s, c) = (
+        let (f, r, s, c, m) = (
             self.config.feature_names.take(),
             self.config.response_names.take(),
             self.config.shape,
             self.config.fit_intercept,
+            self.config.lt_reference.take(),
         );
         self.config = cfg;
         self.config.feature_names = f;
         self.config.response_names = r;
         self.config.shape = s;
         self.config.fit_intercept = c;
+        if m.is_some() {
+            self.config.lt_reference = m;
+        }
         self
     }
     pub fn endog(&self) -> &DMatrix<f64> {
@@ -118,6 +131,9 @@ impl EsagModel {
         }
         if let Some(n) = &self.config.response_names {
             p = p.response_names(n.clone());
+        }
+        if let Some(m) = &self.config.lt_reference {
+            p = p.lt_reference(m.clone());
         }
         p.fit(&self.exog, &self.endog)
     }
@@ -164,6 +180,25 @@ impl EsagResults {
             .iter()
             .position(|c| c == name)
             .ok_or_else(|| EsagError::Data(format!("no covariate named {name:?}")))
+    }
+    /// `V̂(x)` at each row of `x_new` with pairs-bootstrap intervals (see
+    /// [`covariance_intervals`]).
+    pub fn covariance(
+        &self,
+        x_new: &DMatrix<f64>,
+        n_boot: usize,
+        level: f64,
+        seed: u64,
+    ) -> Result<Vec<CovarianceEstimate>> {
+        covariance_intervals(
+            &self.fit,
+            &self.model.exog,
+            &self.model.endog,
+            x_new,
+            n_boot,
+            level,
+            seed,
+        )
     }
     /// Bootstrap goodness-of-fit test (Algorithm 1).
     pub fn gof(&self, n_boot: usize, seed: u64) -> Result<GofResult> {

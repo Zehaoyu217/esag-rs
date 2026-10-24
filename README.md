@@ -145,6 +145,20 @@ let t = res.test(Restriction::GammaOfFeature(0), 500, 1)?;
 println!("{}\n{}", res.summary(), t.summary());
 ```
 
+**Estimating V(x).** The covariance `V(x)` is a nonlinear function of all
+the coefficients, so it gets its own estimator with bootstrap uncertainty:
+
+```rust
+use esag::inference::covariance_intervals;
+let v = model.predict_covariance(&x_new)?;            // V̂(x) for each row
+let est = covariance_intervals(&model, &x, &y, &x_new, 500, 0.95, 1)?;
+println!("{}", est[0].summary());   // shape eigenvalues ± SE, basic intervals, axes, V̂ entries ± SE
+```
+
+In Python: `res.covariance(X_new)` and `res.covariance_ci(x0, n_boot=500)`.
+`docs/MATH.md` §5b has the simulation check (consistency and interval
+coverage).
+
 To fit a single distribution to i.i.d. data, use `EsagEstimator::new().fit(&y)`.
 `Esag::new(&mu, &gamma)` gives the distribution itself, with `log_pdf`,
 `sample`, `covariance`, `mean_direction` and `angles`.
@@ -278,6 +292,14 @@ between two machines, and esag matches or beats R on 8 of 18 fits.
 At 1,000 replications the standard error of a rejection rate is 0.007.
 
 The last row shows why the papers use the bootstrap.
+
+**Estimating V(x)** (`cargo run --release --example v_recovery`; data from
+a known regression with 5 covariates + const). The geodesic error of V̂(x)
+against the true V(x) shrinks at the 1/√n rate in both shape models: at
+n = 2000 it is 0.11–0.46 for d = 3–8. 95% basic-bootstrap intervals for
+the shape eigenvalues of V(x₀) cover 93–98% of the time (d = 3 and 5,
+n = 2000), and geodesic balls cover 93.5–97.5%. Details and the frame
+caveat of the log-tangent model are in `docs/MATH.md` §5b and §7.
 
 ## Performance
 

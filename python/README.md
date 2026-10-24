@@ -105,6 +105,26 @@ otherwise. The γ map has a singular set that makes big γ regressions slow
 and unreliable. With covariates the two are different regression models
 for the shape (the mean model is the same); compare them by AIC/BIC.
 
+### The covariance V(x)
+
+V depends on every coefficient nonlinearly, so per-coefficient standard
+errors say little about it. Estimate it directly:
+
+```python
+V = res.covariance(X_new)                  # (m, d, d): V-hat at each row
+ci = res.covariance_ci(n_boot=500)         # at the mean covariates (or pass x0)
+print(ci.summary())                        # shape eigenvalues, SEs, basic 95% intervals, axes, V entries ± SE
+ci.eigen_table, ci.covariance_frame, ci.radius   # radius of a geodesic 95% ball around V-hat
+```
+
+The intervals are basic (bias-corrected) pairs-bootstrap intervals. In
+simulations (n = 2000, 5 covariates, d = 3 and 5) they cover 93–98% at level
+95%; V-hat converges at the 1/√n rate (`docs/MATH.md` §5b).
+
+With `shape="log-tangent"`, the model depends on the frame's reference
+direction (`lt_reference=`, default: the data's mean direction); see
+`docs/MATH.md` §7.
+
 ### Distributions
 
 ```python
@@ -116,7 +136,7 @@ dist.logpdf(y), dist.covariance, dist.second_moment, dist.mean_direction
 ## Tests and demo
 
 ```sh
-python -m pytest tests            # 20 tests, ~3 s
+python -m pytest tests            # 22 tests, ~3 s
 python examples/demo.py           # fit, five bootstrap tests, five penalties (d = 3)
 python examples/demo.py 5         # the same at d = 5
 ```

@@ -7,7 +7,7 @@ use esag::model::{EsagModel, EsagResults};
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, PenalizedPath, Target};
 use esag::regression::{EsagRegressor, Shape};
 use nalgebra::DMatrix;
-use numpy::ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -48,7 +48,7 @@ struct PyModel {
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true))]
+    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None))]
     fn new(
         endog: PyReadonlyArray2<'_, f64>,
         exog: Option<PyReadonlyArray2<'_, f64>>,
@@ -56,6 +56,7 @@ impl PyModel {
         endog_names: Option<Vec<String>>,
         shape: &str,
         hasconst: bool,
+        lt_reference: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         let y = to_dmatrix(&endog);
         let x = match &exog {
@@ -83,6 +84,12 @@ impl PyModel {
                 return Err(err("endog_names must have one name per endog column"));
             }
             m = m.endog_names(&n);
+        }
+        if let Some(r) = lt_reference {
+            if r.len() != y.ncols() {
+                return Err(err("lt_reference must have one entry per endog column"));
+            }
+            m = m.lt_reference(r);
         }
         Ok(Self { inner: m })
     }
@@ -483,6 +490,55 @@ impl PyResults {
     /// The fitted model as JSON.
     fn to_json(&self) -> PyResult<String> {
         self.inner.to_json().map_err(err)
+    }
+    /// `V̂(x)` for each row of `exog`: an `(m, d, d)` array.
+    fn covariance<'py>(
+        &self,
+        py: Python<'py>,
+        exog: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<f64>>> {
+        let x = to_dmatrix(&exog);
+        let vs = self.inner.predict_covariance(&x).map_err(err)?;
+        let d = self.inner.d;
+        Ok(Array3::from_shape_fn((vs.len(), d, d), |(i, a, b)| vs[i][(a, b)]).into_pyarray(py))
+    }
+    /// `V̂(x)` with pairs-bootstrap intervals at each row of `exog`: a list
+    /// of dicts.
+    #[pyo3(signature = (exog, n_boot=500, level=0.95, seed=1))]
+    fn covariance_ci<'py>(
+        &self,
+        py: Python<'py>,
+        exog: PyReadonlyArray2<'_, f64>,
+        n_boot: usize,
+        level: f64,
+        seed: u64,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let x = to_dmatrix(&exog);
+        let res = &self.inner;
+        let est = py
+            .detach(|| res.covariance(&x, n_boot, level, seed))
+            .map_err(err)?;
+        est.iter()
+            .map(|e| {
+                let d = PyDict::new(py);
+                d.set_item("x", e.x.clone())?;
+                d.set_item("covariance", to_py(py, &e.covariance))?;
+                d.set_item("mean_direction", e.mean_direction.clone())?;
+                d.set_item("eigenvalues", e.eigenvalues.clone())?;
+                d.set_item("axes", to_py(py, &e.axes))?;
+                d.set_item("eig_lower", e.eig_lower.clone())?;
+                d.set_item("eig_upper", e.eig_upper.clone())?;
+                d.set_item("eig_se", e.eig_se.clone())?;
+                d.set_item("entry_se", to_py(py, &e.entry_se))?;
+                d.set_item("entry_lower", to_py(py, &e.entry_lower))?;
+                d.set_item("entry_upper", to_py(py, &e.entry_upper))?;
+                d.set_item("radius", e.radius)?;
+                d.set_item("level", e.level)?;
+                d.set_item("n_boot", e.n_boot)?;
+                d.set_item("summary", e.summary())?;
+                Ok(d)
+            })
+            .collect()
     }
 }
 

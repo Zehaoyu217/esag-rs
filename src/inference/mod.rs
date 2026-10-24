@@ -4,11 +4,13 @@
 //! covariate dependence (`tests`).
 
 pub mod bootstrap;
+pub mod covariance;
 pub mod gof;
 pub mod regions;
 pub mod tests;
 
 pub use bootstrap::{BootstrapResult, bootstrap_coef};
+pub use covariance::{CovarianceEstimate, covariance_intervals, geodesic_distance};
 pub use gof::{GofMethod, GofResult, bootstrap_gof};
 pub use regions::{
     PredictionRegion, bootstrap_refits, confidence_region_sample, prediction_region,
