@@ -27,6 +27,7 @@ use crate::distribution::{Esag, residual_q};
 use crate::error::{EsagError, Result};
 use crate::frame::Frame;
 use crate::loglik;
+use crate::logtangent::LtFrame;
 use crate::optim::lbfgs::{Lbfgs, LbfgsConfig, Objective, OptimResult, Status, minimize};
 use crate::stats::normal::norm_sf;
 use nalgebra::{DMatrix, DVector};
@@ -39,6 +40,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn default_true() -> bool {
     true
+}
+
+/// How the shape rows of `eta` parameterize the covariance `V`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Shape {
+    /// Yu & Huang's `gamma` (the papers' model).
+    #[default]
+    Gamma,
+    /// The smooth log-tangent coordinates `s` of [`crate::logtangent`]:
+    /// `V = μ̂μ̂ᵀ + Ξ(μ̂) exp(S) Ξ(μ̂)ᵀ`, `S` traceless symmetric, with the
+    /// frame `Ξ` transported from a reference direction (the data's mean
+    /// direction unless [`EsagRegressor::lt_reference`] is set). Same
+    /// distributions and parameter count as `gamma`, but `V` depends smoothly
+    /// on `s`, so the likelihood has no cliffs (see `docs/MATH.md`).
+    LogTangent,
 }
 
 /// How the optimiser is initialised.
@@ -96,6 +112,14 @@ pub struct EsagRegressor {
     pub mask: Option<DMatrix<bool>>,
     /// Optional feature names for `summary()`.
     pub feature_names: Option<Vec<String>>,
+    /// Shape parameterization (default [`Shape::Gamma`]).
+    #[serde(default)]
+    pub shape: Shape,
+    /// Reference direction of the log-tangent frame (`Shape::LogTangent`);
+    /// `None` = the sample mean direction of `Y`. A fitted model records the
+    /// direction it used, so refits keep the same frame.
+    #[serde(default)]
+    pub lt_reference: Option<Vec<f64>>,
     /// Preconditioner for warm-started refits: a lower-triangular factor `L`
     /// of an approximate inverse Hessian over the free parameters (optimiser
     /// order). L-BFGS then works in `z` with `θ = θ₀ + L z`, where the
@@ -127,6 +151,8 @@ impl EsagRegressor {
             verbose: false,
             mask: None,
             feature_names: None,
+            shape: Shape::Gamma,
+            lt_reference: None,
             precondition: None,
         }
     }
@@ -177,6 +203,38 @@ impl EsagRegressor {
         self
     }
     /// Feature names (length = number of columns of `X`, excluding intercept).
+    pub fn with_shape(mut self, shape: Shape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    pub fn with_lt_reference(mut self, m: Option<Vec<f64>>) -> Self {
+        self.lt_reference = m;
+        self
+    }
+
+    /// Validated data with the kernel for this configuration's shape.
+    pub(crate) fn data(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<RegressionData> {
+        let mut data = RegressionData::new(x, y, self.fit_intercept)?;
+        if self.shape == Shape::LogTangent {
+            let m = match &self.lt_reference {
+                Some(m) => {
+                    if m.len() != data.d {
+                        return Err(EsagError::Shape(format!(
+                            "lt_reference has length {} but d = {}",
+                            m.len(),
+                            data.d
+                        )));
+                    }
+                    m.clone()
+                }
+                None => mean_direction(&data.y, data.n, data.d),
+            };
+            data.lt = Some(LtFrame::new(&m));
+        }
+        Ok(data)
+    }
+
     pub fn with_feature_names(mut self, names: Vec<String>) -> Self {
         self.feature_names = Some(names);
         self
@@ -189,7 +247,7 @@ impl EsagRegressor {
     /// configuration (including `seed`), not on thread timing or the number
     /// of threads.
     pub fn fit(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<EsagRegressorFit> {
-        let data = RegressionData::new(x, y, self.fit_intercept)?;
+        let data = self.data(x, y)?;
         let mask = self.resolve_mask(&data)?;
         let inits: Vec<Init> = match &self.init {
             Init::Auto => vec![Init::DataDriven, Init::RStyle],
@@ -250,7 +308,7 @@ impl EsagRegressor {
         y: &DMatrix<f64>,
         b0: &DMatrix<f64>,
     ) -> Result<EsagRegressorFit> {
-        let data = RegressionData::new(x, y, self.fit_intercept)?;
+        let data = self.data(x, y)?;
         if b0.nrows() != data.b_dim || b0.ncols() != data.p_total {
             return Err(EsagError::Shape(format!(
                 "warm start must be {}×{}, got {}×{}",
@@ -312,21 +370,31 @@ impl EsagRegressor {
                 b.copy_from(m);
             }
             Init::RStyle => {
+                // gamma: just off the isotropic kink; log-tangent: smooth at 0
+                let shape0 = if data.lt.is_some() { 0.0 } else { 1e-3 };
                 for j in 0..p_total {
                     for k in 0..d {
                         b[(k, j)] = 1.0;
                     }
                     for k in d..b_dim {
-                        b[(k, j)] = 1e-3;
+                        b[(k, j)] = shape0;
                     }
                 }
             }
             Init::DataDriven | Init::Auto => {
                 let (mu0, gamma0) = moment_start(&data.y, data.n, d);
+                let shape0 = match &data.lt {
+                    None => gamma0,
+                    Some(fr) => {
+                        let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
+                        let v = DMatrix::from_row_slice(d, d, &v);
+                        crate::logtangent::s_from_covariance(fr, &mu0, &v)
+                    }
+                };
                 for k in 0..d {
                     b[(k, 0)] = mu0[k];
                 }
-                for (k, g) in gamma0.iter().enumerate() {
+                for (k, g) in shape0.iter().enumerate() {
                     b[(d + k, 0)] = *g;
                 }
             }
@@ -472,7 +540,8 @@ impl EsagRegressor {
             parallel: self.parallel,
             // groups j ≥ 2 (where observations can get pinned) exist from d = 4;
             // in practice traps need d ≥ 5 and covariates
-            trap_streak: (data.d >= 5 && data.p > 0).then(|| AtomicUsize::new(0)),
+            trap_streak: (data.lt.is_none() && data.d >= 5 && data.p > 0)
+                .then(|| AtomicUsize::new(0)),
         }
     }
 
@@ -576,7 +645,7 @@ impl EsagRegressor {
         // Pick the canonical member of the {B, B with gamma group 1 negated}
         // equivalence class (identical likelihood, see `canonicalize_coef`).
         let mut coef = best.coef.clone();
-        if data.p_total == 1 && mask.iter().all(|&f| f) && data.d >= 4 {
+        if data.lt.is_none() && data.p_total == 1 && mask.iter().all(|&f| f) && data.d >= 4 {
             // Intercept-only fit: replace gamma by the canonical member of its
             // equivalence class (same V, same likelihood), so equivalent
             // solutions report identical gamma in every dimension.
@@ -599,7 +668,7 @@ impl EsagRegressor {
                 best.grad = g;
             }
         }
-        if canonicalize_coef(&mut coef, data.d) {
+        if data.lt.is_none() && canonicalize_coef(&mut coef, data.d) {
             for (xi, &(k, _)) in best.x.iter_mut().zip(&free) {
                 if k == data.d || k == data.d + 1 {
                     *xi = -*xi;
@@ -688,6 +757,11 @@ impl EsagRegressor {
         };
 
         let feature_names = self.param_column_names(data);
+        let mut config = self.clone();
+        if let Some(fr) = &data.lt {
+            config.lt_reference = Some(fr.reference().to_vec());
+        }
+        config.precondition = None;
         Ok(EsagRegressorFit {
             d: data.d,
             n_features: data.p,
@@ -705,7 +779,7 @@ impl EsagRegressor {
             hessian,
             cov_params,
             column_names: feature_names,
-            config: self.clone(),
+            config,
         })
     }
 
@@ -724,6 +798,25 @@ impl EsagRegressor {
         }
         names
     }
+}
+
+/// Normalised sample mean of unit vectors `y` (row-major `n × d`), or `e_d`
+/// if the mean is (numerically) zero.
+fn mean_direction(y: &[f64], n: usize, d: usize) -> Vec<f64> {
+    let mut m = vec![0.0; d];
+    for i in 0..n {
+        for k in 0..d {
+            m[k] += y[i * d + k];
+        }
+    }
+    let nrm = m.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if nrm > 1e-8 * n as f64 {
+        m.iter_mut().for_each(|v| *v /= nrm);
+    } else {
+        m = vec![0.0; d];
+        m[d - 1] = 1.0;
+    }
+    m
 }
 
 /// Moment-based starting values from unit vectors `y` (row-major `n × d`):
@@ -949,6 +1042,9 @@ pub(crate) struct RegressionData {
     pub x: Vec<f64>,
     /// n × d row-major unit vectors
     pub y: Vec<f64>,
+    /// Log-tangent frame when the shape rows are log-tangent coordinates
+    /// (`None`: gamma).
+    pub lt: Option<LtFrame>,
 }
 
 impl RegressionData {
@@ -1013,6 +1109,7 @@ impl RegressionData {
             b_dim: dims::eta_len(d),
             x: xf,
             y: yf,
+            lt: None,
         })
     }
 }
@@ -1201,7 +1298,7 @@ fn joint_eval(
         for (r, i) in rows.enumerate() {
             let yi = &data.y[i * d..(i + 1) * d];
             let gcol = &mut ge.as_mut_slice()[r * bd..(r + 1) * bd];
-            f += loglik::loglik_eta_grad(&eta.as_slice()[r * bd..(r + 1) * bd], yi, gcol);
+            f += kernel_grad(data, &eta.as_slice()[r * bd..(r + 1) * bd], yi, gcol);
             if ratio {
                 norms.push(gcol.iter().map(|v| v * v).sum::<f64>());
             }
@@ -1251,12 +1348,63 @@ fn joint_eval(
     (f, DMatrix::from_row_slice(bd, pt, &g), r)
 }
 
+/// Per-observation log-density and gradient in `eta` for the data's shape
+/// parameterization.
+#[inline]
+fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
+    match &data.lt {
+        None => loglik::loglik_eta_grad(eta, y, g),
+        Some(fr) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
+    }
+}
+
+/// Value, gradient and central-difference Hessian (step
+/// `1e-5·max(1, |eta_i|)`, symmetrised) of an exact-gradient function.
+fn fd_hessian(
+    eta: &[f64],
+    grad: &mut [f64],
+    hess: &mut [f64],
+    gradient: impl Fn(&[f64], &mut [f64]) -> f64,
+) -> f64 {
+    let n = eta.len();
+    let f = gradient(eta, grad);
+    let mut e = eta.to_vec();
+    let mut gp = vec![0.0; n];
+    let mut gm = vec![0.0; n];
+    for i in 0..n {
+        let h = 1e-5 * eta[i].abs().max(1.0);
+        let (xp, xm) = (eta[i] + h, eta[i] - h);
+        e[i] = xp;
+        gradient(&e, &mut gp);
+        e[i] = xm;
+        gradient(&e, &mut gm);
+        e[i] = eta[i];
+        let inv = 1.0 / (xp - xm);
+        for j in 0..n {
+            hess[j * n + i] = (gp[j] - gm[j]) * inv;
+        }
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let s = 0.5 * (hess[i * n + j] + hess[j * n + i]);
+            hess[i * n + j] = s;
+            hess[j * n + i] = s;
+        }
+    }
+    f
+}
+
 /// Per-observation value, gradient and Hessian in `eta`. Exact second-order
 /// AD for `d = 3` (0.36 µs); for `d ≥ 4` central differences of the exact
 /// reverse-mode gradient, which are faster (d = 4: 1.25 vs 1.9 µs; d = 6:
 /// 4.0 vs 23 µs) and agree with the exact Hessian to ~1e-8 relative.
 #[inline]
-fn obs_hessian(eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
+fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
+    if let Some(fr) = &data.lt {
+        return fd_hessian(eta, g, h, |e, gr| {
+            crate::logtangent::loglik_lt_grad(fr, e, y, gr)
+        });
+    }
     if eta.len() == 5 {
         crate::hdual::loglik_eta_hess(eta, y, g, h)
     } else {
@@ -1307,7 +1455,7 @@ pub(crate) fn joint_loglik_grad_hess(
                     .map(|(a, c)| a * c)
                     .sum();
             }
-            f += obs_hessian(&eta, yi, &mut ge, &mut he);
+            f += obs_hessian(data, &eta, yi, &mut ge, &mut he);
             for j in 0..pt {
                 for k in 0..bd {
                     g[j * bd + k] += ge[k] * xi[j];
@@ -1498,9 +1646,34 @@ impl EsagRegressorFit {
     /// The fitted conditional distribution `ESAG(mu_i, gamma_i)` for every row.
     pub fn predict_distribution(&self, x: &DMatrix<f64>) -> Result<Vec<Esag>> {
         let eta = self.linear_predictor(x)?;
+        let lt = self.lt_frame();
         (0..x.nrows())
-            .map(|i| Esag::from_eta(eta.row(i).iter().copied().collect::<Vec<_>>().as_slice()))
+            .map(|i| {
+                let row: Vec<f64> = eta.row(i).iter().copied().collect();
+                self.distribution_at(&row, lt.as_ref())
+            })
             .collect()
+    }
+
+    /// The log-tangent frame of a `Shape::LogTangent` fit.
+    pub fn lt_frame(&self) -> Option<LtFrame> {
+        match (self.config.shape, &self.config.lt_reference) {
+            (Shape::LogTangent, Some(m)) => Some(LtFrame::new(m)),
+            _ => None,
+        }
+    }
+
+    /// The distribution for one linear predictor `eta` (in this model's
+    /// shape parameterization; pass `self.lt_frame()` for log-tangent fits).
+    pub fn distribution_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Result<Esag> {
+        match lt {
+            None => Esag::from_eta(eta),
+            Some(fr) => {
+                let d = self.d;
+                let v = crate::logtangent::covariance(fr, &eta[..d], &eta[d..]);
+                Esag::from_covariance(&eta[..d], &v)
+            }
+        }
     }
 
     /// Per-observation log-likelihood `log f(y_i; eta_i)`.
@@ -1513,13 +1686,18 @@ impl EsagRegressorFit {
             )));
         }
         let eta = self.linear_predictor(x)?;
+        let lt = self.lt_frame();
         let mut out = DVector::zeros(data.n);
         let mut e = vec![0.0; self.b_dim()];
         for i in 0..data.n {
             for k in 0..self.b_dim() {
                 e[k] = eta[(i, k)];
             }
-            out[i] = loglik::loglik_eta(&e, &data.y[i * self.d..(i + 1) * self.d]);
+            let yi = &data.y[i * self.d..(i + 1) * self.d];
+            out[i] = match &lt {
+                None => loglik::loglik_eta(&e, yi),
+                Some(fr) => crate::logtangent::loglik_lt(fr, &e, yi),
+            };
         }
         Ok(out)
     }
@@ -1536,11 +1714,15 @@ impl EsagRegressorFit {
         let data = RegressionData::new(x, y, self.fit_intercept)?;
         let eta = self.linear_predictor(x)?;
         let d = self.d;
+        let lt = self.lt_frame();
         let mut q = Vec::with_capacity(data.n);
         let mut t1 = Vec::with_capacity(data.n);
         for i in 0..data.n {
             let e: Vec<f64> = (0..self.b_dim()).map(|k| eta[(i, k)]).collect();
-            let frame = Frame::new(&e[..d], &e[d..]);
+            let frame = match &lt {
+                None => Frame::new(&e[..d], &e[d..]),
+                Some(_) => self.distribution_at(&e, lt.as_ref())?.frame(),
+            };
             let yi = &data.y[i * d..(i + 1) * d];
             let qi = residual_q(&frame, yi);
             let s: f64 = frame.lambda.iter().sum();
@@ -1582,15 +1764,21 @@ impl EsagRegressorFit {
         Some(se)
     }
 
-    /// Names of the `eta` rows: `mu[1]..mu[d], gamma[1]..gamma[g]`.
+    /// Names of the `eta` rows: `mu[1]..mu[d]`, then `gamma[1]..gamma[g]`
+    /// (or `s[1]..s[g]` for the log-tangent shape).
     pub fn row_names(&self) -> Vec<String> {
         let d = self.d;
+        let shape = if self.config.shape == Shape::LogTangent {
+            "s"
+        } else {
+            "gamma"
+        };
         (0..self.b_dim())
             .map(|k| {
                 if k < d {
                     format!("mu[{}]", k + 1)
                 } else {
-                    format!("gamma[{}]", k - d + 1)
+                    format!("{shape}[{}]", k - d + 1)
                 }
             })
             .collect()

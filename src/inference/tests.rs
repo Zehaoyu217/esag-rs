@@ -160,9 +160,16 @@ fn moment_stat(
     let diffs: Vec<Vec<f64>> = if n_mc == 0 {
         let eta = fit0.linear_predictor(x)?;
         let bd = eta.ncols();
+        let lt = fit0.lt_frame();
         let one = |i: usize| -> Vec<f64> {
             let row: Vec<f64> = (0..bd).map(|k| eta[(i, k)]).collect();
-            let frame = Frame::new(&row[..d], &row[d..]);
+            let frame = match &lt {
+                None => Frame::new(&row[..d], &row[d..]),
+                Some(_) => fit0
+                    .distribution_at(&row, lt.as_ref())
+                    .expect("valid log-tangent parameters")
+                    .frame(),
+            };
             let ey2 = second_moment_diag_from_frame(&frame);
             (0..d).map(|k| y[(i, k)].powi(2) - ey2[k]).collect()
         };

@@ -2,7 +2,7 @@
 //! `cargo run --release --example big_fit [-- --quick]`
 
 use esag::distribution::Esag;
-use esag::regression::EsagRegressor;
+use esag::regression::{EsagRegressor, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -12,6 +12,19 @@ use std::time::Instant;
 /// Simulate `n` responses on S^{d-1} with `p` standard-normal covariates.
 /// Intercept: ‖μ‖ ≈ 4, moderate anisotropy; slopes of size ~0.3.
 pub fn sim(d: usize, p: usize, n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>) {
+    sim_shape(d, p, n, seed, Shape::Gamma)
+}
+
+/// As [`sim`], with the shape rows read in either parameterization (for
+/// `LogTangent` the frame's reference direction is `e_d`).
+pub fn sim_shape(
+    d: usize,
+    p: usize,
+    n: usize,
+    seed: u64,
+    shape: Shape,
+) -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>) {
+    let lt = esag::logtangent::LtFrame::standard(d);
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let bd = esag::dims::eta_len(d);
     let b = DMatrix::from_fn(bd, p + 1, |k, j| {
@@ -36,7 +49,13 @@ pub fn sim(d: usize, p: usize, n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f6
         for k in 0..bd {
             eta[k] = b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>();
         }
-        let dist = Esag::from_eta(&eta).unwrap();
+        let dist = match shape {
+            Shape::Gamma => Esag::from_eta(&eta).unwrap(),
+            Shape::LogTangent => {
+                let v = esag::logtangent::covariance(&lt, &eta[..d], &eta[d..]);
+                Esag::from_covariance(&eta[..d], &v).unwrap()
+            }
+        };
         dist.sample_one(&dist.frame(), &mut rng, &mut buf);
         for k in 0..d {
             y[(i, k)] = buf[k];
@@ -49,38 +68,40 @@ fn main() {
     let quick = std::env::args().any(|a| a == "--quick");
     let ns: &[usize] = if quick { &[2000] } else { &[1000, 5000, 20000] };
     println!(
-        "{:<28}{:>8}{:>8}{:>7}{:>11}{:>11}{:>10}{:>6}",
-        "case", "params", "iters", "fev", "fit", "fit+SE", "|grad|", "conv"
+        "{:<22}{:>7} | {:>27} | {:>27}",
+        "case", "params", "gamma: fit+SE  iters conv", "log-tangent: fit+SE iters conv"
     );
-    for &(d, p) in &[(7usize, 5usize), (7, 6), (8, 5), (8, 6)] {
-        for &n in ns {
-            let (x, y, _) = sim(d, p, n, 11);
-            let t = Instant::now();
-            let f0 = EsagRegressor::new()
-                .with_hessian(false)
-                .fit(&x, &y)
-                .unwrap();
-            let t_fit = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let f1 = EsagRegressor::new().fit(&x, &y).unwrap();
-            let t_se = t.elapsed().as_secs_f64();
-            println!(
-                "{:<28}{:>8}{:>8}{:>7}{:>9.1}ms{:>9.1}ms{:>10.1e}{:>6}",
-                format!("d={d} p={p} n={n}"),
-                f0.n_params(),
-                f0.n_iter,
-                f0.n_fev,
-                t_fit * 1e3,
-                t_se * 1e3,
-                f1.grad_norm,
-                f1.converged
-            );
-            if (f0.log_likelihood - f1.log_likelihood).abs()
-                > 1e-3 * f1.log_likelihood.abs().max(1.0)
-            {
+    for (truth, label) in [
+        (Shape::Gamma, "data from the gamma model"),
+        (Shape::LogTangent, "data from the log-tangent model"),
+    ] {
+        println!("-- {label}");
+        for &(d, p) in &[(7usize, 5usize), (7, 6), (8, 5), (8, 6)] {
+            for &n in ns {
+                let (x, y, _) = sim_shape(d, p, n, 11, truth);
+                let mut cells = vec![];
+                let mut lls = vec![];
+                for shape in [Shape::Gamma, Shape::LogTangent] {
+                    let t = Instant::now();
+                    let f = EsagRegressor::new().with_shape(shape).fit(&x, &y).unwrap();
+                    let dt = t.elapsed().as_secs_f64();
+                    cells.push(format!(
+                        "{:>10.1}ms {:>5} {:>5}{:>5}",
+                        dt * 1e3,
+                        f.n_iter,
+                        if f.converged { "yes" } else { "NO" },
+                        ""
+                    ));
+                    lls.push(f.log_likelihood);
+                }
                 println!(
-                    "   ! loglik differs: {} vs {}",
-                    f0.log_likelihood, f1.log_likelihood
+                    "{:<22}{:>7} | {} | {}   ll γ {:.2} / lt {:.2}",
+                    format!("d={d} p={p} n={n}"),
+                    esag::dims::eta_len(d) * (p + 1),
+                    cells[0],
+                    cells[1],
+                    lls[0],
+                    lls[1]
                 );
             }
         }

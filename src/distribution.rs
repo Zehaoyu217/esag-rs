@@ -66,6 +66,38 @@ impl Esag {
         Self::new(&eta[..d], &eta[d..])
     }
 
+    /// The ESAG distribution with mean `mu` and covariance `v` (`V mu = mu`
+    /// up to rounding; `V` is rescaled to determinant 1), via the canonical
+    /// `gamma` of [`crate::param::gamma_from_covariance`]. Exactly tied
+    /// tangent eigenvalues are separated by a relative 1e-10 first: the
+    /// `gamma` family reaches such `V` only as a limit.
+    pub fn from_covariance(mu: &[f64], v: &DMatrix<f64>) -> Result<Self> {
+        let d = mu.len();
+        let rowmajor: Vec<f64> = (0..d)
+            .flat_map(|r| (0..d).map(move |c| (r, c)))
+            .map(|(r, c)| v[(r, c)])
+            .collect();
+        let gamma = crate::param::gamma_from_covariance(mu, &rowmajor);
+        let dist = Self::new(mu, &gamma)?;
+        let scale = v.determinant().powf(1.0 / d as f64);
+        let err = (dist.covariance() - v / scale).abs().max();
+        if err <= 1e-8 * (v / scale).abs().max().max(1.0) {
+            return Ok(dist);
+        }
+        // separate exact ties along the tangent eigen-directions
+        let eig = nalgebra::SymmetricEigen::new((v + v.transpose()) * 0.5);
+        let mut vals = eig.eigenvalues.clone();
+        for (j, x) in vals.iter_mut().enumerate() {
+            *x *= 1.0 + 1e-10 * j as f64;
+        }
+        let v2 = &eig.eigenvectors * DMatrix::from_diagonal(&vals) * eig.eigenvectors.transpose();
+        let rowmajor: Vec<f64> = (0..d)
+            .flat_map(|r| (0..d).map(move |c| (r, c)))
+            .map(|(r, c)| v2[(r, c)])
+            .collect();
+        Self::new(mu, &crate::param::gamma_from_covariance(mu, &rowmajor))
+    }
+
     /// Ambient dimension `d` (the data live on S^{d-1}).
     pub fn dim(&self) -> usize {
         self.mu.len()
