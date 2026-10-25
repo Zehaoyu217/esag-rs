@@ -167,7 +167,7 @@ Evidence (the hard scenario of `examples/hard_scenario.rs`, `n = 2000`,
   7 of 8 fits at `d = 5` end in traps, as many as with `x1, x3, x4`
   (`gamma_trap_reach`). At `d = 4`, whose only trailing pair is group 2's,
   21 of 24 fits converge at `n = 2000` (but 1 of 12 at `n = 200`, and
-  15–20× slower than log-tangent at every n);
+  19–110× slower than log-tangent (n = 2000 to 200));
 * the race never converged (0 of 12 at `d = 5` and `d = 8`, n = 500 and
   2000); the perturbed restarts never rescued a trapped fit (0 of 51, hard
   and standard scenarios), and only found other traps, up to 67

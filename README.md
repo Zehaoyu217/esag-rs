@@ -634,7 +634,7 @@ continuous. Consequences:
   than the trap (4 of 5 comparisons), but gradient methods do not reach
   them reliably. This is a property of the γ-linear model, not of the
   optimizer; the log-tangent model on the same kind of data converges in
-  251 of 252 fits from n = 200 on, and at d = 4 in 36 of 36, 15–110×
+  251 of 252 fits from n = 200 on, and at d = 4 in 36 of 36, 19–110×
   faster than γ.
 * **The frame's pole.** `onb(μ)` is singular where `μ_0 = μ_1 = 0`. When
   the data's mean direction is near that set (for example near `e_d`), γ
