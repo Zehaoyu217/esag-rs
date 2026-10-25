@@ -1227,3 +1227,150 @@ mod gamma_refits {
         }
     }
 }
+
+#[cfg(test)]
+mod refit_choices {
+    //! Which refit settings the bootstrap statistics need (hard scenario).
+    use super::*;
+    use crate::regression::Shape;
+    use crate::regression::fit_profile::{config, hard_truth, simulate};
+
+    /// The γ second full-refit start, and looser refit tolerances, against
+    /// the current refits. `cargo test --release --lib refit_choices -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn second_start_and_tolerance() {
+        let reps: usize = std::env::var("R")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        for (d, shape) in [
+            (3usize, Shape::Gamma),
+            (3, Shape::LogTangent),
+            (5, Shape::LogTangent),
+        ] {
+            let (x, y) = simulate(&hard_truth(d), 2000, 7, shape);
+            let fit = config(d, shape).fit(&x, &y).unwrap();
+            for null in [
+                Restriction::GammaOfFeature(0),
+                Restriction::Feature(4),
+                Restriction::ConstantShape,
+            ] {
+                let mask0 = restriction_mask(&fit, &null).unwrap();
+                let mut b0 = fit.coef.clone();
+                for (v, &f) in b0.iter_mut().zip(mask0.iter()) {
+                    if !f {
+                        *v = 0.0;
+                    }
+                }
+                let mut cfg0 = refit_config(&fit);
+                cfg0.mask = Some(mask0.clone());
+                cfg0.precondition = None;
+                let fit0 = {
+                    let mut once = cfg0.clone();
+                    once.compute_hessian = true;
+                    once.fit_warm(&x, &y, &b0).unwrap()
+                };
+                cfg0.precondition = fit0
+                    .cov_params
+                    .as_ref()
+                    .and_then(crate::regression::precondition_from_cov);
+                let mut cfg_a = refit_config(&fit);
+                cfg_a.precondition = cfg_a.precondition_at(&x, &y, &fit0.coef, &fit.mask);
+                let cfg_a2 = refit_config(&fit);
+                let one = |b: usize, tol: Option<f64>, second: bool| {
+                    let mut rng = crate::stream_rng(3, 5, b as u64);
+                    let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+                    let (mut c0, mut ca, mut ca2) = (cfg0.clone(), cfg_a.clone(), cfg_a2.clone());
+                    c0.refit_decrement = tol;
+                    ca.refit_decrement = tol;
+                    ca2.refit_decrement = tol;
+                    let f0 = c0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+                    let mut ba = f0.coef.clone();
+                    for &(k, j) in &fit.free {
+                        if !mask0[(k, j)] {
+                            ba[(k, j)] = if k < d || shape == Shape::LogTangent {
+                                0.0
+                            } else {
+                                1e-3
+                            };
+                        }
+                    }
+                    let fa1 = ca.fit_warm(&x, &yb, &ba).unwrap();
+                    let mut fev = f0.n_fev + fa1.n_fev;
+                    let mut gain2 = 0.0;
+                    let fa = if second {
+                        let fa2 = ca2.fit_warm(&x, &yb, &fit.coef).unwrap();
+                        fev += fa2.n_fev;
+                        gain2 = fa2.log_likelihood - fa1.log_likelihood;
+                        if fa2.log_likelihood > fa1.log_likelihood {
+                            fa2
+                        } else {
+                            fa1
+                        }
+                    } else {
+                        fa1
+                    };
+                    let lr = -2.0 * (f0.log_likelihood - fa.log_likelihood);
+                    let (roc, dd) = roc_and_d(
+                        &f0.linear_predictor(&x).unwrap(),
+                        &fa.linear_predictor(&x).unwrap(),
+                        d,
+                    );
+                    (lr, roc, dd, fev, gain2)
+                };
+                let gamma = shape == Shape::Gamma;
+                let base: Vec<(f64, f64, f64, usize, f64)> = (0..reps)
+                    .into_par_iter()
+                    .map(|b| one(b, None, gamma))
+                    .collect();
+                let sd = |v: &[f64]| {
+                    let m = v.iter().sum::<f64>() / v.len() as f64;
+                    (v.iter().map(|a| (a - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
+                };
+                let roc_sd = sd(&base.iter().map(|r| r.1).collect::<Vec<_>>());
+                let fev0 = base.iter().map(|r| r.3).sum::<usize>() as f64 / reps as f64;
+                let mut line = format!(
+                    "d={d} {:<10} {:<28} fev {fev0:5.1}",
+                    format!("{shape:?}"),
+                    restriction_label(&fit, &null)
+                );
+                if gamma {
+                    let g: Vec<f64> = base.iter().map(|r| r.4).collect();
+                    let n_pos = g.iter().filter(|&&v| v > 1e-4).count();
+                    let gmax = g.iter().fold(0.0f64, |a, &v| a.max(v));
+                    let without: Vec<(f64, f64, f64, usize, f64)> = (0..reps)
+                        .into_par_iter()
+                        .map(|b| one(b, None, false))
+                        .collect();
+                    let fev1 = without.iter().map(|r| r.3).sum::<usize>() as f64 / reps as f64;
+                    line += &format!(
+                        " | 2nd start better (>1e-4) in {n_pos}/{reps}, by up to {gmax:.3}; without it fev {fev1:5.1}"
+                    );
+                }
+                for tol in [1e-5, 1e-4] {
+                    let alt: Vec<(f64, f64, f64, usize, f64)> = (0..reps)
+                        .into_par_iter()
+                        .map(|b| one(b, Some(tol), gamma))
+                        .collect();
+                    let fev = alt.iter().map(|r| r.3).sum::<usize>() as f64 / reps as f64;
+                    let dlr = alt
+                        .iter()
+                        .zip(&base)
+                        .map(|(a, b)| (a.0 - b.0).abs())
+                        .fold(0.0, f64::max);
+                    let droc = alt
+                        .iter()
+                        .zip(&base)
+                        .map(|(a, b)| (a.1 - b.1).abs())
+                        .fold(0.0, f64::max);
+                    line += &format!(
+                        " | tol {tol:.0e}: fev {fev:5.1}, max |dLR| {dlr:.1e}, max |dRoC|/sd {:.1e}",
+                        droc / roc_sd
+                    );
+                }
+                println!("{line}");
+            }
+        }
+    }
+}

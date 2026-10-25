@@ -135,6 +135,10 @@ pub struct EsagRegressor {
     /// at the start instead.
     #[serde(skip)]
     pub(crate) local_precondition: bool,
+    /// Stopping rule of whitened refits (predicted remaining gain); `None`
+    /// = [`REFIT_DECREMENT`].
+    #[serde(skip)]
+    pub(crate) refit_decrement: Option<f64>,
 }
 
 impl Default for EsagRegressor {
@@ -164,6 +168,7 @@ impl EsagRegressor {
             lt_reference: None,
             precondition: None,
             local_precondition: false,
+            refit_decrement: None,
         }
     }
     /// Whether to add an intercept column.
@@ -663,7 +668,7 @@ impl EsagRegressor {
                 tol_decrement: if self.compute_hessian {
                     HANDOFF_DECREMENT
                 } else {
-                    REFIT_DECREMENT
+                    self.refit_decrement.unwrap_or(REFIT_DECREMENT)
                 },
                 tol_grad_abs: 0.0,
                 max_iter: iters,
@@ -1403,47 +1408,83 @@ fn empirical_precondition(
     b: &DMatrix<f64>,
     free: &[(usize, usize)],
 ) -> Option<Arc<DMatrix<f64>>> {
+    let (info, _) = score_info(data, b, free);
+    precondition_from_cov(&info.cholesky()?.inverse())
+}
+
+/// Index of the pair `(a, b)`, `a ≤ b < n`, in the order
+/// `(0, 0), (0, 1), …, (0, n−1), (1, 1), …`.
+#[inline]
+fn pair_index(a: usize, b: usize, n: usize) -> usize {
+    let (lo, hi) = (a.min(b), a.max(b));
+    lo * n - lo * (lo + 1) / 2 + hi
+}
+
+/// The empirical information `Σ_i s_i s_iᵀ` and the score `Σ_i s_i` over
+/// the coefficients `free` at `b`, with `s_i` the score of observation `i`
+/// (entry `(k, j)`: `∂ℓ_i/∂η_k · x̃_ij`). As `s_i s_iᵀ = (x̃_i x̃_iᵀ) ⊗
+/// (g_i g_iᵀ)`, every entry is one of the `pt(pt+1)/2 × bd(bd+1)/2` sums
+/// `Σ_i x̃_ij x̃_ij' g_ik g_ik'`, which come out of one matrix product per
+/// chunk of observations (as in [`joint_loglik_grad_hess`]): at d = 8 with
+/// 6 design columns, 1.7× fewer operations than the Gram matrix of the
+/// `s_i`, in one large product.
+fn score_info(
+    data: &RegressionData,
+    b: &DMatrix<f64>,
+    free: &[(usize, usize)],
+) -> (DMatrix<f64>, DVector<f64>) {
     const CHUNK: usize = 256;
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
-    let nf = free.len();
-    let mut info = DMatrix::<f64>::zeros(nf, nf);
-    let mut ge = vec![0.0; bd];
+    let (nx, nh) = (pt * (pt + 1) / 2, bd * (bd + 1) / 2);
+    // c[(η pair, x pair)]; per observation the η products are one
+    // contiguous column of `ggt`
+    let mut c = DMatrix::<f64>::zeros(nh, nx);
+    let mut gsum = DMatrix::<f64>::zeros(bd, pt);
     for start in (0..data.n).step_by(CHUNK) {
         let end = (start + CHUNK).min(data.n);
         let m = end - start;
         let xt = nalgebra::DMatrixView::from_slice(&data.x[start * pt..end * pt], pt, m);
         let eta = b * xt;
-        let mut s = DMatrix::<f64>::zeros(m, nf);
+        let mut ge = DMatrix::<f64>::zeros(bd, m);
+        let mut ggt = DMatrix::<f64>::zeros(nh, m);
+        let mut w = DMatrix::<f64>::zeros(m, nx);
         for r in 0..m {
             let i = start + r;
+            let gr = &mut ge.as_mut_slice()[r * bd..(r + 1) * bd];
             kernel_grad(
                 data,
                 &eta.as_slice()[r * bd..(r + 1) * bd],
                 &data.y[i * d..(i + 1) * d],
-                &mut ge,
+                gr,
             );
-            for (a, &(k, j)) in free.iter().enumerate() {
-                s[(r, a)] = ge[k] * data.x[i * pt + j];
+            let col = &mut ggt.as_mut_slice()[r * nh..(r + 1) * nh];
+            let mut q = 0;
+            for k1 in 0..bd {
+                let g1 = gr[k1];
+                for &g2 in &gr[k1..] {
+                    col[q] = g1 * g2;
+                    q += 1;
+                }
+            }
+            let xi = &data.x[i * pt..(i + 1) * pt];
+            let mut a = 0;
+            for j1 in 0..pt {
+                for j2 in j1..pt {
+                    w[(r, a)] = xi[j1] * xi[j2];
+                    a += 1;
+                }
             }
         }
-        info.gemm_tr(1.0, &s, &s, 1.0);
+        c.gemm(1.0, &ggt, &w, 1.0);
+        gsum.gemm(1.0, &ge, &xt.transpose(), 1.0);
     }
-    precondition_from_cov(&info.cholesky()?.inverse())
-}
-
-/// `info += SᵀS` on and below the diagonal (column blocks of 64; the upper
-/// blocks are left alone): the symmetric Gram matrix at about half the cost.
-fn gram_lower_add(info: &mut DMatrix<f64>, s: &DMatrix<f64>) {
-    const BS: usize = 64;
-    let k = s.ncols();
-    for a in (0..k).step_by(BS) {
-        let na = BS.min(k - a);
-        for b in (0..=a).step_by(BS) {
-            let nb = BS.min(k - b);
-            info.view_mut((a, b), (na, nb))
-                .gemm_tr(1.0, &s.columns(a, na), &s.columns(b, nb), 1.0);
-        }
-    }
+    let nf = free.len();
+    let info = DMatrix::from_fn(nf, nf, |a, e| {
+        let ((ka, ja), (ke, je)) = (free[a], free[e]);
+        c[(pair_index(ka, ke, bd), pair_index(ja, je, pt))]
+    });
+    let g = DVector::from_iterator(nf, free.iter().map(|&(k, j)| gsum[(k, j)]));
+    (info, g)
 }
 
 /// Lower Cholesky factor of a covariance matrix (the preconditioner for
@@ -2030,37 +2071,10 @@ impl EsagRegressorFit {
         y: &DMatrix<f64>,
         full: &[(usize, usize)],
     ) -> Result<f64> {
-        const CHUNK: usize = 256;
         let mut data = RegressionData::new(x, y, self.fit_intercept)?;
         data.lt = self.lt_frame();
-        let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
         let nf = full.len();
-        let mut info = DMatrix::<f64>::zeros(nf, nf);
-        let mut g = DVector::<f64>::zeros(nf);
-        let mut ge = vec![0.0; bd];
-        for start in (0..data.n).step_by(CHUNK) {
-            let end = (start + CHUNK).min(data.n);
-            let m = end - start;
-            let xt = nalgebra::DMatrixView::from_slice(&data.x[start * pt..end * pt], pt, m);
-            let eta = &self.coef * xt;
-            let mut s = DMatrix::<f64>::zeros(m, nf);
-            for r in 0..m {
-                let i = start + r;
-                kernel_grad(
-                    &data,
-                    &eta.as_slice()[r * bd..(r + 1) * bd],
-                    &data.y[i * d..(i + 1) * d],
-                    &mut ge,
-                );
-                for (a, &(k, j)) in full.iter().enumerate() {
-                    s[(r, a)] = ge[k] * data.x[i * pt + j];
-                }
-            }
-            gram_lower_add(&mut info, &s);
-            for a in 0..nf {
-                g[a] += s.column(a).sum();
-            }
-        }
+        let (info, g) = score_info(&data, &self.coef, full);
         // Order the kept coefficients first: the Cholesky factor `L` of `I`
         // then holds that of `I_ff` as its leading block, and with `Lz = g`,
         // `LM = Σ_{a ≥ k_f} z_a²` (one factorization, and no difference of
