@@ -364,9 +364,10 @@ pub fn hypothesis_test(
 /// [`hypothesis_test`] with the statistics of the restricted fit only, the
 /// score statistic `LM` and `M`: each replicate refits the restricted model
 /// and nothing else. The full-model refits are most of the cost of a test
-/// (all of its local maxima for the gamma shape at d ≥ 5 with covariates),
-/// so this is 2–4× faster; `LM` has the size and power of `LR`
-/// (`docs/MATH.md` §6). RoC, D and LR are reported at the data, without
+/// (and, for the gamma shape at d ≥ 5 with covariates, its slowest and most
+/// multimodal part), so this is 1.4–1.9× faster for the log-tangent shape
+/// and 2–4× for gamma (29× for its shape-constant null at d = 5); `LM` has
+/// the size and power of `LR` (`docs/MATH.md` §6). RoC, D and LR are reported at the data, without
 /// bootstrap p-values (`NaN`).
 pub fn score_test(
     fit_full: &EsagRegressorFit,
@@ -549,9 +550,11 @@ fn run_test(
         }
     }
     let nb = br.len().max(1) as f64;
+    let pv_all = |obs: f64, v: &[f64]| v.iter().filter(|&&s| obs < s).count() as f64 / nb;
+    // RoC, D and LR need the full refits, which a score test skips
     let pv = |obs: f64, v: &[f64]| {
         if full_refits {
-            v.iter().filter(|&&s| obs < s).count() as f64 / nb
+            pv_all(obs, v)
         } else {
             f64::NAN
         }
@@ -574,7 +577,7 @@ fn run_test(
         lr,
         p_roc: pv(roc, &br),
         p_d: pv(d_stat, &bd),
-        p_m: pv(m_stat, &bm),
+        p_m: pv_all(m_stat, &bm),
         p_lr: pv(lr, &bl),
         lm,
         p_lm,

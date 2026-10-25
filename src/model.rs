@@ -174,7 +174,8 @@ impl EsagResults {
         )
     }
     /// The same test from the restricted fit alone (score statistic `LM` and
-    /// `M`; see [`crate::inference::score_test`]): 2–4× faster.
+    /// `M`; see [`crate::inference::score_test`]): 1.4–1.9× faster for the
+    /// log-tangent shape, 2–4× (up to 29×) for gamma.
     pub fn score_test(
         &self,
         restriction: Restriction,

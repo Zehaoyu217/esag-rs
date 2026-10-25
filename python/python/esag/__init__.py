@@ -477,7 +477,8 @@ class ESAGResults(_CoefTable):
         and M, with bootstrap p-values from restricted refits only.
 
         The full-model refits are most of the cost of :meth:`test`, so this is
-        2-4x faster, and LM has the size and power of LR. RoC, D and LR are
+        1.4-1.9x faster for the log-tangent shape and 2-4x (up to 29x) for
+        gamma, and LM has the size and power of LR. RoC, D and LR are
         reported at the data, without bootstrap p-values (NaN).
         """
         if isinstance(exog, (int, np.integer)):

@@ -13,8 +13,10 @@ angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
 * maximum-likelihood fitting, without covariates or with them
   (`(μ_i, γ_i) = B·(1, x_i)`);
 * residuals, bootstrap goodness of fit, prediction regions, and bootstrap
-  hypothesis tests (RoC, D, M, LR) for isotropy and covariate effects, with
-  the second moments in `M` computed exactly instead of by Monte Carlo;
+  hypothesis tests (RoC, D, M, LR, and a score statistic LM) for covariate
+  effects on the mean and on an anisotropic shape, and for isotropy, with
+  the second moments in `M` computed exactly instead of by Monte Carlo, and
+  a score test that refits only the restricted model;
 * an opt-in smooth shape parameterization (`Shape::LogTangent`) for the same
   distributions, which removes the discontinuities of `γ ↦ V` that make large
   regressions (d = 7–8, 5–6 covariates) slow and unreliable;
@@ -62,8 +64,9 @@ res = model.fit()
 print(res.summary())                    # statsmodels-style table, one block per equation
 res.params, res.bse, res.pvalues, res.conf_int()
 
-res.test("isotropy", n_boot=500)        # RoC, D, M, LR with bootstrap p-values
-res.test("shape", "temp", n_boot=500)   # nulls: isotropy | mu | shape | feature
+res.test("shape", "temp", n_boot=500)   # RoC, D, M, LR, LM with bootstrap p-values
+res.test("constant_shape", n_boot=500)  # nulls: mu | shape | feature | constant_shape | isotropy
+res.score_test("shape", "temp")         # LM and M from restricted refits only: faster
 
 reg = model.fit_regularized("adaptive_group_lasso", groups="covariate_part")
 print(reg.summary())                    # relaxed refit of the selected model; dropped terms marked
@@ -86,7 +89,7 @@ session.
 
 ```rust
 use esag::regression::EsagRegressor;
-use esag::inference::{bootstrap_gof, hypothesis_test, prediction_region, GofMethod, Restriction};
+use esag::inference::{bootstrap_gof, hypothesis_test, prediction_region, score_test, GofMethod, Restriction};
 
 // x: n × p covariates (no intercept column), y: n × d unit vectors
 let model = EsagRegressor::new()
@@ -100,7 +103,8 @@ let mean_loglik = model.score(&x_test, &y_test)?;   // held-out mean log-likelih
 let resid = model.residuals(&x, &y)?;               // Q_i and T1_i (≈ χ²_{d−1})
 
 let gof = bootstrap_gof(&model, &x, &y, GofMethod::TwoSampleReference, 200, 1)?;
-let iso = hypothesis_test(&model, &x, &y, Restriction::Isotropy, 200, 0, 2)?;
+let shp = hypothesis_test(&model, &x, &y, Restriction::GammaOfFeature(0), 500, 0, 2)?;
+let fast = score_test(&model, &x, &y, Restriction::ConstantShape, 500, 0, 2)?;
 let pr  = prediction_region(&model, &x, &y, &[1.0], 5000, 100, &[0.95, 0.9], 3)?;
 
 std::fs::write("model.json", model.to_json()?)?;     // save; EsagRegressorFit::from_json loads
@@ -191,7 +195,7 @@ $B simulate --n 800 --out sim.csv
 $B fit sim.csv --y y1,y2,y3 --x x1 --model model.json
 $B predict model.json sim.csv --x x1 --out pred.csv
 $B gof model.json sim.csv --y y1,y2,y3 --x x1 --boot 200
-$B test model.json sim.csv --y y1,y2,y3 --x x1 --null isotropy --boot 200   # also: mu | gamma | feature
+$B test model.json sim.csv --y y1,y2,y3 --x x1 --null gamma --feature 0 --boot 200   # also: mu | feature | constant-shape | isotropy; --score
 $B region model.json sim.csv --y y1,y2,y3 --x x1 --at 0.5
 $B fit sim.csv --y y1,y2,y3 --x x1 --shape log-tangent
 $B penalize sim.csv --y y1,y2,y3 --x x1 --penalty adaptive-group-lasso --groups covariate-part
@@ -211,7 +215,8 @@ $B penalize sim.csv --y y1,y2,y3 --paper RoC-LASSO                          # th
 | `distribution::Esag` | the distribution: `log_pdf`, `pdf`, `sample`, `covariance`, `cov_pow`, `angles`, `mean_direction`, `residuals`, `region_statistic`. |
 | `preprocessing::MinMaxScaler` | rescales covariates to [1, 2], as the papers recommend. |
 | `inference::bootstrap_gof` | goodness-of-fit test: `TwoSampleReference` (paper's Algorithm 1) or `OneSampleChiSquare` (the R code's variant). |
-| `inference::hypothesis_test` | RoC, D, M, LR with parametric-bootstrap p-values. Nulls: `Isotropy`, `MuOfFeature(j)`, `GammaOfFeature(j)`, `Feature(j)`, `Custom(mask)`. |
+| `inference::hypothesis_test` | RoC, D, M, LR and the score statistic LM with parametric-bootstrap p-values. Nulls: `MuOfFeature(j)`, `GammaOfFeature(j)`, `Feature(j)`, `ConstantShape`, `Isotropy`, `Custom(mask)`. |
+| `inference::score_test` | the same nulls from restricted refits only (LM and M): 1.4–1.9× faster for log-tangent, 2–4× (up to 29×) for γ. |
 | `inference::{prediction_region, prediction_regions, region_coverage}` | CSDA Algorithm 4, with bootstrap refits shared across query points. |
 | `inference::bootstrap_coef` | pairs-bootstrap SEs and percentile intervals. |
 | `regression::canonicalize_coef` | picks the canonical sign of the first γ group (see identifiability below). |
@@ -293,6 +298,31 @@ At 1,000 replications the standard error of a rejection rate is 0.007.
 
 The last row shows why the papers use the bootstrap.
 
+**Size and power when V is anisotropic** (`cargo run --release --example
+aniso_study -- size|power`). The setting is n = 2000, 5 covariates + const,
+B = 199, and data from regressions whose V(x) is far from the identity:
+the median ratio of the largest to the smallest shape eigenvalue is 2–4 at
+d = 3, 8–10 at d = 5 and 33–85 at d = 8. There are four nulls: μ free of
+x1, the shape free of x1, no effect of x5, and the shape free of every
+covariate (the same anisotropic eigenvalues at every x). Each null has 300
+replications (s.e. 0.013) unless stated.
+
+| shape, d | rejection at 5%, RoC / D / M / LR / LM, over the four nulls |
+|---|---|
+| γ, d = 3 | 0.037–0.060 |
+| log-tangent, d = 3 | 0.027–0.063 |
+| γ, d = 5 | 0.023–0.060; LR averages 0.037 (slightly conservative, `docs/MATH.md` §6) |
+| log-tangent, d = 5 | 0.033–0.073 |
+| log-tangent, d = 8 | 0.027–0.070 |
+| γ, d = 8 (score test: M and LM; 200 replications) | 0.015–0.070; LM averages 0.050 |
+
+At an effect a quarter of the simulated one (c = 0.25), RoC, D, LR and LM
+reject 14–95% of the time at d = 3, 53–100% at d = 5 (13–75% at c = 0.1)
+and 99–100% at d = 8 (log-tangent). The score statistic LM has LR's power:
+the two differ by at most 0.08, and mostly by 0.02 or less. `M` stays at
+3–8% at d = 3, because it averages moment residuals over all observations,
+and a centred covariate's effect cancels in that average to first order.
+
 **Estimating V(x)** (`cargo run --release --example v_recovery`; data from
 a known regression with 5 covariates + const). The geodesic error of V̂(x)
 against the true V(x) shrinks at the 1/√n rate in both shape models: at
@@ -366,28 +396,36 @@ average about 5).
 | hypothesis test, 300 replicates, hydrochemistry | 819 ms | 221 ms | 44 ms |
 | `regression_demo`, whole run | 6.3 s | 2.0 s | 0.6 s |
 
-Bootstrap hypothesis tests at B = 500, n = 2000, 5 covariates + const
-(`cargo run --release --example test_bench 3,5,8`, with
-`RAYON_NUM_THREADS=1` for one core; each run computes RoC, D, M and LR; the
-four nulls are isotropy, μ free of x1, shape free of x1, and no effect of
-x5):
+Bootstrap hypothesis tests at B = 500, n = 2000, 5 covariates + const, on
+data whose V(x) is anisotropic (`cargo run --release --example test_bench
+3,5,8`, with `RAYON_NUM_THREADS=1` for one core). The four nulls are the
+shape free of every covariate, μ free of x1, the shape free of x1, and no
+effect of x5. The full test bootstraps RoC, D, M, LR and LM; the score test
+(`score_test`) bootstraps LM and M from restricted refits only, with the
+same LM and M replicates:
 
-| d | log-tangent, 1 core | log-tangent, 15 threads | γ, 1 core | γ, 15 threads |
+| d | log-tangent, full | log-tangent, score | γ, full | γ, score |
 |---|---|---|---|---|
-| 3 | 1.7–1.9 s | 0.16–0.17 s | 2.6–6.6 s | 0.26–0.62 s |
-| 5 | 5.8–8.8 s | 0.47–0.70 s | 28–49 s; isotropy 191 s* | 2.4–4.3 s; isotropy 16 s* |
-| 8 | 24–32 s | 2.4–3.0 s | 130–360 s; isotropy 540 s*† | 12–33 s; isotropy 51 s* |
+| **one core** | | | | |
+| 3 | 2.0–2.3 s | 1.5–1.6 s | 3.4–4.2 s | 1.3–1.9 s |
+| 5 | 7.0–9.6 s | 4.4–5.9 s | 27–48 s; shape constant 98 s | 7.8–12 s; shape constant 3.3 s |
+| 8 | 30–36 s | 17–22 s | 129–348 s; shape constant 331 s† | 36–119 s; shape constant 14 s† |
+| **15 threads** | | | | |
+| 3 | 0.19–0.21 s | 0.14–0.15 s | 0.31–0.38 s | 0.13–0.18 s |
+| 5 | 0.69–0.90 s | 0.46–0.60 s | 2.5–4.4 s; shape constant 8.6 s | 0.78–1.2 s; shape constant 0.35 s |
+| 8 | 3.2–3.8 s | 1.9–2.5 s | 12–34 s; shape constant 30 s | 3.6–9.5 s; shape constant 1.4 s |
 
-\* In γ, the isotropy null of a d ≥ 5 regression lies on the singular set
-(§2 of `docs/MATH.md`), so full refits of null replicates do not converge
-and the bootstrap LR is unreliable (§6); the log-tangent shape has no such
-problem. † B = 50, scaled by 10. γ at d ≥ 5 is slower because its
-likelihood is rough there, not because its kernel is: refits need 50–200
-evaluations and have local maxima. Refits now use the empirical information
-as their metric, which made these tests 1.4–2.5× faster than the previous
-version (d = 5, one core: 28–82 s, isotropy 387 s). The Python session in
-`python/examples/demo.py` (d = 3, γ, five nulls, five penalties) runs each
-test in 1.1–1.8 s and each penalty path in 0.6–1.3 s.
+† B = 50, scaled by 10. γ at d ≥ 5 is slower because its likelihood is
+rough there, not because its kernel is: refits need 50–200 evaluations and
+have local maxima (`docs/MATH.md` §6). Refits use the empirical information
+as their metric, which made the full tests 1.4–2.5× faster than the
+previous version. The score statistic's Gram matrix is O(n k²) for k
+coefficients, about 15% of a restricted refit (0.6 ms at d = 3, 14–18 ms at
+d = 8). It makes a full test up to 20% slower than before it was added
+(log-tangent d = 8, one core: 24–32 s before), and the score test is faster
+than either. The Python session in `python/examples/demo.py` (d = 3, γ, five
+nulls, five penalties) runs each test in 1.1–1.8 s and each penalty path in
+0.6–1.3 s.
 
 Large regressions (`cargo run --release --example big_fit`, fit with SEs;
 data drawn from the log-tangent model):

@@ -138,6 +138,7 @@ def test_score_test(res):
     np.testing.assert_array_equal(fast.bootstrap["LM"], full.bootstrap["LM"])
     np.testing.assert_array_equal(fast.bootstrap["M"], full.bootstrap["M"])
     assert fast.pvalue["LM"] == full.pvalue["LM"] > 0.01
+    assert fast.pvalue["M"] == full.pvalue["M"]
     assert np.isnan(fast.pvalue["LR"]) and len(fast.bootstrap["LR"]) == 0
     assert fast.statistic["LR"] == full.statistic["LR"]
     assert abs(fast.statistic["LM"] - fast.statistic["LR"]) < 0.5 + 0.1 * fast.statistic["LR"]

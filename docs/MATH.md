@@ -295,14 +295,16 @@ RoC = mean_i ‖μ_{ai}‖ / ‖μ_{0i}‖
 D   = mean_i {2 − cos∠(μ_{0i}, μ_{ai})} ‖μ_{ai}‖ / ‖μ_{0i}‖
 M   = ‖ mean_i ( y_i² − E_0 y_i² ) ‖²     (elementwise squares; E_0 exact, see below)
 LR  = −2 (ℓ_0 − ℓ_a)
+LM  = gᵀ I⁻¹ g − g_fᵀ I_ff⁻¹ g_f          (score statistic at the restricted fit, below)
 ```
 
 `M` is the squared norm, as in the R code and the papers' tables (CSDA eq. (4)
 prints the norm; p-values are unaffected). Null distributions come from a
 parametric bootstrap under the restricted fit,
 refitting both models each time, and `p = #{stat^(b) > stat}/B`. Supported
-nulls are isotropy (`γ ≡ 0`), `μ` free of feature `j`, `γ` free of feature
-`j`, both, or any custom mask. Two differences from the R code: bootstrap
+nulls are `μ` free of feature `j`, `γ` free of feature `j`, both, the shape
+free of every feature (`ConstantShape`: an anisotropic shape, the same at
+every `x`), isotropy (`γ ≡ 0`), or any custom mask. Two differences from the R code: bootstrap
 responses are drawn from each observation's own null parameters (the R code
 indexes them by the bootstrap counter), and every `d` is supported (the R
 isotropy and γ-restricted fits hard-code `d = 4`).
@@ -420,6 +422,112 @@ metrics by up to 19 (mean +3.4 ± 2.1 for the new one). The γ isotropy
 `LR` at d ≥ 5 is therefore unreliable. `M` uses only the restricted fit
 and is unaffected. The log-tangent model has the same null hypothesis
 (`V ≡ I`) and a smooth likelihood around it.
+
+**Score statistic and score test.** With `s_i` the score of observation `i`
+over the full model's free coefficients at the restricted fit, `g = Σ s_i`
+and `I = Σ s_i s_iᵀ` (the empirical information),
+`LM = gᵀ I⁻¹ g − g_fᵀ I_ff⁻¹ g_f`, where `f` indexes the coefficients the
+restricted model frees. At an exact restricted maximum `g_f = 0` and the
+second term vanishes; otherwise it removes what the optimizer left of their
+gradient (`LM` is then the efficient score `g_r − I_rf I_ff⁻¹ g_f` in the
+metric `[I⁻¹]_rr`). `LM` and `LR` are asymptotically equivalent under the
+null and under local alternatives, and the bootstrap calibrates `LM` like
+the other statistics. `LM` needs only the restricted fit, so `score_test`
+bootstraps it, with `M`, from restricted refits alone. The full refits
+(from two starts for γ) are most of the cost of a test, and on γ's rough
+likelihood at d ≥ 5 they carry all of the full model's local-maxima noise.
+The Gram matrix costs O(n k²) for k coefficients: 0.6 ms per replicate at
+d = 3 and 14–18 ms at d = 8 (n = 2000, 5 covariates), about 15% of a
+restricted refit. For the γ isotropy null `γ = 0` is a cone without a
+score, and `LM` is `NaN`.
+
+**`M` has no first-order power against covariate effects.** `M` averages
+the moment residuals `y_i² − E_0 y_i²` over all observations. An
+alternative `b_0 + cδ` that adds an effect of a centred covariate `x_j`
+changes `E y_i²` by `c (∂E y_i²/∂b · δ) x_ij` to first order, and the
+average over `i` of that is `O(c · mean_i x_ij) ≈ 0`. Only second-order
+terms remain. So `M` detects alternatives that move the average second
+moment, such as anisotropy against the isotropy null as in the papers, and
+not slopes. In the study below at d = 3, at the effect size where RoC, D,
+LR and LM reject 14–95% of the time, `M` rejects 3–8%.
+
+**Size and power when V is anisotropic** (`examples/aniso_study.rs`). The
+setting is n = 2000, 5 standard-normal covariates + const and B = 199. The
+data come from the coefficients of `examples/big_fit.rs::truth`, with the
+null's coefficients set to zero (size; 300 replications, s.e. 0.013) or
+scaled by c (power; 100 replications). No truth is isotropic. The median
+over x of λ_max/λ_min, the shape eigenvalues of V(x), is:
+
+| d | γ | log-tangent |
+|---|---|---|
+| 3 | 2.0 | 4.4 |
+| 5 | 8.0 | 10.2 |
+| 8 | 85 | 33 |
+
+Under the shape-constant null the ratio is the same at every x: 2.0, 7.2
+and 69 for γ, and 4.2, 8.4 and 26 for log-tangent. Log-tangent fits use the
+simulator's frame (reference `e_d`), so the null tested is the null
+simulated.
+
+Rejection rates at 5% under the null (RoC / D / M / LR / LM):
+
+| d | null | γ | log-tangent |
+|---|---|---|---|
+| 3 | μ free of x1 | .040 .050 .060 .047 .037 | .050 .050 .037 .047 .057 |
+| 3 | shape free of x1 | .040 .037 .060 .050 .043 | .043 .040 .057 .060 .063 |
+| 3 | x5 no effect | .053 .050 .047 .040 .040 | .033 .030 .053 .027 .030 |
+| 3 | shape constant | .060 .053 .050 .053 .047 | .040 .040 .037 .053 .050 |
+| 5 | μ free of x1 | .023 .023 .047 .030 .037 | .040 .033 .043 .040 .050 |
+| 5 | shape free of x1 | .033 .033 .043 .023 .027 | .043 .043 .047 .043 .047 |
+| 5 | x5 no effect | .040 .047 .057 .050 .053 | .057 .057 .060 .073 .067 |
+| 5 | shape constant | .053 .053 .060 .043 .037 | .047 .047 .073 .040 .050 |
+| 8 | μ free of x1 | – – .030 – .070* | .047 .047 .043 .030 .037 |
+| 8 | shape free of x1 | – – .015 – .025* | .067 .070 .033 .070 .053 |
+| 8 | x5 no effect | – – .030 – .065* | .033 .030 .047 .030 .027 |
+| 8 | shape constant | – – .035 – .040* | .040 .043 .043 .037 .030 |
+
+\* γ at d = 8: the score test only (M and LM; 200 replications, s.e. 0.015),
+since a full γ test there takes 12–34 s on 15 threads.
+
+No refit failed in any cell. The log-tangent tests at every d and the γ
+tests at d = 3 hold their level, and so does γ's LM at d = 8 (0.050 on
+average; M there is slightly conservative, 0.015–0.035). The γ tests at
+d = 5 are slightly conservative: LR, RoC and LM reject at 0.037–0.039 on
+average over the four nulls (s.e. 0.006). This is the restricted refits'
+share of the local-maxima problem above. A bootstrap
+restricted refit starts at the bootstrap truth and stops at the first
+maximum it reaches. Against a second fit of the same data from scratch, it
+is lower in 3–8 of 40 replicates (by up to 0.97) and higher in 0–6
+(`gamma_refits::restricted_refit_maxima`). A low ℓ_0^(b) inflates LR^(b)
+and LM^(b), which makes the test conservative rather than liberal. `M`
+does not use the refit's log-likelihood and holds its level (.043–.060).
+
+Power at c = 0.25, and at c = 0.1 for d = 5 (RoC / D / M / LR / LM; γ at
+d = 8 not run):
+
+| d | alternative | γ | log-tangent |
+|---|---|---|---|
+| 3 | μ depends on x1 | .93 .94 .08 .95 .94 | .90 .91 .03 .85 .86 |
+| 3 | shape depends on x1 | .14 .14 .08 .15 .15 | .23 .24 .04 .23 .24 |
+| 3 | x5 has an effect | .81 .82 .07 .80 .78 | .94 .94 .03 .94 .93 |
+| 3 | shape depends on x | .27 .26 .04 .24 .26 | .62 .62 .07 .61 .60 |
+| 5 | μ depends on x1 | 1 1 .33 1 1 | 1 1 .30 1 1 |
+| 5 | shape depends on x1 | .99 .99 .11 .99 .98 | .53 .53 .06 .58 .53 |
+| 5 | x5 has an effect | 1 1 .06 1 1 | 1 1 .10 1 1 |
+| 5 | shape depends on x | .99 .99 .16 1 1 | 1 1 .04 .99 .98 |
+| 5, c = 0.1 | μ depends on x1 | .35 .39 .12 .40 .41 | .57 .52 .04 .70 .72 |
+| 5, c = 0.1 | shape depends on x1 | .26 .29 .08 .32 .27 | .14 .14 .05 .14 .13 |
+| 5, c = 0.1 | x5 has an effect | .52 .52 .07 .49 .51 | .71 .70 .09 .75 .75 |
+| 5, c = 0.1 | shape depends on x | .26 .26 .09 .26 .34 | .20 .20 .10 .21 .23 |
+| 8 | μ depends on x1 | – | 1 1 .17 1 1 |
+| 8 | shape depends on x1 | – | 1 1 .06 1 .99 |
+| 8 | x5 has an effect | – | 1 1 .07 1 1 |
+| 8 | shape depends on x | – | 1 1 .07 1 1 |
+
+`LM` has the power of `LR`: the two differ by at most 0.08, in either
+direction, and mostly by 0.02 or less. RoC and D are close to both, except
+for a log-tangent effect on the mean at c = 0.1, which LR and LM detect
+more often (0.70–0.72 against 0.52–0.57). `M` has almost no power (see above).
 
 ## 7. Log-tangent shape parameterization (smooth option) (`src/logtangent.rs`)
 

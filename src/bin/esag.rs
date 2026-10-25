@@ -214,7 +214,8 @@ enum Cmd {
         mc: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
-        /// Score test: refit only the restricted model (LM and M), 2-4x faster.
+        /// Score test: refit only the restricted model (LM and M); 1.4-1.9x
+        /// faster for log-tangent, 2-4x (up to 29x) for gamma.
         #[arg(long)]
         score: bool,
     },

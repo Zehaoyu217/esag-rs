@@ -54,18 +54,25 @@ temp           -0.5738      0.026    -21.869     0.000      -0.625      -0.522
 ### Bootstrap tests
 
 ```python
-t = res.test("isotropy", n_boot=500)        # shape = 0
 t = res.test("mu", "temp", n_boot=500)      # mean direction free of temp
 t = res.test("shape", "temp")               # shape free of temp
 t = res.test("feature", "temp")             # temp has no effect
-t.pvalue        # {'RoC': ..., 'D': ..., 'M': ..., 'LR': ..., 'LR_chi2': ...}
+t = res.test("constant_shape")              # shape free of every covariate (V(x) anisotropic,
+                                            # same eigenvalues at every x)
+t = res.test("isotropy")                    # shape = 0 (V = I)
+t = res.score_test("shape", "temp")         # LM and M only, from restricted refits
+t.pvalue        # {'RoC': ..., 'D': ..., 'M': ..., 'LR': ..., 'LM': ..., 'LR_chi2': ..., 'LM_chi2': ...}
 t.table         # statistic and bootstrap p-value per statistic
 print(t.summary())
 ```
 
-Every test computes RoC, D, M (with exact second moments) and LR from one
-set of bootstrap replicates. B = 500 with n = 2000 and 5 covariates takes
-0.3–1.8 s at d = 3 and about 1 s at d = 5 (log-tangent).
+Every test computes RoC, D, M (with exact second moments), LR and the score
+statistic LM from one set of bootstrap replicates; `score_test` computes LM
+and M from restricted refits only, with the same LM and M replicates and
+LR's power. On anisotropic data with B = 500, n = 2000 and 5 covariates, a
+test takes 0.2–0.4 s at d = 3, 0.7–0.9 s at d = 5 (log-tangent) and
+2.5–4.4 s at d = 5 (γ) on 15 threads; `score_test` takes 0.13–0.18 s,
+0.5–0.6 s and 0.8–1.2 s.
 
 ### LASSO family
 

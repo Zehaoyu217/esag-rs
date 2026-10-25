@@ -185,6 +185,7 @@ fn score_statistic_tracks_lr_under_an_anisotropic_null() {
         let fast = score_test(&fit, &x, &y, Restriction::GammaOfFeature(1), 20, 0, 3).unwrap();
         assert_eq!(fast.boot_lm, t.boot_lm);
         assert_eq!(fast.boot_m, t.boot_m);
+        assert_eq!((fast.p_m, fast.p_lm), (t.p_m, t.p_lm));
         assert!(fast.p_lr.is_nan() && fast.boot_lr.is_empty() && fast.lr == t.lr);
         let c = score_test(&fit, &x, &y, Restriction::ConstantShape, 20, 0, 3).unwrap();
         assert_eq!(c.df, 2 * 2);
