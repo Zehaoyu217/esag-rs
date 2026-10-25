@@ -48,6 +48,7 @@ temp           -0.5738      0.026    -21.869     0.000      -0.625      -0.522
 | `res.conf_int(alpha)` | (equation, exog) × (lower, upper) |
 | `res.cov_params()` | covariance of the estimated coefficients |
 | `res.llf`, `aic`, `bic`, `nobs`, `df_model`, `df_resid`, `converged` | |
+| `res.singular_obs`, `res.degenerate_obs` | why a fit did not converge: observations on a singular set of γ (no regular maximum; use `shape="log-tangent"`), or with V(x) degenerating (the likelihood is unbounded; use `fit_regularized`) |
 | `res.predict(exog)`, `linear_predictor`, `resid`, `loglike_obs()`, `simulate()` | |
 | `res.summary(alpha)` | text summary (prints; `as_text()`; HTML in notebooks) |
 
@@ -102,7 +103,10 @@ reg.path                   # alpha, lambda, df, llf, criterion, n_active, select
 | `paper` | `"LASSO"`, `"aLASSO"`, `"RoC-LASSO"`, `"GLASSO"`, `"aGLASSO"`, `"RoC-GLASSO"`: the Project 3 R scripts' methods |
 
 Covariates are standardized internally for the penalty; coefficients are
-reported on the original scale.
+reported on the original scale. With about as many coefficients as
+observations, where the unpenalized MLE does not exist, the path starts
+from the null model, never selects a degenerate refit, and takes adaptive
+weights from the plain penalty's selection.
 
 ### Shapes
 
@@ -110,7 +114,10 @@ reported on the original scale.
 there are no covariates, and the smooth log-tangent parameterization
 otherwise, and raises an `esag.ShapeWarning` when it makes that switch.
 The γ map has a singular set that makes big γ regressions slow and gives
-their likelihood local maxima (`docs/MATH.md` §2, §6). With covariates the
+their likelihood local maxima (`docs/MATH.md` §2, §6). When V depends
+strongly on the covariates at d ≥ 5, the γ likelihood has no regular
+maximum at all: its supremum is approached by putting observations on that
+set, and `res.singular_obs` lists them. With covariates the
 two are different regression models for the shape (the mean model is the
 same); compare them by AIC/BIC. Pass `shape="gamma"` or
 `shape="log-tangent"` to choose explicitly.

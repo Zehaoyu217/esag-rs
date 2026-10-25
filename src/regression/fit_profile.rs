@@ -1071,3 +1071,42 @@ fn unbounded_likelihood_is_reported() {
     assert!(relaxed.degenerate_obs.is_empty());
     assert!(path.best().bic.is_finite());
 }
+
+/// Phases of a fit whose likelihood is unbounded (d = 8, n = 100).
+#[test]
+#[ignore]
+fn unbounded_fit_phases() {
+    let d = 8;
+    let (x, y) = simulate(&hard_truth(d), 100, 100, Shape::LogTangent);
+    let cfg = config(d, Shape::LogTangent);
+    let data = cfg.data(&x, &y).unwrap();
+    let mask = cfg.resolve_mask(&data).unwrap();
+    let free = free_params(&mask);
+    let b0 = cfg
+        .clone()
+        .with_init(Init::DataDriven)
+        .initial_coef(&data)
+        .unwrap();
+    let t = Instant::now();
+    let mut c1 = cfg.clone();
+    c1.precondition = info_precondition(&data, &b0, &free, false);
+    let first = c1.optimize(&data, &b0, &free, 200);
+    println!(
+        "first 200 it: {:.0} ms, status {:?}, it {}, fev {}, degenerate {}",
+        t.elapsed().as_secs_f64() * 1e3,
+        first.status,
+        first.n_iter,
+        first.n_fev,
+        degenerate_observations(&data, &first.coef).len()
+    );
+    let t = Instant::now();
+    let fit = cfg.fit(&x, &y).unwrap();
+    println!(
+        "whole fit: {:.0} ms, status {:?}, it {}, fev {}, degenerate {}",
+        t.elapsed().as_secs_f64() * 1e3,
+        fit.status,
+        fit.n_iter,
+        fit.n_fev,
+        fit.degenerate_obs.len()
+    );
+}

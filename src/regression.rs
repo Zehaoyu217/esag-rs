@@ -309,7 +309,38 @@ impl EsagRegressor {
             first_cfg.local_precondition = false;
             first_cfg.precondition = info_precondition(&data, &starts[0], &free, self.parallel);
             let first = if first_cfg.precondition.is_some() {
-                first_cfg.optimize(&data, &starts[0], &free, self.max_iter)
+                // converging fits need ~10 iterations; one still running
+                // after DIVERGENCE_CHECK whose V(x_i) degenerates will only
+                // diverge further (an unbounded likelihood)
+                let mut best = first_cfg.optimize(
+                    &data,
+                    &starts[0],
+                    &free,
+                    self.max_iter.min(DIVERGENCE_CHECK),
+                );
+                let (mut it, mut fev) = (best.n_iter, best.n_fev);
+                while !best.converged
+                    && it < self.max_iter
+                    && best.status == Status::MaxIterations
+                    && degenerate_observations(&data, &best.coef).is_empty()
+                {
+                    let next = first_cfg.optimize(
+                        &data,
+                        &best.coef,
+                        &free,
+                        (self.max_iter - it).min(DIVERGENCE_CHECK),
+                    );
+                    it += next.n_iter;
+                    fev += next.n_fev;
+                    if next.beats(&best) {
+                        best = next;
+                    } else {
+                        break;
+                    }
+                }
+                best.n_iter = it;
+                best.n_fev = fev;
+                best
             } else {
                 self.race(&data, &starts[..1], &mask, self.max_iter)
             };
@@ -827,7 +858,18 @@ impl EsagRegressor {
             // changes negligibly and is reported as the observed information.
             let (mut f0, mut g0, mut h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
             let mut chol = restrict(&h_full, data.p_total).cholesky();
-            if chol.is_none() && self.compute_hessian && best.status != Status::Aborted {
+            // (not for fits diagnosed as pinned at a singular set or with an
+            // unbounded likelihood: more iterations only drift there)
+            let hopeless = || {
+                !best.converged
+                    && (!singular_observations(data, &coef).is_empty()
+                        || !degenerate_observations(data, &coef).is_empty())
+            };
+            if chol.is_none()
+                && self.compute_hessian
+                && best.status != Status::Aborted
+                && !hopeless()
+            {
                 // Not at a strict local maximum yet: finish with L-BFGS at
                 // full tolerance, then recompute the Hessian.
                 let mut fine = self.clone();
@@ -1118,6 +1160,10 @@ const METRIC_REFRESH: usize = 50;
 const NEWTON_SWITCH: f64 = 1e-4;
 /// Maximum Newton polishing steps (each reuses the one exact Hessian).
 const NEWTON_STEPS: usize = 8;
+
+/// Every this many iterations, the single whitened start of a log-tangent
+/// fit checks for an unbounded likelihood ([`degenerate_observations`]).
+const DIVERGENCE_CHECK: usize = 200;
 
 /// Perturbed safety-net starts raced by [`EsagRegressor::fit`] (in waves of
 /// [`RESTART_WAVE`]) when no default start converges.

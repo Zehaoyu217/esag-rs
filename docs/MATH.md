@@ -137,8 +137,53 @@ functions, document this. Two consequences:
   against a cliff with a huge gradient (one observation pinned at
   `‖(γ_{n−1}, γ_n)‖ ≈ 1e−12`). See "Starts" below for how fitting copes.
 
+**No regular maximum when V depends strongly on x.** Near the set, an
+observation's density depends on the angle of the vanishing pair, and a
+move of `B` of the size of that pair turns the angle all the way round. A
+fit can therefore raise one observation's density by `O(1)` at almost no
+cost to the others, by putting its `γ_i` on the set at the angle that suits
+it best. The supremum of `ℓ(B)` is then approached as `γ_i` reaches the set
+and is not attained, and no optimizer converges. When the shape slopes are
+large enough for the trailing pairs `Γ_pair x̃` to cross zero inside the data
+(a codimension-2 subspace of covariate space, which meets the data cloud
+whenever `p ≥ 2` and the shape varies enough), some observation is
+generically within `O(n^{−1/2})` of the set.
+
+Evidence (the hard scenario of `examples/hard_scenario.rs`, `n = 2000`,
+5 covariates; `src/regression/fit_profile.rs`):
+
+* in every γ fit at `d = 5` that did not converge, the observation with the
+  largest gradient (230× the median) had its trailing pair at `1.2e−5` to
+  `1e−3` of its group norm, and its log-density equalled the maximum over
+  the pair's angle (−1.762 against a range of −3.349 to −1.762);
+* the race never converged (0 of 12 at `d = 5` and `d = 8`, n = 500 and
+  2000); the perturbed restarts never rescued a fit with pinned observations
+  (0 of 51, hard and standard scenarios), and only found other
+  configurations on the set with a higher supremum, by up to 67
+  log-likelihood units: more search gives higher values;
+* at small n the effect is the same (γ at `d = 5, 8`: 0–1 of 12 fits converge
+  at every n from 100 to 1000).
+
+Fits detect this: `EsagRegressorFit::singular_obs` lists the observations
+within `1e−2` of a singular set (relative to the group norm, or
+`√(μ̂_0² + μ̂_1²)` for the frame's pole) whose gradient exceeds 20 times the
+median; the restart waves are skipped when they are not empty (they cannot
+help), and the summary says that the estimate is not an MLE in the usual
+sense. On the standard scenario (`examples/big_fit.rs`, slopes ~0.3) the
+γ fits at `n = 2000` converge (11 of 12), and the waves still rescue some
+fits that stall without a pinned observation (4 of 9).
+
+**The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
+the γ model, unlike the log-tangent model with its reference at the data's
+mean direction, cannot move that set away from the data. With the mean
+direction near `e_d` (on the set), a γ fit at `d = 3` took 105 ms and 200
+iterations, and exact Newton from the full fit crawled on bootstrap data;
+with a generic mean direction it takes 28 ms (33 iterations). The γ
+regression model is not equivariant under rotations of the response.
+
 The log-tangent parameterization (§7) describes the same distributions
-without this set.
+without these sets, and its likelihood is smooth: on the same kind of data
+251 of 252 of its fits converge from `n = 200` on (§3).
 
 ## 3. Regression (`src/regression.rs`)
 
@@ -163,12 +208,26 @@ reverse-mode gradient above. Chunk results are summed in chunk order, so
 the likelihood, and therefore every fit, is bit-for-bit reproducible
 whatever the number of threads.
 
-**Starts.** By default (`Init::Auto`) `esag` races two starts:
+**Starts.** By default (`Init::Auto`) `esag` uses two starts:
 
 * a moment start: `μ` along the mean resultant, with
   `‖μ‖ = (Π σ_j)^{−1/(2(d−1))}` from the eigenvalues of the tangent scatter
   `S ≈ V/‖μ‖²`, and `γ` from the shape of `S` via the inverse map;
 * the R code's start: `μ` coefficients 1, `γ` ≈ 0.
+
+*Log-tangent.* The likelihood is smooth and both starts reach the same
+maximum: 192 of 192 simulated datasets (hard and standard scenarios,
+`d = 3, 5, 8`, `n = 300` and 2000; the differences were below 5e−4, the
+hand-over tolerance; `fit_profile::single_start_safety`). So the moment
+start runs alone, whitened with the exact information there
+(`L Lᵀ = I(B₀)⁻¹`, L-BFGS on `z` with `B = B₀ + L z`): 9–10 evaluations
+instead of 23–34, for one Hessian (2–4 gradients). The R code's start runs
+only if the first fails the convergence check. One-core fits with standard
+errors, `n = 2000`, 5 covariates: 6.7 → 2.8 ms (`d = 3`), 34 → 11.9 ms
+(`d = 5`), 129 → 50 ms (`d = 8`).
+
+*Gamma.* The starts end at different maxima in 2–10 of 16 datasets (by up to
+9 log-likelihood units at `d = 3`), so they are raced.
 
 The race runs in lockstep: every start advances 25 L-BFGS iterations per
 round (in parallel), and all decisions are taken between rounds, so they do
@@ -190,11 +249,32 @@ only ties. A start counts as converged when the optimiser converged *and*
 the mean per-observation gradient is ≤ 1e−3. If the winner has not
 converged, up to two waves of four randomly perturbed starts are raced (600
 iterations each; slope perturbations are divided by each covariate's root
-mean square). A fit that still has not converged is returned with
-`converged = false`: its likelihood is the highest found, but it sits on a
-cliff of the parameterization, so standard errors there are not meaningful.
-The L-BFGS memory defaults to the number of free parameters, clamped to
-[10, 200].
+mean square), unless observations sit on a singular set of γ (§2) or the
+likelihood is unbounded (below): more starts cannot converge there. A fit
+that still has not converged is returned with `converged = false`, and
+`singular_obs` / `degenerate_obs` say why. The L-BFGS memory defaults to
+the number of free parameters, clamped to [10, 200].
+
+**When the MLE does not exist (small samples).** With almost as many
+coefficients as observations, the likelihood of the full model is
+unbounded: the fit drives `V(x_i)` towards a singular matrix at
+high-leverage observations, whose density then grows without bound. On the
+hard scenario at `n = 100` (log-tangent; 84 coefficients at `d = 5`, 210 at
+`d = 8`) the fits that failed (2 of 12 at `d = 5`, 11 of 12 at `d = 8`) all
+did this: the largest log-density exceeded the median one by 17–75 nats,
+`‖S(x_i)‖` reached 8–21 (eigenvalue ratios of `e^{11}` and more), and the
+observed information had eigenvalues up to 10¹¹–10²² of both signs.
+Converged fits stay below 9 nats (n = 100 to 2000, `d = 5, 8`). From
+`n = 200` on, 251 of 252 log-tangent fits converged (`d = 3, 5, 8`; the
+exception stalled at `d = 8`, `n = 200` without degenerating). Exact
+Newton from the stopping point of a degenerate fit does not converge
+either: no optimizer can, since there is no maximum.
+
+`EsagRegressorFit::degenerate_obs` lists the observations whose
+log-density exceeds the median one by more than 12 nats in a fit that did
+not converge; the restarts are then skipped and the summary points to a
+penalized fit (§8), which is well defined. The penalized paths handle this
+case (§8, "Small samples").
 
 **Standard errors.** `esag` reports the inverse observed information. It is
 assembled as `Σ_i (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`, with per-observation Hessians from
@@ -423,6 +503,18 @@ metrics by up to 19 (mean +3.4 ± 2.1 for the new one). The γ isotropy
 and is unaffected. The log-tangent model has the same null hypothesis
 (`V ≡ I`) and a smooth likelihood around it.
 
+**The isotropic model is concave.** With `V = I` the log-density is
+`ℓ_i(μ) = log ∫_0^∞ r^{d−1} exp(−r²/2 + r yᵀμ − ‖μ‖²/2) dr + const`. The
+integrand is jointly log-concave in `(r, μ)`: its Hessian
+`[[−(d−1)/r² − 1, yᵀ], [y, −I]]` has Schur complement `−(d−1)/r² < 0`
+(`‖y‖ = 1`). By Prékopa's theorem `ℓ_i` is concave in `μ`, and with
+`μ_i = M x̃_i` the isotropic regression likelihood is concave in `M`. The
+restricted model of the isotropy null therefore has no local maxima, and
+its fits (4 evaluations per bootstrap refit) cannot stall
+(`logtangent::tests::isotropic_loglik_is_concave_in_mu` checks the Hessian
+at 600 points, d = 3, 5, 8). Nothing of the kind holds once `V ≠ I`: the
+frame `Ξ(μ̂)` couples the mean and the shape.
+
 **Score statistic and score test.** With `s_i` the score of observation `i`
 over the full model's free coefficients at the restricted fit, `g = Σ s_i`
 and `I = Σ s_i s_iᵀ` (the empirical information),
@@ -436,10 +528,34 @@ the other statistics. `LM` needs only the restricted fit, so `score_test`
 bootstraps it, with `M`, from restricted refits alone. The full refits
 (from two starts for γ) are most of the cost of a test, and on γ's rough
 likelihood at d ≥ 5 they carry all of the full model's local-maxima noise.
-The Gram matrix costs O(n k²) for k coefficients: 0.6 ms per replicate at
-d = 3 and 14–18 ms at d = 8 (n = 2000, 5 covariates), about 15% of a
-restricted refit. For the γ isotropy null `γ = 0` is a cone without a
-score, and `LM` is `NaN`.
+The information has Kronecker structure, `s_i s_iᵀ = (x̃_i x̃_iᵀ) ⊗
+(g_i g_iᵀ)`, so its entries are `pt(pt+1)/2 × bd(bd+1)/2` sums
+`Σ_i x̃_ij x̃_ij' g_ik g_ik'`, one matrix product per chunk (1.7× fewer
+operations than the Gram matrix of the `s_i` at d = 8, in one large
+product), and `LM` comes from one Cholesky factor with the restricted
+model's coefficients first (`Lz = g`, `LM = Σ_{a > k_f} z_a²`). `LM` costs
+0.25 ms per replicate at d = 3, 0.55–1.1 ms at d = 5 and 2.2–4.2 ms at
+d = 8 (n = 2000, 5 covariates; 2.3 ms of the last is the log-tangent
+kernel). For the γ isotropy null `γ = 0` is a cone without a score, and
+`LM` is `NaN`.
+
+**Refit settings that were measured and kept** (`inference::tests::
+refit_choices`, hard scenario, 40 replicates per null). A refit tolerance
+of 1e−5 instead of 1e−6 saves about 10% of the evaluations but moves RoC
+replicates by up to 0.12 of their bootstrap SD (0.5 at 1e−4): RoC's
+bootstrap spread is small. γ's second full-refit start (from the original
+full fit) finds a higher maximum at d = 3 in 3–10 of 40 replicates, by up to
+3.9 log-likelihood units, so it stays although it doubles the cost of a γ
+replicate.
+
+**Shape-constant refits.** Under the shape-constant null (and in
+intercept-only fits) every observation has the same log-tangent `S`, and
+only the frame `Ξ(μ̂_i)` varies. One eigen-decomposition per evaluation
+then serves all observations (`logtangent::SharedShape`): each costs
+`O(dp + p²)` (`w_i = Qᵀz_i`), and the shape gradient is accumulated in the
+eigenbasis, `W = Σ_i q̄_i w_i w_iᵀ`, and mapped back once as
+`Q (F ∘ W) Qᵀ`. Restricted refits under that null: 3.3 → 0.8 ms at d = 5,
+11.8 → 1.3 ms at d = 8 (n = 2000, one core).
 
 **`M` has no first-order power against covariate effects.** `M` averages
 the moment residuals `y_i² − E_0 y_i²` over all observations. An
@@ -819,3 +935,28 @@ seeded folds of the held-out log-likelihood (the paper's RMSE (5.5) is
 available but ignores `‖μ̂‖`). The relaxed refit at the selected λ is
 returned with standard errors when the selected model is a coefficient
 mask.
+
+**Small samples.** Where the unpenalized fit is degenerate (§3, "When the
+MLE does not exist") three things change:
+
+* the path runs from the null model down (every penalized atom zero, then
+  decreasing λ with warm starts), instead of up from the degenerate fit:
+  from there every λ stayed stuck at the degenerate point (all 70 atoms
+  active and KKT residual 90 even at λ_max, d = 5, n = 100), and BIC chose
+  the full model;
+* a λ whose relaxed fit (or penalized fit, without relaxing) is degenerate
+  gets an infinite BIC/AIC, so it cannot be selected however large its
+  log-likelihood;
+* adaptive weights come from the plain penalty's selected model (the
+  two-stage adaptive LASSO for `p ≈ n`), not from the degenerate MLE.
+
+At d = 5, n = 100 the five LASSO-type presets then select sparse models
+with regular relaxed refits (0–2 of the 6 true covariate parts, no false
+ones; at n = 100 the data cannot support more).
+
+Proximal Newton also stops once three successive steps no longer decrease
+`F` beyond rounding (relative 1e−13) with the KKT residual already below
+`√tol`: near the tolerance an adaptive weight's atom can flip at its
+threshold, and the solver used to refresh the Hessian at every iteration
+until `max_iter` (4.95 s of a 5.7 s adaptive LASSO path at d = 5,
+n = 2000; the path now takes 0.63 s).

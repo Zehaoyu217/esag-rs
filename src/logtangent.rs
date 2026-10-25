@@ -2267,6 +2267,34 @@ fn shared_core(
 mod tests {
     use super::*;
 
+    /// The isotropic log-density is concave in `μ` (Prékopa: the integrand
+    /// `r^{d−1} exp(−r²/2 + r yᵀμ − ‖μ‖²/2)` is jointly log-concave in
+    /// `(r, μ)`), so isotropic regressions have a concave likelihood.
+    #[test]
+    fn isotropic_loglik_is_concave_in_mu() {
+        for d in [3usize, 5, 8] {
+            let n = dims::eta_len(d);
+            let frame = LtFrame::standard(d);
+            for c in 0..200 {
+                let mu: Vec<f64> = (0..d)
+                    .map(|k| 3.0 * ((c * 13 + k * 7) as f64 * 0.37).sin())
+                    .collect();
+                let yr: Vec<f64> = (0..d)
+                    .map(|k| ((c * 5 + k * 3) as f64 * 1.21).cos())
+                    .collect();
+                let nrm = yr.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let y: Vec<f64> = yr.iter().map(|v| v / nrm).collect();
+                let mut eta = mu.clone();
+                eta.extend(std::iter::repeat_n(0.0, n - d));
+                let (mut g, mut h) = (vec![0.0; n], vec![0.0; n * n]);
+                loglik_lt_hess(&frame, &eta, &y, &mut g, &mut h);
+                let hm = DMatrix::from_fn(d, d, |a, b| h[a * n + b]);
+                let top = nalgebra::SymmetricEigen::new(hm).eigenvalues.max();
+                assert!(top < 1e-9, "d={d} case {c}: largest eigenvalue {top}");
+            }
+        }
+    }
+
     /// The shared-shape kernel against `loglik_lt_grad`, summed over
     /// observations: value, mu-gradient and shape gradient.
     #[test]

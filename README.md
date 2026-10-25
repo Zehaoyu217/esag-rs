@@ -323,6 +323,33 @@ the two differ by at most 0.08, and mostly by 0.02 or less. `M` stays at
 3–8% at d = 3, because it averages moment residuals over all observations,
 and a centred covariate's effect cancels in that average to first order.
 
+**A hard scenario** (`cargo run --release --example hard_scenario --
+fit|tests|lasso`): correlated covariates (ρ = 0.5), moderate concentration
+(‖μ₀‖ = 2.5), μ and V both strongly x-dependent, sparse effects (x1 moves
+μ and the shape, x2 only μ, x3 only the shape, x4 both weakly, x5
+nothing). Fits with SEs on one core, 12 replications per cell:
+
+| d | shape | n = 200 | n = 500 | n = 2000 | converged | V̂(x) error at n = 2000 |
+|---|---|---|---|---|---|---|
+| 3 | log-tangent | 0.6 ms | 0.9 ms | 2.5 ms | 36/36 | 0.12 |
+| 3 | γ | 1.7 ms | 3.4 ms | 12.6 ms | 36/36 | 0.12 |
+| 5 | log-tangent | 1.9 ms | 3.4 ms | 11.4 ms | 36/36 | 0.26 |
+| 5 | γ | 60 ms | 73 ms | 0.69 s | 2/36 (26 on the singular set) | 0.34 |
+| 8 | log-tangent | 12 ms | 17 ms | 53 ms | 35/36 | 0.44 |
+| 8 | γ | 0.12 s | 0.17 s | 0.30 s | 0/36 (35 on the singular set) | 0.56 |
+
+The V̂(x) error is the mean geodesic distance from the true V(x) over 200
+new covariate points. γ at d ≥ 5 does not converge on this data because
+its likelihood has no regular maximum there (see "The γ parameterization:
+what porting found" below); the log-tangent model does.
+
+LASSO family on the same data (log-tangent, BIC at relaxed refits, 40
+replications; 12 at d = 8), covariate parts found:
+
+| d, n | penalty | strong parts (of 4) | weak x4 parts (of 2) | false (of 4) | time per path, one core |
+|---|---|---|---|---|---|
+HARD_LASSO_ROWS
+
 **Estimating V(x)** (`cargo run --release --example v_recovery`; data from
 a known regression with 5 covariates + const). The geodesic error of V̂(x)
 against the true V(x) shrinks at the 1/√n rate in both shape models: at
@@ -377,6 +404,23 @@ refitted and reduced to four numbers one at a time.
 * **A smooth shape model where γ is singular.** The log-tangent shape
   removes the discontinuities of γ ↦ V that make big γ regressions take
   hundreds of iterations or fail.
+* **One whitened start for the smooth model.** A log-tangent fit runs the
+  moment start alone, whitened with the exact information there: 9–10
+  likelihood passes instead of 2 × 23–34 for the two raced starts (both
+  starts reached the same maximum in 192 of 192 simulated datasets). Fits
+  with SEs at n = 2000, 5 covariates: 2.8 / 12 / 50 ms at d = 3 / 5 / 8,
+  2.4–2.9× faster than before.
+* **Structure of the restricted models.** Under the shape-constant null
+  every observation has the same shape S, so one eigen-decomposition per
+  pass serves them all (restricted refits 4–9× faster at d = 5–8). The
+  score statistic's information has Kronecker structure
+  `(x̃x̃ᵀ) ⊗ (ggᵀ)`, so it is one matrix product over the unique products
+  (LM 2.2–4.2 ms at d = 8, from 8.8–10.9).
+* **No time spent where no answer exists.** A γ fit with observations
+  pinned at the singular set, or a fit whose likelihood is unbounded
+  (V(x) degenerating at small n), skips the restart waves that can only
+  find other such points (γ d = 8, n = 2000: 1.7 → 0.3 s), and says why
+  (`singular_obs`, `degenerate_obs`).
 * **Small things that add up.** Matrix-product assembly of η = B X̃ᵀ and of
   the gradient, cube and square roots instead of `powf`, a Newton finish
   for standard errors, and early pruning of dominated starts.
@@ -492,6 +536,12 @@ Where the speed comes from:
   gradient test. Bootstrap fits retry from a second start. Restricted fits
   start from the full fit, and full refits use the best of two starts, which
   fixed an over-rejection of the LR test (8.7% down to 5.0%).
+* **Fits that say why they did not converge.** A γ fit with observations on
+  a singular set of the parameterization (`singular_obs`), or a fit whose
+  likelihood is unbounded because V(x) degenerates at high-leverage
+  observations (`degenerate_obs`, small n), is flagged with a summary note,
+  and the penalized paths stay well defined there (they descend from the
+  null model and never select a degenerate refit).
 * **The paper's goodness-of-fit statistic.** Algorithm 1 (two-sample KS
   against a model-based reference) is the default; the R code's one-sample χ²
   variant is still available.
@@ -516,6 +566,23 @@ continuous. Consequences:
   likelihood is multimodal and optimizers stall with one observation pinned
   at the set; this, not arithmetic, is what made big fits slow.
   `Shape::LogTangent` has no such set.
+* **No regular maximum when V depends strongly on x.** Near the set an
+  observation's density depends on the angle of the vanishing pair, and a
+  tiny move of B turns that angle all the way round. So a fit gains `O(1)`
+  by putting such an observation on the set at its best angle: the
+  likelihood's supremum is approached there and not attained. With strong
+  shape effects at d = 5 and 8 (`examples/hard_scenario.rs`), 0–2 of 12 γ
+  fits converge at every n from 200 to 2000, the observation with the
+  largest gradient sits at its density's maximum over the angle with its
+  trailing pair nearly zero (10⁻⁷–10⁻³ of its group norm), and more
+  restarts only find higher
+  suprema (by up to 67 log-likelihood units). This is a property of the
+  γ-linear model, not of the optimizer; the log-tangent model on the same
+  kind of data converges in 251 of 252 fits from n = 200 on.
+* **The frame's pole.** `onb(μ)` is singular where `μ_0 = μ_1 = 0`. When
+  the data's mean direction is near that set (for example near `e_d`), γ
+  fits slow down even at d = 3 (105 vs 28 ms); the γ model is not
+  equivariant under rotations of the response.
 * **Project 3.** Exact zeros of a group `j ≥ 2` or of a trailing pair sit
   on the set, and both of the paper's simulation truths lie on it (nudging
   them by 1e−9 changes `V` by 4.6 and 0.8–1.0). The penalized module
