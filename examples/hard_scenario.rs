@@ -10,14 +10,15 @@
 //! nothing. Log-tangent data and fits use the frame with reference
 //! `center(d)`.
 //!
-//! `cargo run --release --example hard_scenario -- fit|tests|lasso`
+//! `cargo run --release --example hard_scenario -- fit|tests|lasso|recovery`
 //! env: `D=3,5` `SHAPE=gamma|lt` `NS=200,500,2000` `R` (replications) `B`
-//! (bootstrap) `FAST=1` (score tests only).
+//! (bootstrap) `FAST=1` (score tests only) `TRUTH=gamma|lt` (the shape the
+//! data come from in `fit`; default: the fitted shape).
 use esag::distribution::Esag;
 use esag::inference::{Restriction, hypothesis_test, score_test};
 use esag::logtangent::{LtFrame, covariance};
 use esag::penalized::{Grouping, PenalizedEsag};
-use esag::regression::{EsagRegressor, Shape};
+use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -40,6 +41,15 @@ fn list(key: &str, default: &str) -> Vec<usize> {
         .split(',')
         .map(|v| v.parse().unwrap())
         .collect()
+}
+
+/// The shape the data come from (`TRUTH=gamma|lt`); default: the fitted one.
+fn truth_shape() -> Option<Shape> {
+    match std::env::var("TRUTH").as_deref() {
+        Ok("gamma") => Some(Shape::Gamma),
+        Ok("lt") => Some(Shape::LogTangent),
+        _ => None,
+    }
 }
 
 fn shapes() -> Vec<Shape> {
@@ -181,11 +191,21 @@ fn fit_study() {
         for &shape in &shapes() {
             for n in list("NS", "200,500,2000") {
                 let b = truth(d);
+                let data_shape = truth_shape().unwrap_or(shape);
                 let mut rng = ChaCha8Rng::seed_from_u64(99);
                 let x_test = covariates(200, &mut rng);
+                // how much the true V(x) moves over the test points
+                let v0 = true_dist(&b, &[0.0; P], d, data_shape).covariance();
+                let spread = (0..200)
+                    .map(|i| {
+                        let row: Vec<f64> = x_test.row(i).iter().copied().collect();
+                        geodesic(&v0, &true_dist(&b, &row, d, data_shape).covariance())
+                    })
+                    .sum::<f64>()
+                    / 200.0;
                 let rows: Vec<(bool, usize, usize, f64, f64, f64)> = (0..reps)
                     .map(|r| {
-                        let (x, y) = simulate(d, n, 1000 + r as u64, shape);
+                        let (x, y) = simulate(d, n, 1000 + r as u64, data_shape);
                         let t = Instant::now();
                         let fit = config(d, shape).fit(&x, &y).unwrap();
                         let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -194,7 +214,7 @@ fn fit_study() {
                         let (mut gv, mut ang) = (0.0, 0.0);
                         for (i, vh) in vhat.iter().enumerate() {
                             let row: Vec<f64> = x_test.row(i).iter().copied().collect();
-                            let td = true_dist(&b, &row, d, shape);
+                            let td = true_dist(&b, &row, d, data_shape);
                             gv += geodesic(&td.covariance(), vh);
                             let mh: Vec<f64> = mhat.row(i).iter().copied().collect();
                             let c: f64 =
@@ -219,8 +239,12 @@ fn fit_study() {
                 let mut ang: Vec<f64> = rows.iter().map(|r| r.5).collect();
                 let max_ms = ms.iter().fold(0.0f64, |a, &b| a.max(b));
                 println!(
-                    "d={d} {:<10} n={n:>4} K={:>3}: converged {conv:>2}/{reps} (singular set {pinned}, unbounded {unbounded}); time median {:7.1} ms, max {:7.1} ms; V error {:.3}, angle {:.2}°",
-                    format!("{shape:?}"),
+                    "d={d} {:<10} n={n:>4} K={:>3}: converged {conv:>2}/{reps} (singular set {pinned}, unbounded {unbounded}); time median {:7.1} ms, max {:7.1} ms; V error {:.3} (V(x) moves {spread:.2} from V(0)), angle {:.2}°",
+                    if data_shape == shape {
+                        format!("{shape:?}")
+                    } else {
+                        format!("{shape:?} on {data_shape:?} data")
+                    },
                     esag::dims::eta_len(d) * (P + 1),
                     median(&mut ms),
                     max_ms,
@@ -378,11 +402,122 @@ fn lasso_study() {
     }
 }
 
+/// How well each estimator recovers `V(x)` and `μ(x)`: the full model, the
+/// model with only the true covariates (an oracle), a constant shape, the
+/// adaptive LASSO's relaxed refit, and the γ full model. Mean geodesic
+/// error of `V̂(x)` over 200 fresh covariate points (median over
+/// replications), against how anisotropic `V(x)` is and how much it moves
+/// with `x`. `TRUTH=gamma|lt` picks the data's shape (default `lt`).
+fn recovery_study() {
+    let reps = env("R", 12usize);
+    let data_shape = truth_shape().unwrap_or(Shape::LogTangent);
+    println!(
+        "V(x) and mu(x) recovery, {data_shape:?} data, {reps} replications; V error = mean geodesic distance of V̂(x) from V(x) over 200 covariate points, angle = mean error of the mean direction (degrees)"
+    );
+    for d in list("D", "3,5") {
+        let b = truth(d);
+        let bd = b.nrows();
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let x_test = covariates(200, &mut rng);
+        let rows: Vec<Vec<f64>> = (0..200)
+            .map(|i| x_test.row(i).iter().copied().collect())
+            .collect();
+        let truth_v: Vec<DMatrix<f64>> = rows
+            .iter()
+            .map(|r| true_dist(&b, r, d, data_shape).covariance())
+            .collect();
+        let v0 = true_dist(&b, &[0.0; P], d, data_shape).covariance();
+        let eye = DMatrix::<f64>::identity(d, d);
+        let aniso = truth_v.iter().map(|v| geodesic(&eye, v)).sum::<f64>() / 200.0;
+        let spread = truth_v.iter().map(|v| geodesic(&v0, v)).sum::<f64>() / 200.0;
+        println!(
+            "d={d}: V(x) is {aniso:.2} from isotropy and moves {spread:.2} from V(0) on average"
+        );
+        // free coefficients: all; the true support; shape intercept only
+        let oracle = DMatrix::from_fn(bd, P + 1, |k, j| {
+            j == 0
+                || if k < d {
+                    [1, 2, 4].contains(&j)
+                } else {
+                    [1, 3, 4].contains(&j)
+                }
+        });
+        let constant = DMatrix::from_fn(bd, P + 1, |k, j| k < d || j == 0);
+        for n in list("NS", "500,2000") {
+            let out: Vec<[(f64, f64); 5]> = (0..reps)
+                .into_par_iter()
+                .map(|r| {
+                    let (x, y) = simulate(d, n, 3000 + r as u64, data_shape);
+                    let score = |fit: &EsagRegressorFit| {
+                        let vhat = fit.predict_covariance(&x_test).unwrap();
+                        let mhat = fit.predict(&x_test).unwrap();
+                        let (mut gv, mut ang) = (0.0, 0.0);
+                        for i in 0..200 {
+                            gv += geodesic(&truth_v[i], &vhat[i]);
+                            let td = true_dist(&b, &rows[i], d, data_shape);
+                            let c: f64 = mhat
+                                .row(i)
+                                .iter()
+                                .zip(td.mean_direction())
+                                .map(|(a, b)| a * b)
+                                .sum();
+                            ang += c.clamp(-1.0, 1.0).acos().to_degrees();
+                        }
+                        (gv / 200.0, ang / 200.0)
+                    };
+                    let lt = config(d, Shape::LogTangent);
+                    let full = lt.clone().fit(&x, &y).unwrap();
+                    let orc = lt
+                        .clone()
+                        .with_mask(Some(oracle.clone()))
+                        .fit(&x, &y)
+                        .unwrap();
+                    let cst = lt
+                        .clone()
+                        .with_mask(Some(constant.clone()))
+                        .fit(&x, &y)
+                        .unwrap();
+                    let path = PenalizedEsag::adaptive_lasso()
+                        .lt_reference(center(d))
+                        .with_parallel(false)
+                        .fit(&x, &y)
+                        .unwrap();
+                    let gam = config(d, Shape::Gamma).fit(&x, &y).unwrap();
+                    [
+                        score(&full),
+                        score(&orc),
+                        score(&cst),
+                        score(path.relaxed.as_ref().unwrap()),
+                        score(&gam),
+                    ]
+                })
+                .collect();
+            let names = [
+                "log-tangent, full model",
+                "log-tangent, true covariates only",
+                "log-tangent, constant shape",
+                "log-tangent, adaptive LASSO (relaxed)",
+                "gamma, full model",
+            ];
+            for (k, name) in names.iter().enumerate() {
+                let mut gv: Vec<f64> = out.iter().map(|o| o[k].0).collect();
+                let mut ang: Vec<f64> = out.iter().map(|o| o[k].1).collect();
+                println!(
+                    "  n={n:>4} {name:<38} V error {:.3}  angle {:.2}°",
+                    median(&mut gv),
+                    median(&mut ang)
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref().unwrap_or("fit") {
         "fit" => fit_study(),
         "tests" => test_study(),
         "lasso" => lasso_study(),
-        _ => panic!("mode: fit | tests | lasso"),
+        "recovery" => recovery_study(),
+        _ => panic!("mode: fit | tests | lasso | recovery"),
     }
 }

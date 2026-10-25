@@ -327,7 +327,7 @@ the two differ by at most 0.08, and mostly by 0.02 or less. `M` stays at
 and a centred covariate's effect cancels in that average to first order.
 
 **A hard scenario** (`cargo run --release --example hard_scenario --
-fit|tests|lasso`): correlated covariates (ρ = 0.5), moderate concentration
+fit|tests|lasso|recovery`): correlated covariates (ρ = 0.5), moderate concentration
 (‖μ₀‖ = 2.5), μ and V both strongly x-dependent, sparse effects (x1 moves
 μ and the shape, x2 only μ, x3 only the shape, x4 both weakly, x5
 nothing). Fits with SEs on one core, 12 replications per cell:
@@ -348,6 +348,33 @@ new covariate points. γ at d ≥ 5 does not converge on this data because
 its fits stop in traps, local suprema at the singular set of the γ map
 (see "The γ parameterization: what porting found" below); the log-tangent
 model does.
+
+**How well μ(x) and V(x) are recovered** (`hard_scenario -- recovery`,
+`TRUTH=gamma`: data from the γ model, so the log-tangent fits are
+misspecified; 12 replications). V(x) is 0.5–0.9 from isotropy and moves
+0.14–0.40 with x (geodesic distance; 0.25 is roughly a 13–28% error in V's
+eigenvalues):
+
+| d | estimator | V̂ error, n = 500 | n = 2000 | μ̂ direction error, n = 2000 |
+|---|---|---|---|---|
+| 3 | log-tangent, full model | 0.22 | 0.12 | 1.6° |
+| 3 | γ, full model | 0.27 | 0.12 | 1.5° |
+| 4 | log-tangent, full model | 0.43 | 0.26 | 2.1° |
+| 4 | γ, full model | 0.62 | 0.24 | 2.1° |
+| 5 | log-tangent, full model | 0.57 | 0.29 | 2.6° |
+| 5 | log-tangent, true covariates only | 0.45 | 0.24 | 2.1° |
+| 5 | log-tangent, constant shape | 0.44 | 0.37 | 2.7° |
+| 5 | log-tangent, adaptive LASSO (relaxed) | 0.48 | 0.29 | 2.7° |
+| 5 | γ, full model | 0.82 | 0.32 | 2.6° |
+
+On γ's own data the log-tangent fit recovers V(x) about as well as the γ
+fit (within 0.02 at n = 2000), and better at n = 500 or where γ is trapped
+(d = 5). The error halves when n quadruples. At n = 2000 the full model
+beats a constant shape. At n = 500 (84 coefficients at d = 5) the
+estimation noise of the shape slopes is as large as V's dependence on x:
+a constant shape, or the true covariates only, do better than the full
+model. On log-tangent data the picture is the same (full model 0.12 /
+0.19 / 0.26 at n = 2000 for d = 3 / 4 / 5).
 
 Bootstrap tests on the same data (n = 2000, B = 199, 200 replications,
 s.e. 0.015; at d = 8 score tests, 100 replications), rejection rates at 5%:
