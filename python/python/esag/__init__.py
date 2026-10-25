@@ -413,6 +413,9 @@ class ESAGResults(_CoefTable):
                         doc="Number of estimated coefficients.")
     df_resid = property(lambda self: self._native.df_resid)
     converged = property(lambda self: self._native.converged)
+    #: Observations at a singular set of the gamma parameterization (empty
+    #: when the fit converged): the likelihood has no regular maximum there.
+    singular_obs = property(lambda self: list(self._native.singular_obs))
     n_iter = property(lambda self: self._native.n_iter)
     lt_reference = property(
         lambda self: None if self._native.lt_reference is None

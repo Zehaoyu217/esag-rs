@@ -236,6 +236,32 @@ fn gamma_singular_diagnosis() {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+            // the gradient without the observations at the singular set
+            for &(cut_ratio, cut_grad) in &[(1e-2, 20.0), (1e-3, 20.0), (1e-2, 50.0)] {
+                let mut greg = DMatrix::<f64>::zeros(bd, pt);
+                let mut k_sing = 0;
+                for (i, row) in rows.iter().enumerate() {
+                    let singular = row.1 < cut_ratio && row.0 > cut_grad * med;
+                    if singular {
+                        k_sing += 1;
+                        continue;
+                    }
+                    for k in 0..bd {
+                        eta[k] = (0..pt).map(|j| fit.coef[(k, j)] * data.x[i * pt + j]).sum();
+                    }
+                    kernel_grad(&data, &eta, &data.y[i * d..(i + 1) * d], &mut ge);
+                    for k in 0..bd {
+                        for j in 0..pt {
+                            greg[(k, j)] += ge[k] * data.x[i * pt + j];
+                        }
+                    }
+                }
+                println!(
+                    "   cut (pair < {cut_ratio:.0e}, |g| > {cut_grad}x median): {k_sing} singular; regular-part |grad|_inf {:.2e} (mean per obs {:.1e})",
+                    greg.amax(),
+                    greg.amax() / data.n as f64
+                );
+            }
             // envelope: rotate the trailing pair of the worst observation
             let (_, _, gr, i) = by_grad[0];
             for k in 0..bd {
@@ -702,4 +728,128 @@ fn full_fit_breakdown() {
             );
         }
     }
+}
+
+/// How often the safety net (perturbed restart waves) rescues a gamma fit
+/// at d ≥ 5 whose race did not converge.
+/// `cargo test --release --lib safety_net_value -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn safety_net_value() {
+    let seeds: u64 = std::env::var("SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    for (label, hard) in [("hard", true), ("standard", false)] {
+        for d in [5usize, 8] {
+            for n in [500usize, 2000] {
+                let out: Vec<(bool, bool, f64, usize, f64, f64)> = (0..seeds)
+                    .into_par_iter()
+                    .map(|seed| {
+                        let (truth, m) = if hard {
+                            (hard_truth(d), center(d))
+                        } else {
+                            let mut m = vec![0.0; d];
+                            m[d - 1] = 1.0;
+                            (standard_truth(d, 5), m)
+                        };
+                        let rho = if hard { 0.5 } else { 0.0 };
+                        let (x, y) = simulate_with(&truth, n, 900 + seed, Shape::Gamma, rho, &m);
+                        let cfg = EsagRegressor::new()
+                            .with_shape(Shape::Gamma)
+                            .with_parallel(false)
+                            .with_hessian(false);
+                        let data = cfg.data(&x, &y).unwrap();
+                        let mask = cfg.resolve_mask(&data).unwrap();
+                        let starts: Vec<DMatrix<f64>> = [Init::DataDriven, Init::RStyle]
+                            .iter()
+                            .map(|i| {
+                                cfg.clone()
+                                    .with_init(i.clone())
+                                    .initial_coef(&data)
+                                    .unwrap()
+                            })
+                            .collect();
+                        let t = Instant::now();
+                        let race = cfg.race(&data, &starts, &mask, cfg.max_iter);
+                        let t_race = t.elapsed().as_secs_f64() * 1e3;
+                        let pinned = singular_observations(&data, &race.coef).len();
+                        // the safety net, as in `fit`
+                        let mut best = race;
+                        let t = Instant::now();
+                        if !best.converged {
+                            let mut centers = starts.clone();
+                            centers.push(best.coef.clone());
+                            let extra = perturbed_starts(
+                                &data,
+                                &centers,
+                                &mask,
+                                AUTO_RESTARTS,
+                                cfg.seed.wrapping_add(0x5EED),
+                            );
+                            let ll0 = -best.neg_ll;
+                            for wave in extra.chunks(RESTART_WAVE) {
+                                let alt = cfg.race(
+                                    &data,
+                                    wave,
+                                    &mask,
+                                    cfg.max_iter.min(RESTART_MAX_ITER),
+                                );
+                                if alt.beats(&best) {
+                                    best = alt;
+                                }
+                                if best.converged {
+                                    break;
+                                }
+                            }
+                            let t_net = t.elapsed().as_secs_f64() * 1e3;
+                            (
+                                false,
+                                best.converged,
+                                -best.neg_ll - ll0,
+                                pinned,
+                                t_race,
+                                t_net,
+                            )
+                        } else {
+                            (true, true, 0.0, pinned, t_race, 0.0)
+                        }
+                    })
+                    .collect();
+                let race_conv = out.iter().filter(|o| o.0).count();
+                let rescued = out.iter().filter(|o| !o.0 && o.1).count();
+                let failed: Vec<&(bool, bool, f64, usize, f64, f64)> =
+                    out.iter().filter(|o| !o.0).collect();
+                let pinned = failed.iter().filter(|o| o.3 > 0).count();
+                let gains: Vec<String> = failed.iter().map(|o| format!("{:.2}", o.2)).collect();
+                let t_race: f64 = out.iter().map(|o| o.4).sum::<f64>() / seeds as f64;
+                let t_net: f64 = out.iter().map(|o| o.5).sum::<f64>() / seeds as f64;
+                println!(
+                    "{label:<8} d={d} n={n:>4}: race converged {race_conv:>2}/{seeds}; of the {} others, {pinned} pinned, {rescued} rescued by the net; ll gains {:?}; mean ms race {t_race:.0}, net {t_net:.0}",
+                    failed.len(),
+                    gains
+                );
+            }
+        }
+    }
+}
+
+/// A gamma fit with observations pinned at the singular set is flagged and
+/// explained; the log-tangent fit of the same data converges.
+#[test]
+fn pinned_gamma_fit_is_reported() {
+    let d = 5;
+    let (x, y) = simulate(&hard_truth(d), 500, 900, Shape::Gamma);
+    let fit = EsagRegressor::new()
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    assert!(!fit.converged);
+    assert!(
+        !fit.singular_obs.is_empty(),
+        "no singular observations found"
+    );
+    assert!(fit.summary().contains("singular set of the gamma"));
+    let lt = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
+    assert!(lt.converged && lt.singular_obs.is_empty());
 }

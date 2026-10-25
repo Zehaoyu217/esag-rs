@@ -334,6 +334,10 @@ impl PyResults {
         self.inner.converged
     }
     #[getter]
+    fn singular_obs(&self) -> Vec<usize> {
+        self.inner.singular_obs.clone()
+    }
+    #[getter]
     fn n_iter(&self) -> usize {
         self.inner.n_iter
     }

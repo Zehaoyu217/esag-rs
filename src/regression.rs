@@ -322,7 +322,14 @@ impl EsagRegressor {
         // parameterization, see `docs/MATH.md`), race waves of perturbed
         // starts around the default starts and the best point so far, until
         // one converges.
-        if !best.converged && matches!(self.init, Init::Auto) && self.n_restarts == 0 {
+        // Where gamma's likelihood has cliffs and the winner sits with
+        // observations on the singular set, no start converges: the
+        // supremum is approached there (`docs/MATH.md` §2), and the waves
+        // below converged in 0–1 of 12 such fits. Skip them.
+        let pinned = !best.converged
+            && data.gamma_cliffs()
+            && !singular_observations(&data, &best.coef).is_empty();
+        if !best.converged && !pinned && matches!(self.init, Init::Auto) && self.n_restarts == 0 {
             let mut centers = starts.clone();
             centers.push(best.coef.clone());
             let extra = perturbed_starts(
@@ -870,11 +877,17 @@ impl EsagRegressor {
         }
         config.precondition = None;
         config.local_precondition = false;
+        let singular_obs = if best.converged || data.lt.is_some() {
+            vec![]
+        } else {
+            singular_observations(data, &coef)
+        };
         Ok(EsagRegressorFit {
             d: data.d,
             n_features: data.p,
             fit_intercept: self.fit_intercept,
             n_obs: data.n,
+            singular_obs,
             coef,
             mask,
             free,
@@ -1135,6 +1148,66 @@ fn perturbed_starts(
         })
         .collect()
 }
+/// An observation counts as singular when its gradient in `η` exceeds this
+/// many times the median observation's ([`singular_observations`]).
+const SINGULAR_GRADIENT: f64 = 20.0;
+/// ... and it lies within this relative distance of a singular set.
+const SINGULAR_DISTANCE: f64 = 1e-2;
+
+/// Observations of a gamma fit at `b` that sit at a singular set of the
+/// parameterization, where `V(γ)` is discontinuous: a group `j ≥ 2` whose
+/// trailing pair nearly vanishes (relative to the group norm), or a mean
+/// direction near the pole `μ̂₀ = μ̂₁ = 0` of the frame `onb(μ)`, in either
+/// case with a gradient over [`SINGULAR_GRADIENT`] times the median. Near
+/// such a set the observation's density changes by `O(1)` as the
+/// coefficients turn around it, and the likelihood's supremum is
+/// approached by putting the observation on the set at its best angle
+/// (`docs/MATH.md` §2): optimisers cannot converge there. Empty for the
+/// log-tangent shape.
+pub(crate) fn singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
+    if data.lt.is_some() {
+        return vec![];
+    }
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let mut eta = vec![0.0; bd];
+    let mut g = vec![0.0; bd];
+    let rows: Vec<(f64, f64)> = (0..data.n)
+        .map(|i| {
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
+            }
+            kernel_grad(data, &eta, &data.y[i * d..(i + 1) * d], &mut g);
+            let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+            // relative distance to the nearest singular set
+            let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
+            let mut dist = if mm > 0.0 {
+                ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt()
+            } else {
+                1.0
+            };
+            for gr in 2..=d - 2 {
+                let off = d + gr * (gr + 1) / 2 - 1;
+                let grp = &eta[off..off + gr + 1];
+                let all = grp.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if all > 0.0 {
+                    let pair = (grp[gr - 1].powi(2) + grp[gr].powi(2)).sqrt();
+                    dist = dist.min(pair / all);
+                }
+            }
+            (gn, dist)
+        })
+        .collect();
+    let mut norms: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    let mid = norms.len() / 2;
+    let (_, med, _) = norms.select_nth_unstable_by(mid, f64::total_cmp);
+    let cut = SINGULAR_GRADIENT * *med;
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.0 > cut && r.1 < SINGULAR_DISTANCE)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Mean per-observation gradient (infinity norm) below which an optimiser
 /// stop counts as convergence. Guards against "function converged" stops at
 /// singular points of the parameterization (coinciding eigenvalues), where
@@ -1796,6 +1869,13 @@ pub struct EsagRegressorFit {
     pub converged: bool,
     /// Infinity norm of the gradient at the solution.
     pub grad_norm: f64,
+    /// Observations (row indices) at a singular set of the gamma
+    /// parameterization, where `V(γ)` is discontinuous, with a large
+    /// gradient: the likelihood has no regular maximum at this fit (see
+    /// [`singular_observations`]). Empty for converged fits and for the
+    /// log-tangent shape.
+    #[serde(default)]
+    pub singular_obs: Vec<usize>,
     /// Observed information (Hessian of the negative log-likelihood) over the
     /// free parameters, if computed.
     pub hessian: Option<DMatrix<f64>>,
@@ -2267,6 +2347,21 @@ impl EsagRegressorFit {
             .collect();
         let mut s = header(title, &left, &right);
         s += &coef_blocks(&blocks, alpha);
+        if !self.singular_obs.is_empty() {
+            let k = self.singular_obs.len();
+            let shown: Vec<String> = self
+                .singular_obs
+                .iter()
+                .take(8)
+                .map(|i| i.to_string())
+                .collect();
+            s += &format!(
+                "Notes:\n[1] {k} observation{} ({}{}) sit at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). shape=\"logtangent\"\n    fits the same distributions with a smooth parameterization.\n",
+                if k == 1 { "" } else { "s" },
+                shown.join(", "),
+                if k > 8 { ", ..." } else { "" }
+            );
+        }
         if let (Shape::LogTangent, Some(m)) = (self.config.shape, &self.config.lt_reference) {
             let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
             s += &format!(
