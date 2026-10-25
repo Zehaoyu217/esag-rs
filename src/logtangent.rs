@@ -1975,9 +1975,361 @@ fn exp_neg_dd2(a: &[f64], p: usize, ex: &[f64], fq: &[f64], i: usize, j: usize, 
     }
 }
 
+// =========================================================================
+// A shape shared by many observations
+// =========================================================================
+
+/// The eigen-decomposition of a shape `S` that every observation shares,
+/// as in regressions whose shape coefficients are zero except the
+/// intercept's (the shape-constant null, intercept-only fits).
+/// [`loglik_lt_grad_shared`] then costs `O(dp + p²)` per observation
+/// instead of a Jacobi diagonalisation, and accumulates the shape gradient
+/// in the eigenbasis, `W = Σ_i q̄_i w_i w_iᵀ`; [`SharedShape::shape_gradient`]
+/// maps it back to the shape coordinates once, as `Q (F ∘ W) Qᵀ`.
+#[derive(Clone, Debug)]
+pub struct SharedShape {
+    p: usize,
+    /// The eigenvectors as rows: `qt[j*p + k] = Q_kj`.
+    qt: Vec<f64>,
+    /// `e^{−λ_j}`.
+    ex: Vec<f64>,
+    /// The first divided differences of `e^{−x}` at the eigenvalues.
+    fm: Vec<f64>,
+}
+
+impl SharedShape {
+    /// The decomposition of the shape with coordinates `s` (`p = d − 1`).
+    ///
+    /// # Panics
+    /// If `s.len() != (p−1)(p+2)/2`.
+    pub fn new(s: &[f64], p: usize) -> Self {
+        let (lam, q) = sym_eigen(&s_to_matrix(s, p), p);
+        let mut qt = vec![0.0; p * p];
+        for j in 0..p {
+            for k in 0..p {
+                qt[j * p + k] = q[(k, j)];
+            }
+        }
+        let ex: Vec<f64> = lam.iter().map(|l| (-l).exp()).collect();
+        let mut fm = vec![0.0; p * p];
+        for i in 0..p {
+            fm[i * p + i] = -ex[i];
+            for j in i + 1..p {
+                let f = exp_neg_divided_difference(lam[i], lam[j], ex[i], ex[j]);
+                fm[i * p + j] = f;
+                fm[j * p + i] = f;
+            }
+        }
+        Self { p, qt, ex, fm }
+    }
+
+    /// Length of the accumulator `W` of [`loglik_lt_grad_shared`] (a
+    /// row-major `p × p`; only its upper triangle is used).
+    pub fn acc_len(&self) -> usize {
+        self.p * self.p
+    }
+
+    /// The gradient of `Σ_i q̄_i q_i` with respect to the shape coordinates,
+    /// from the accumulator `W = Σ_i q̄_i w_i w_iᵀ`, into `out`.
+    pub fn shape_gradient(&self, wacc: &[f64], out: &mut [f64]) {
+        let p = self.p;
+        // G = F ∘ W, symmetric
+        let mut g = vec![0.0; p * p];
+        for i in 0..p {
+            for j in i..p {
+                let v = self.fm[i * p + j] * wacc[i * p + j];
+                g[i * p + j] = v;
+                g[j * p + i] = v;
+            }
+        }
+        // r = G Qᵀ, then the upper triangle of Q r = Q (F ∘ W) Qᵀ
+        let mut r = vec![0.0; p * p];
+        for i in 0..p {
+            for j in 0..p {
+                let gij = g[i * p + j];
+                let row = &self.qt[j * p..(j + 1) * p];
+                for l in 0..p {
+                    r[i * p + l] += gij * row[l];
+                }
+            }
+        }
+        let mut m = vec![0.0; p * p];
+        for k in 0..p {
+            for l in k..p {
+                let mut acc = 0.0;
+                for i in 0..p {
+                    acc += self.qt[i * p + k] * r[i * p + l];
+                }
+                m[k * p + l] = acc;
+            }
+        }
+        s_grad_from_upper(&m, p, 1.0, out);
+    }
+}
+
+/// [`loglik_lt_grad`] for an observation whose shape is `shared`: the
+/// log-density, its gradient with respect to `mu` (into `gmu`), and the
+/// observation's term `q̄ wwᵀ` of the shape gradient added to the upper
+/// triangle of `wacc` (see [`SharedShape`]). The value agrees with
+/// [`loglik_lt`] at the same shape to rounding.
+///
+/// # Panics
+/// If the lengths of `mu`, `y` and `gmu` differ from `frame.dim()`, or
+/// `wacc.len() != shared.acc_len()`.
+pub fn loglik_lt_grad_shared(
+    frame: &LtFrame,
+    shared: &SharedShape,
+    mu: &[f64],
+    y: &[f64],
+    gmu: &mut [f64],
+    wacc: &mut [f64],
+) -> f64 {
+    let d = frame.dim();
+    assert!(
+        mu.len() == d && y.len() == d && gmu.len() == d && shared.p + 1 == d,
+        "dimensions do not match the frame (d = {d})"
+    );
+    assert_eq!(
+        wacc.len(),
+        shared.acc_len(),
+        "accumulator has the wrong length"
+    );
+    match d {
+        3 => shared_fixed::<3, 2>(frame, shared, mu, y, gmu, wacc),
+        4 => shared_fixed::<4, 3>(frame, shared, mu, y, gmu, wacc),
+        5 => shared_fixed::<5, 4>(frame, shared, mu, y, gmu, wacc),
+        6 => shared_fixed::<6, 5>(frame, shared, mu, y, gmu, wacc),
+        7 => shared_fixed::<7, 6>(frame, shared, mu, y, gmu, wacc),
+        8 => shared_fixed::<8, 7>(frame, shared, mu, y, gmu, wacc),
+        _ => {
+            let p = d - 1;
+            let mut dv = vec![0.0; 4 * d];
+            let mut pv = vec![0.0; 3 * p];
+            let (mu_hat, rest) = dv.split_at_mut(d);
+            let (v, rest) = rest.split_at_mut(d);
+            let (u, ub) = rest.split_at_mut(d);
+            let (z, rest) = pv.split_at_mut(p);
+            let (w, zb) = rest.split_at_mut(p);
+            shared_core(
+                &frame.m, &frame.e, shared, mu, y, gmu, wacc, mu_hat, v, u, ub, z, w, zb,
+            )
+        }
+    }
+}
+
+/// Stack buffers for [`loglik_lt_grad_shared`] at `D = P + 1 ≤ 8`.
+#[inline(never)]
+fn shared_fixed<const D: usize, const P: usize>(
+    frame: &LtFrame,
+    shared: &SharedShape,
+    mu: &[f64],
+    y: &[f64],
+    gmu: &mut [f64],
+    wacc: &mut [f64],
+) -> f64 {
+    let mut dv = [[0.0; D]; 4];
+    let mut pv = [[0.0; P]; 3];
+    let [mu_hat, v, u, ub] = &mut dv;
+    let [z, w, zb] = &mut pv;
+    shared_core(
+        &frame.m[..D],
+        &frame.e[..D * P],
+        shared,
+        &mu[..D],
+        &y[..D],
+        &mut gmu[..D],
+        &mut wacc[..P * P],
+        mu_hat,
+        v,
+        u,
+        ub,
+        z,
+        w,
+        zb,
+    )
+}
+
+/// The forward pass and reverse sweep of [`lt_core`] with the shape's
+/// eigen-decomposition given.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn shared_core(
+    m: &[f64],
+    e: &[f64],
+    sh: &SharedShape,
+    mu: &[f64],
+    y: &[f64],
+    gmu: &mut [f64],
+    wacc: &mut [f64],
+    mu_hat: &mut [f64],
+    v: &mut [f64],
+    u: &mut [f64],
+    ub: &mut [f64],
+    z: &mut [f64],
+    w: &mut [f64],
+    zb: &mut [f64],
+) -> f64 {
+    let d = mu.len();
+    let p = d - 1;
+    let (qt, ex) = (&sh.qt[..p * p], &sh.ex[..p]);
+    // ---- frame, as in lt_core
+    let rf = reflector_into(m, &e[..d], mu, mu_hat, v);
+    let (mut ymu, mut b, mut vy) = (0.0, 0.0, 0.0);
+    for k in 0..d {
+        ymu += y[k] * mu[k];
+        b += y[k] * mu_hat[k];
+        vy += y[k] * v[k];
+    }
+    let kappa = 2.0 * vy / rf.vv;
+    for k in 0..d {
+        u[k] = y[k] - kappa * v[k];
+    }
+    for j in 0..p {
+        let ej = &e[j * d..(j + 1) * d];
+        let mut acc = 0.0;
+        for k in 0..d {
+            acc += ej[k] * u[k];
+        }
+        z[j] = acc;
+    }
+    // ---- shape: w = Qᵀz, zᵀe^{−S}z = Σ_j e^{−λ_j} w_j²
+    let mut zt = 0.0;
+    for j in 0..p {
+        let row = &qt[j * p..(j + 1) * p];
+        let mut acc = 0.0;
+        for k in 0..p {
+            acc += row[k] * z[k];
+        }
+        w[j] = acc;
+        zt += ex[j] * acc * acc;
+    }
+    // ---- log-density
+    let q = b * b + zt;
+    let sq = q.sqrt();
+    let alpha = ymu / sq;
+    let (lmp, dlmp, _) = log_m_p_derivs(alpha, p);
+    let ll =
+        -0.5 * p as f64 * LN_2PI - q.ln() * (0.5 * d as f64) + (alpha * alpha - rf.mm) * 0.5 + lmp;
+    // ---- reverse sweep: z̄ = 2Q(e^{−λ} ∘ w), W += q̄ wwᵀ
+    let ab = alpha + dlmp;
+    let qb = -0.5 * (d as f64 + ab * alpha) / q;
+    let ymub = ab / sq;
+    zb.fill(0.0);
+    for j in 0..p {
+        let c = 2.0 * ex[j] * w[j];
+        let row = &qt[j * p..(j + 1) * p];
+        for k in 0..p {
+            zb[k] += c * row[k];
+        }
+        let cw = qb * w[j];
+        for l in j..p {
+            wacc[j * p + l] += cw * w[l];
+        }
+    }
+    // ---- ū = E z̄; v̄ = −κū − (2(ū·v)/(v·v)) u; μ̂̄ = v̄ + 2b y (as in lt_core)
+    if rf.mu_free {
+        ub.fill(0.0);
+        for j in 0..p {
+            let c = zb[j];
+            let ej = &e[j * d..(j + 1) * d];
+            for k in 0..d {
+                ub[k] += c * ej[k];
+            }
+        }
+        let (ck, cu) = if rf.frame_free {
+            let mut uv = 0.0;
+            for k in 0..d {
+                uv += ub[k] * v[k];
+            }
+            (kappa, 2.0 * uv / rf.vv)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut proj = 0.0;
+        for k in 0..d {
+            let h = 2.0 * b * y[k] - ck * ub[k] - cu * u[k];
+            ub[k] = h;
+            proj += h * mu_hat[k];
+        }
+        for k in 0..d {
+            let gq = (ub[k] - proj * mu_hat[k]) * rf.inv_n;
+            gmu[k] = qb * gq + ymub * y[k] - mu[k];
+        }
+    } else {
+        for k in 0..d {
+            gmu[k] = ymub * y[k] - mu[k];
+        }
+    }
+    ll
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared-shape kernel against `loglik_lt_grad`, summed over
+    /// observations: value, mu-gradient and shape gradient.
+    #[test]
+    fn shared_shape_matches_per_observation_kernel() {
+        for d in [3usize, 4, 5, 8, 10] {
+            let p = d - 1;
+            let ns = dims::gamma_len(d);
+            let m: Vec<f64> = (0..d).map(|k| 0.4 + 0.3 * (k as f64 * 1.7).sin()).collect();
+            let frame = LtFrame::new(&m);
+            let s: Vec<f64> = (0..ns)
+                .map(|k| 0.6 * ((k * 5 + 1) as f64 * 0.91).sin())
+                .collect();
+            let shared = SharedShape::new(&s, p);
+            let (mut f1, mut f2) = (0.0, 0.0);
+            let mut g1 = vec![0.0; d + ns];
+            let mut g2mu = vec![0.0; d];
+            let mut wacc = vec![0.0; shared.acc_len()];
+            let mut gs2 = vec![0.0; ns];
+            for i in 0..20 {
+                let mu: Vec<f64> = (0..d)
+                    .map(|k| 2.0 * m[k] + 0.7 * ((i * 3 + k) as f64 * 1.3).cos())
+                    .collect();
+                let yr: Vec<f64> = (0..d)
+                    .map(|k| ((i * 7 + k * 2) as f64 * 0.77).sin() + m[k])
+                    .collect();
+                let nrm = yr.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let y: Vec<f64> = yr.iter().map(|v| v / nrm).collect();
+                let mut eta = mu.clone();
+                eta.extend_from_slice(&s);
+                let mut g = vec![0.0; d + ns];
+                f1 += loglik_lt_grad(&frame, &eta, &y, &mut g);
+                for (a, b) in g1.iter_mut().zip(&g) {
+                    *a += b;
+                }
+                let mut gm = vec![0.0; d];
+                f2 += loglik_lt_grad_shared(&frame, &shared, &mu, &y, &mut gm, &mut wacc);
+                for (a, b) in g2mu.iter_mut().zip(&gm) {
+                    *a += b;
+                }
+            }
+            shared.shape_gradient(&wacc, &mut gs2);
+            assert!(
+                (f1 - f2).abs() < 1e-12 * f1.abs().max(1.0),
+                "d={d}: {f1} vs {f2}"
+            );
+            for k in 0..d {
+                assert!(
+                    (g1[k] - g2mu[k]).abs() < 1e-10,
+                    "d={d} mu[{k}]: {} vs {}",
+                    g1[k],
+                    g2mu[k]
+                );
+            }
+            for k in 0..ns {
+                assert!(
+                    (g1[d + k] - gs2[k]).abs() < 1e-10,
+                    "d={d} s[{k}]: {} vs {}",
+                    g1[d + k],
+                    gs2[k]
+                );
+            }
+        }
+    }
 
     /// splitmix64 → uniform in [lo, hi).
     struct Rng(u64);

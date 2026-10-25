@@ -696,8 +696,13 @@ mod timing {
             .split(',')
             .map(|v| v.parse().unwrap())
             .collect();
+        let shapes = match std::env::var("SHAPE").as_deref() {
+            Ok("lt") => vec![Shape::LogTangent],
+            Ok("gamma") => vec![Shape::Gamma],
+            _ => vec![Shape::LogTangent, Shape::Gamma],
+        };
         for d in ds {
-            for shape in [Shape::LogTangent, Shape::Gamma] {
+            for &shape in &shapes {
                 let (x, y) = simulate(&hard_truth(d), 2000, 7, shape);
                 let t = Instant::now();
                 let fit = config(d, shape).with_parallel(false).fit(&x, &y).unwrap();

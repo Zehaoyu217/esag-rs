@@ -589,6 +589,7 @@ impl EsagRegressor {
             // groups j ≥ 2 (where observations can get pinned) exist from d = 4;
             // in practice traps need d ≥ 5 and covariates
             trap_streak: data.gamma_cliffs().then(|| AtomicUsize::new(0)),
+            shared: shared_shape(data, b0, free),
         }
     }
 
@@ -746,6 +747,7 @@ impl EsagRegressor {
             free: &free,
             parallel: self.parallel,
             trap_streak: None,
+            shared: shared_shape(data, &best.coef, &free),
         };
         // Pick the canonical member of the {B, B with gamma group 1 negated}
         // equivalence class (identical likelihood, see `canonicalize_coef`).
@@ -1244,6 +1246,9 @@ struct NegLogLik<'a> {
     /// observation pinned at a discontinuity of the gamma parameterization).
     /// `None` disables the monitor.
     trap_streak: Option<AtomicUsize>,
+    /// Every observation has the same log-tangent shape (see
+    /// [`shared_shape`]): one eigen-decomposition per evaluation.
+    shared: bool,
 }
 
 /// The objective in whitened coordinates `θ = θ₀ + L z` (`L` lower
@@ -1418,6 +1423,7 @@ impl<'a> SmoothNegLogLik<'a> {
         Self {
             inner: NegLogLik {
                 data,
+                shared: shared_shape(data, &base, free),
                 base,
                 free,
                 parallel,
@@ -1463,8 +1469,13 @@ const PAR_CHUNK: usize = 64;
 impl Objective for NegLogLik<'_> {
     fn value_and_gradient(&self, params: &[f64], grad: &mut [f64]) -> f64 {
         let b = self.assemble(params);
-        let (f, g_full, ratio) =
-            joint_eval(self.data, &b, self.parallel, self.trap_streak.is_some());
+        let (f, g_full, ratio) = joint_eval(
+            self.data,
+            &b,
+            self.parallel,
+            self.trap_streak.is_some(),
+            self.shared,
+        );
         for (gi, &(k, j)) in grad.iter_mut().zip(self.free) {
             *gi = -g_full[(k, j)];
         }
@@ -1492,23 +1503,55 @@ pub(crate) fn joint_loglik_and_grad(
     b: &DMatrix<f64>,
     parallel: bool,
 ) -> (f64, DMatrix<f64>) {
-    let (f, g, _) = joint_eval(data, b, parallel, false);
+    let (f, g, _) = joint_eval(data, b, parallel, false, false);
     (f, g)
 }
 
+/// Whether every observation of a log-tangent fit has the same shape `S`,
+/// whatever the free coefficients: an intercept, and every shape
+/// coefficient of the other columns fixed (not free) at zero. The gradient
+/// with respect to those fixed coefficients is then not needed, and
+/// [`joint_eval`] diagonalises `S` once per evaluation
+/// ([`crate::logtangent::SharedShape`]).
+fn shared_shape(data: &RegressionData, base: &DMatrix<f64>, free: &[(usize, usize)]) -> bool {
+    let (d, pt) = (data.d, data.p_total);
+    data.lt.is_some()
+        && pt > data.p
+        && data.p > 0
+        && !free.iter().any(|&(k, j)| k >= d && j >= 1)
+        && (d..data.b_dim).all(|k| (1..pt).all(|j| base[(k, j)] == 0.0))
+}
+
+/// One chunk of [`joint_eval`]: log-likelihood, row-major gradient,
+/// squared per-observation gradient norms (if requested) and the shared
+/// shape's accumulator (if any).
+type ChunkEval = (f64, Vec<f64>, Vec<f64>, Vec<f64>);
+
 /// [`joint_loglik_and_grad`], plus (if `ratio` is set) the largest
 /// per-observation gradient norm `‖∇_η ℓ_i‖` over the median one (else 0).
+/// With `shared` (see [`shared_shape`]) the gradient with respect to the
+/// shape coefficients of columns `j ≥ 1` is not computed (left at 0).
 fn joint_eval(
     data: &RegressionData,
     b: &DMatrix<f64>,
     parallel: bool,
     ratio: bool,
+    shared: bool,
 ) -> (f64, DMatrix<f64>, f64) {
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    // one eigen-decomposition of the common shape (the intercept column)
+    let sh = match &data.lt {
+        Some(_) if shared => {
+            let s: Vec<f64> = (d..bd).map(|k| b[(k, 0)]).collect();
+            Some(crate::logtangent::SharedShape::new(&s, d - 1))
+        }
+        _ => None,
+    };
+    let acc_len = sh.as_ref().map_or(0, |s| s.acc_len());
     // Per chunk of observations: eta = B X_cᵀ (bd × m, one contiguous
     // column per observation) and the gradient Σ_i g_i x̃_iᵀ = G X_c, both
     // as matrix products.
-    let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, Vec<f64>) {
+    let body = |rows: std::ops::Range<usize>| -> ChunkEval {
         let m = rows.len();
         // row-major m × pt block of the design = column-major pt × m (X_cᵀ)
         let xt = nalgebra::DMatrixView::from_slice(&data.x[rows.start * pt..rows.end * pt], pt, m);
@@ -1516,10 +1559,22 @@ fn joint_eval(
         let mut ge = DMatrix::<f64>::zeros(bd, m);
         let mut f = 0.0;
         let mut norms = Vec::with_capacity(if ratio { m } else { 0 });
+        let mut wacc = vec![0.0; acc_len];
         for (r, i) in rows.enumerate() {
             let yi = &data.y[i * d..(i + 1) * d];
             let gcol = &mut ge.as_mut_slice()[r * bd..(r + 1) * bd];
-            f += kernel_grad(data, &eta.as_slice()[r * bd..(r + 1) * bd], yi, gcol);
+            let ei = &eta.as_slice()[r * bd..(r + 1) * bd];
+            f += match (&sh, &data.lt) {
+                (Some(sh), Some(fr)) => crate::logtangent::loglik_lt_grad_shared(
+                    fr,
+                    sh,
+                    &ei[..d],
+                    yi,
+                    &mut gcol[..d],
+                    &mut wacc,
+                ),
+                _ => kernel_grad(data, ei, yi, gcol),
+            };
             if ratio {
                 norms.push(gcol.iter().map(|v| v * v).sum::<f64>());
             }
@@ -1532,31 +1587,43 @@ fn joint_eval(
                 g[k * pt + j] = gm[(k, j)];
             }
         }
-        (f, g, norms)
+        (f, g, norms, wacc)
     };
-    let (f, g, mut norms) = if parallel && data.n >= 2 * PAR_CHUNK {
+    let (f, mut g, mut norms, wacc) = if parallel && data.n >= 2 * PAR_CHUNK {
         let n_chunks = data.n.div_ceil(PAR_CHUNK);
         // Chunk results are summed in chunk order (not with rayon's
         // `reduce`, whose combination tree depends on thread timing), so the
         // result is bit-for-bit reproducible.
-        let parts: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n_chunks)
+        let parts: Vec<ChunkEval> = (0..n_chunks)
             .into_par_iter()
             .map(|c| body(c * PAR_CHUNK..((c + 1) * PAR_CHUNK).min(data.n)))
             .collect();
         let mut f = 0.0;
         let mut g = vec![0.0; bd * pt];
         let mut norms = Vec::with_capacity(if ratio { data.n } else { 0 });
-        for (fc, gc, nc) in parts {
+        let mut wacc = vec![0.0; acc_len];
+        for (fc, gc, nc, wc) in parts {
             f += fc;
             for (a, b) in g.iter_mut().zip(&gc) {
                 *a += b;
             }
             norms.extend(nc);
+            for (a, b) in wacc.iter_mut().zip(&wc) {
+                *a += b;
+            }
         }
-        (f, g, norms)
+        (f, g, norms, wacc)
     } else {
         body(0..data.n)
     };
+    if let Some(sh) = &sh {
+        // the shape rows of the intercept column (all others are fixed)
+        let mut gs = vec![0.0; bd - d];
+        sh.shape_gradient(&wacc, &mut gs);
+        for (k, v) in gs.iter().enumerate() {
+            g[(d + k) * pt] = *v;
+        }
+    }
     let r = if ratio && !norms.is_empty() {
         let max = norms.iter().fold(0.0f64, |m, &v| m.max(v));
         let mid = norms.len() / 2;
