@@ -52,7 +52,8 @@ use crate::optim::prox::{
     SmoothObjective, SparseGroupNorms,
 };
 use crate::regression::{
-    EsagRegressor, EsagRegressorFit, Init, RegressionData, Shape, SmoothNegLogLik, isotropic_mask,
+    EsagRegressor, EsagRegressorFit, Init, RegressionData, Shape, SmoothNegLogLik,
+    degenerate_observations, isotropic_mask,
 };
 use nalgebra::DMatrix;
 use rayon::prelude::*;
@@ -907,6 +908,27 @@ impl Prepared {
         // weights depend on its coordinates, not only on its V)
         let theta_init: Vec<f64> = match &cfg.initial_coef {
             Some(b) if paper => free.iter().map(|&(k, j)| b[(k, j)]).collect(),
+            _ if matches!(cfg.weighting, Weighting::Adaptive(_))
+                && !initial.degenerate_obs.is_empty() =>
+            {
+                // The unpenalized MLE does not exist (the fit drives V(x)
+                // towards a singular matrix): adaptive weights from the
+                // plain penalty's selected model instead, as in the
+                // two-stage adaptive LASSO for p ≈ n.
+                let plain = cfg.clone().plain().fit(x, y)?;
+                let b = plain
+                    .relaxed
+                    .as_ref()
+                    .map_or(&plain.best().coef, |r| &r.coef);
+                let mut bs = b.clone();
+                for j in 1..b.ncols() {
+                    for k in 0..b.nrows() {
+                        bs[(k, j)] = b[(k, j)] * scale[j - 1];
+                        bs[(k, 0)] += b[(k, j)] * center[j - 1];
+                    }
+                }
+                free.iter().map(|&(k, j)| bs[(k, j)]).collect()
+            }
             _ => free.iter().map(|&(k, j)| initial.coef[(k, j)]).collect(),
         };
         // the target coefficients (row, column)
@@ -1252,6 +1274,14 @@ impl Prepared {
             cfg.parallel,
         );
         let mut theta = start.clone().unwrap_or_else(|| self.theta_init.clone());
+        // Where the unpenalized MLE does not exist (its fit drives V(x)
+        // towards a singular matrix), warm starts from it inherit the
+        // degeneracy at every λ. Go down from the null model instead
+        // (every penalized atom zero), so the small λ come last.
+        if start.is_none() && !self.initial.degenerate_obs.is_empty() && !cfg.is_paper() {
+            order.reverse();
+            theta = self.null_theta()?;
+        }
         let mut out: Vec<Option<PathPoint>> = vec![None; self.lambdas.len()];
         let mut relaxed_cache: Vec<(Vec<bool>, f64, f64)> = vec![];
         let mut prev_solution: Option<Vec<f64>> = None;
@@ -1351,6 +1381,8 @@ impl Prepared {
                         relaxed_cache.push((active.clone(), rl, df));
                         rl
                     }
+                } else if self.degenerate(&theta) {
+                    f64::NEG_INFINITY
                 } else {
                     ll
                 };
@@ -1365,6 +1397,24 @@ impl Prepared {
             .into_iter()
             .map(|p| p.expect("every lambda fitted"))
             .collect())
+    }
+
+    /// The null model's coefficients: every penalized atom at zero, the
+    /// rest refitted from `theta_init`.
+    fn null_theta(&self) -> Result<Vec<f64>> {
+        let pen = AtomPenalty {
+            atoms: atoms_as_groups_or_gaps(&self.atoms),
+            base: self.base.iter().map(|_| f64::INFINITY).collect(),
+            exponent: Exponent::Fixed(1.0),
+            lambda: 1.0,
+        };
+        let obj = SmoothNegLogLik::new(
+            &self.data,
+            DMatrix::zeros(self.data.b_dim, self.data.p_total),
+            &self.free,
+            self.config.parallel,
+        );
+        Ok(solve(&obj, &pen, &self.theta_init, 1e-6)?.theta)
     }
 
     fn penalty(&self, lambda: f64) -> AtomPenalty<Atoms> {
@@ -1424,7 +1474,22 @@ impl Prepared {
             lambda: 1.0,
         };
         let res = solve(&obj, &pen, theta, 1e-6)?;
+        // a refit that drives V(x_i) towards a singular matrix has an
+        // unbounded likelihood: never select it
+        if self.degenerate(&res.theta) {
+            return Ok(f64::NEG_INFINITY);
+        }
         Ok(-res.smooth)
+    }
+
+    /// Whether coefficients `theta` (standardised) fit some observation by
+    /// a nearly singular `V(x_i)` ([`degenerate_observations`]).
+    fn degenerate(&self, theta: &[f64]) -> bool {
+        let mut b = DMatrix::zeros(self.data.b_dim, self.data.p_total);
+        for (&(k, j), &v) in self.free.iter().zip(theta) {
+            b[(k, j)] = v;
+        }
+        !degenerate_observations(&self.data, &b).is_empty()
     }
 
     /// Relaxed refit at a selected point, as an `EsagRegressorFit` (with

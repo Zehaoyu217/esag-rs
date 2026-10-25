@@ -561,6 +561,8 @@ fn prox_newton_r<A: PenaltyAtoms>(
     let mut n_iter = 0;
     let mut kkt = f64::INFINITY;
     let mut converged = false;
+    // consecutive accepted steps whose decrease is at the rounding level of F
+    let mut flat = 0usize;
     let smooth_grad = |th: &[f64], g: &[f64]| -> Vec<f64> {
         let mut gh = g.to_vec();
         if r_fixed.is_none() {
@@ -634,6 +636,25 @@ fn prox_newton_r<A: PenaltyAtoms>(
             continue;
         }
         let new_obj = f_cand + value(&cand);
+        // Stalled at the tolerance: steps that no longer decrease F beyond
+        // rounding, with the residual already below √tol (an atom flipping
+        // at its threshold). Without this the loop refreshes the Hessian
+        // every iteration until max_iter (5 s at d = 5, n = 2000).
+        if obj - new_obj <= FLAT_DECREASE * obj.abs().max(1.0) && kkt <= cfg.tol.sqrt() {
+            flat += 1;
+            if flat >= FLAT_STEPS {
+                theta.copy_from_slice(&cand);
+                fs = f_cand;
+                grad.copy_from_slice(&gc);
+                obj = new_obj;
+                let gh = smooth_grad(&theta, &grad);
+                kkt = gradient_mapping(&theta, &gh, pen, &pen.weights_at_r(r_at(&theta)));
+                converged = kkt <= cfg.tol.sqrt();
+                break;
+            }
+        } else {
+            flat = 0;
+        }
         // full steps whose decrease matches the model keep the Hessian (it
         // changes little along a warm-started path); otherwise refresh it
         let good = t == 1.0 && (obj - new_obj) >= 0.5 * (-dd);
@@ -663,6 +684,10 @@ fn prox_newton_r<A: PenaltyAtoms>(
 
 /// Newton steps that may reuse one Hessian.
 const HESSIAN_REUSE: usize = 5;
+/// A decrease of `F` below this relative size counts as rounding.
+const FLAT_DECREASE: f64 = 1e-13;
+/// Consecutive such steps after which a solve near the tolerance stops.
+const FLAT_STEPS: usize = 3;
 
 fn weighted_atoms<A: PenaltyAtoms>(atoms: &A, theta: &[f64], w: &[f64]) -> f64 {
     let mut phi = vec![0.0; atoms.len()];

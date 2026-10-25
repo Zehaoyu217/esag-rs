@@ -313,7 +313,7 @@ impl EsagRegressor {
             } else {
                 self.race(&data, &starts[..1], &mask, self.max_iter)
             };
-            if first.converged {
+            if first.converged || !degenerate_observations(&data, &first.coef).is_empty() {
                 first
             } else {
                 let second = self.race(&data, &starts[1..], &mask, self.max_iter);
@@ -334,7 +334,15 @@ impl EsagRegressor {
         let pinned = !best.converged
             && data.gamma_cliffs()
             && !singular_observations(&data, &best.coef).is_empty();
-        if !best.converged && !pinned && matches!(self.init, Init::Auto) && self.n_restarts == 0 {
+        // Nor where the likelihood is unbounded (a fitted V(x_i) heading for
+        // a singular matrix): more starts only diverge further.
+        let unbounded = !best.converged && !degenerate_observations(&data, &best.coef).is_empty();
+        if !best.converged
+            && !pinned
+            && !unbounded
+            && matches!(self.init, Init::Auto)
+            && self.n_restarts == 0
+        {
             let mut centers = starts.clone();
             centers.push(best.coef.clone());
             let extra = perturbed_starts(
@@ -887,12 +895,18 @@ impl EsagRegressor {
         } else {
             singular_observations(data, &coef)
         };
+        let degenerate_obs = if best.converged {
+            vec![]
+        } else {
+            degenerate_observations(data, &coef)
+        };
         Ok(EsagRegressorFit {
             d: data.d,
             n_features: data.p,
             fit_intercept: self.fit_intercept,
             n_obs: data.n,
             singular_obs,
+            degenerate_obs,
             coef,
             mask,
             free,
@@ -1209,6 +1223,40 @@ pub(crate) fn singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> 
     rows.iter()
         .enumerate()
         .filter(|(_, r)| r.0 > cut && r.1 < SINGULAR_DISTANCE)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// An observation whose log-density exceeds the median observation's by
+/// more than this many nats is fitted by a nearly singular `V(x_i)`
+/// ([`degenerate_observations`]). Converged fits stay below 9 (n = 100 to
+/// 2000, d = 5 and 8); fits that diverge reach 17 to 75.
+const DEGENERATE_EXCESS: f64 = 12.0;
+
+/// Observations whose fitted density at `b` exceeds the median
+/// observation's by more than [`DEGENERATE_EXCESS`] nats: the fit is
+/// driving `V(x_i)` towards a singular matrix there. With almost as many
+/// coefficients as observations the likelihood is unbounded this way (the
+/// MLE does not exist), whatever the optimiser does.
+pub(crate) fn degenerate_observations(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let mut eta = vec![0.0; bd];
+    let mut g = vec![0.0; bd];
+    let ll: Vec<f64> = (0..data.n)
+        .map(|i| {
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
+            }
+            kernel_grad(data, &eta, &data.y[i * d..(i + 1) * d], &mut g)
+        })
+        .collect();
+    let mut sorted = ll.clone();
+    let mid = sorted.len() / 2;
+    let (_, med, _) = sorted.select_nth_unstable_by(mid, f64::total_cmp);
+    let cut = *med + DEGENERATE_EXCESS;
+    ll.iter()
+        .enumerate()
+        .filter(|&(_, v)| !(*v <= cut))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1917,6 +1965,12 @@ pub struct EsagRegressorFit {
     /// log-tangent shape.
     #[serde(default)]
     pub singular_obs: Vec<usize>,
+    /// Observations (row indices) whose fitted density exceeds the median
+    /// observation's by more than 12 nats in a fit that did not converge:
+    /// `V(x_i)` is driven towards a singular matrix and the likelihood is
+    /// unbounded (see [`degenerate_observations`]). Empty otherwise.
+    #[serde(default)]
+    pub degenerate_obs: Vec<usize>,
     /// Observed information (Hessian of the negative log-likelihood) over the
     /// free parameters, if computed.
     pub hessian: Option<DMatrix<f64>>,
@@ -2361,27 +2415,45 @@ impl EsagRegressorFit {
             .collect();
         let mut s = header(title, &left, &right);
         s += &coef_blocks(&blocks, alpha);
+        let mut notes: Vec<String> = vec![];
+        let list = |v: &[usize]| {
+            let shown: Vec<String> = v.iter().take(8).map(|i| i.to_string()).collect();
+            format!(
+                "{}{}",
+                shown.join(", "),
+                if v.len() > 8 { ", ..." } else { "" }
+            )
+        };
         if !self.singular_obs.is_empty() {
             let k = self.singular_obs.len();
-            let shown: Vec<String> = self
-                .singular_obs
-                .iter()
-                .take(8)
-                .map(|i| i.to_string())
-                .collect();
-            s += &format!(
-                "Notes:\n[1] {k} observation{} ({}{}) sit at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). shape=\"logtangent\"\n    fits the same distributions with a smooth parameterization.\n",
+            notes.push(format!(
+                "{k} observation{} ({}) sit at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). shape=\"logtangent\"\n    fits the same distributions with a smooth parameterization.",
                 if k == 1 { "" } else { "s" },
-                shown.join(", "),
-                if k > 8 { ", ..." } else { "" }
-            );
+                list(&self.singular_obs)
+            ));
+        }
+        if !self.degenerate_obs.is_empty() {
+            let k = self.degenerate_obs.len();
+            notes.push(format!(
+                "The likelihood is unbounded: the fit drives V(x) towards a singular\n    matrix at {k} observation{} ({}), whose density then exceeds the median\n    observation's by more than 12 nats. With {} free coefficients for {}\n    observations the MLE does not exist. Use fewer shape covariates or a\n    penalized fit (fit_regularized, e.g. a ridge or lasso penalty).",
+                if k == 1 { "" } else { "s" },
+                list(&self.degenerate_obs),
+                self.free.len(),
+                self.n_obs
+            ));
         }
         if let (Shape::LogTangent, Some(m)) = (self.config.shape, &self.config.lt_reference) {
             let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
-            s += &format!(
-                "Notes:\n[1] Log-tangent shape in the frame with reference direction\n    m = ({}).\n    The shape coefficients, and the model, depend on m: pass it as\n    lt_reference to fit the same model to other data.\n",
+            notes.push(format!(
+                "Log-tangent shape in the frame with reference direction\n    m = ({}).\n    The shape coefficients, and the model, depend on m: pass it as\n    lt_reference to fit the same model to other data.",
                 m.join(", ")
-            );
+            ));
+        }
+        if !notes.is_empty() {
+            s += "Notes:\n";
+            for (i, n) in notes.iter().enumerate() {
+                s += &format!("[{}] {n}\n", i + 1);
+            }
         }
         s
     }

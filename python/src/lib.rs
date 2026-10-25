@@ -338,6 +338,10 @@ impl PyResults {
         self.inner.singular_obs.clone()
     }
     #[getter]
+    fn degenerate_obs(&self) -> Vec<usize> {
+        self.inner.degenerate_obs.clone()
+    }
+    #[getter]
     fn n_iter(&self) -> usize {
         self.inner.n_iter
     }

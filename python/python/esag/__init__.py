@@ -416,6 +416,10 @@ class ESAGResults(_CoefTable):
     #: Observations at a singular set of the gamma parameterization (empty
     #: when the fit converged): the likelihood has no regular maximum there.
     singular_obs = property(lambda self: list(self._native.singular_obs))
+    #: Observations whose fitted density exceeds the median one's by more
+    #: than 12 nats in a fit that did not converge: V(x) heads for a
+    #: singular matrix and the MLE does not exist (use fit_regularized).
+    degenerate_obs = property(lambda self: list(self._native.degenerate_obs))
     n_iter = property(lambda self: self._native.n_iter)
     lt_reference = property(
         lambda self: None if self._native.lt_reference is None

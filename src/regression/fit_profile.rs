@@ -853,3 +853,221 @@ fn pinned_gamma_fit_is_reported() {
     let lt = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
     assert!(lt.converged && lt.singular_obs.is_empty());
 }
+
+/// The most extreme fitted shape over the observations: log-tangent
+/// `max_i ‖S(x_i)‖_F` (log condition number scale of V's tangent block) and
+/// the largest per-observation log-density, for converged and failed fits.
+/// `cargo test --release --lib degenerate_shapes -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn degenerate_shapes() {
+    for (d, n) in [
+        (5usize, 100usize),
+        (8, 100),
+        (8, 150),
+        (8, 200),
+        (5, 300),
+        (8, 2000),
+    ] {
+        let truth = hard_truth(d);
+        let mut lines = vec![];
+        for r in 0..12u64 {
+            let (x, y) = simulate(&truth, n, 100 + r, Shape::LogTangent);
+            let cfg = config(d, Shape::LogTangent);
+            let fit = cfg.fit(&x, &y).unwrap();
+            let eta = fit.linear_predictor(&x).unwrap();
+            let smax = (0..n)
+                .map(|i| {
+                    (d..eta.ncols())
+                        .map(|k| eta[(i, k)].powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                })
+                .fold(0.0f64, f64::max);
+            let rows = fit.log_likelihood_rows(&x, &y).unwrap();
+            let mut v: Vec<f64> = rows.iter().copied().collect();
+            v.sort_by(f64::total_cmp);
+            let lmax = v[n - 1] - v[n / 2];
+            lines.push(format!(
+                "{}{:.1}/{:.1}",
+                if fit.converged { "" } else { "*" },
+                smax,
+                lmax
+            ));
+        }
+        println!(
+            "d={d} n={n}: max ‖S_i‖ / max log-density excess over the median (* = not converged): {}",
+            lines.join("  ")
+        );
+    }
+}
+
+/// The LASSO family on the hard scenario: selected covariate parts against
+/// the truth (μ: x1, x2, x4; shape: x1, x3, x4), time on one core.
+/// `RAYON_NUM_THREADS=1 cargo test --release --lib lasso_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn lasso_probe() {
+    use crate::penalized::{Grouping, PenalizedEsag};
+    let truth_mu = [true, true, false, true, false];
+    let truth_sh = [true, false, true, true, false];
+    let ds: Vec<usize> = std::env::var("D")
+        .unwrap_or_else(|_| "3,5".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let ns: Vec<usize> = std::env::var("NS")
+        .unwrap_or_else(|_| "100,300,2000".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for d in ds {
+        for &n in &ns {
+            let (x, y) = simulate(&hard_truth(d), n, 21, Shape::LogTangent);
+            let presets: Vec<(&str, PenalizedEsag)> = vec![
+                ("lasso", PenalizedEsag::lasso()),
+                ("adaptive lasso", PenalizedEsag::adaptive_lasso()),
+                (
+                    "group lasso",
+                    PenalizedEsag::group_lasso().grouping(Grouping::CovariatePart),
+                ),
+                (
+                    "adaptive group lasso",
+                    PenalizedEsag::adaptive_group_lasso().grouping(Grouping::CovariatePart),
+                ),
+                (
+                    "sparse group lasso",
+                    PenalizedEsag::sparse_group_lasso(0.5).grouping(Grouping::CovariatePart),
+                ),
+            ];
+            for (name, pe) in presets {
+                let pe = pe.lt_reference(center(d)).with_parallel(false);
+                let t = Instant::now();
+                let res = pe.fit(&x, &y);
+                let dt = t.elapsed().as_secs_f64() * 1e3;
+                match res {
+                    Ok(path) => {
+                        let b = &path.best().coef;
+                        let act = |j: usize, rows: std::ops::Range<usize>| {
+                            rows.into_iter().any(|k| b[(k, j + 1)] != 0.0)
+                        };
+                        let mut tp = 0;
+                        let mut fp = 0;
+                        let mut pattern = String::new();
+                        for j in 0..5 {
+                            let (am, ash) = (act(j, 0..d), act(j, d..b.nrows()));
+                            pattern += &format!(
+                                "{}{} ",
+                                if am { "m" } else { "." },
+                                if ash { "s" } else { "." }
+                            );
+                            tp += usize::from(am && truth_mu[j]) + usize::from(ash && truth_sh[j]);
+                            fp +=
+                                usize::from(am && !truth_mu[j]) + usize::from(ash && !truth_sh[j]);
+                        }
+                        let rel = path.relaxed.as_ref();
+                        println!(
+                            "d={d} n={n:>4} {name:<21} {dt:8.0} ms | x1..x5 {pattern}| TP {tp}/6 FP {fp}/4 | init conv {} degen {} | relaxed conv {}",
+                            path.initial.converged,
+                            path.initial.degenerate_obs.len(),
+                            rel.map_or("-".into(), |r| format!(
+                                "{} degen {}",
+                                r.converged,
+                                r.degenerate_obs.len()
+                            )),
+                        );
+                    }
+                    Err(e) => println!("d={d} n={n:>4} {name:<21} {dt:8.0} ms | error: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Path detail at small n (debugging the selection guard).
+#[test]
+#[ignore]
+fn lasso_path_detail() {
+    use crate::penalized::PenalizedEsag;
+    let d = 5;
+    let (x, y) = simulate(&hard_truth(d), 100, 21, Shape::LogTangent);
+    let path = PenalizedEsag::lasso()
+        .lt_reference(center(d))
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    for (i, p) in path.points.iter().enumerate() {
+        let data = config(d, Shape::LogTangent).data(&x, &y).unwrap();
+        let degen = degenerate_observations(&data, &p.coef).len();
+        println!(
+            "{i:2} λ {:9.3} active {:3} df {:4.0} ll {:9.2} crit_ll {:9.2} bic {:9.2} conv {} kkt {:.1e} degen(at penalized coef) {degen}{}",
+            p.lambda,
+            p.active.iter().filter(|&&a| a).count(),
+            p.df,
+            p.log_likelihood,
+            p.criterion_loglik,
+            p.bic,
+            p.converged,
+            p.kkt,
+            if i == path.selected {
+                "  <- selected"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// Where the adaptive LASSO path spends its time (d = 5, n = 2000).
+/// `ESAG_P3_DEBUG=1 cargo test --release --lib adaptive_lasso_time -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn adaptive_lasso_time() {
+    use crate::penalized::PenalizedEsag;
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let (x, y) = simulate(&hard_truth(d), 2000, 21, Shape::LogTangent);
+    let t = Instant::now();
+    let path = PenalizedEsag::adaptive_lasso()
+        .lt_reference(center(d))
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    println!("total {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    for p in &path.points {
+        println!(
+            "λ {:10.3} active {:3} iters {:4} conv {} kkt {:.1e}",
+            p.lambda,
+            p.active.iter().filter(|&&a| a).count(),
+            p.n_iter,
+            p.converged,
+            p.kkt
+        );
+    }
+}
+
+/// A small-sample fit whose likelihood is unbounded is flagged and
+/// explained, and the LASSO path then still selects a regular model.
+#[test]
+fn unbounded_likelihood_is_reported() {
+    use crate::penalized::PenalizedEsag;
+    let d = 5;
+    let (x, y) = simulate(&hard_truth(d), 100, 21, Shape::LogTangent);
+    let fit = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
+    assert!(!fit.converged);
+    assert!(
+        !fit.degenerate_obs.is_empty(),
+        "no degenerate observation found"
+    );
+    assert!(fit.summary().contains("The likelihood is unbounded"));
+    let path = PenalizedEsag::lasso()
+        .lt_reference(center(d))
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    let relaxed = path.relaxed.as_ref().unwrap();
+    assert!(relaxed.degenerate_obs.is_empty());
+    assert!(path.best().bic.is_finite());
+}
