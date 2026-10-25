@@ -144,9 +144,10 @@ that suits observation `i` best, `ℓ(B)` has a local supremum that is not a
 regular point: nearby, observation `i` can only lose and the others hardly
 change. Every observation brings such a codimension-2 family of traps in
 coefficient space, and a fit with shape covariates reaches them: its free
-shape slopes can put a high-leverage observation on the set at little cost
-to the rest, even when the true coefficients keep every observation far
-from it. L-BFGS that comes near a trap stalls against it with a huge
+shape slopes can put an observation on the set at little cost to the rest,
+most easily one with large covariate values (trapped observations sit at a
+median 78th–84th percentile of `‖x_i‖`; `trapped_leverage`), even when the
+true coefficients keep every observation far from it. L-BFGS that comes near a trap stalls against it with a huge
 gradient. Traps are local suprema; regular maxima exist too, but gradient
 methods do not reach them reliably.
 

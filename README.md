@@ -622,8 +622,8 @@ continuous. Consequences:
   round. So every observation on the set at its best angle is a trap: a
   local supremum of the likelihood that is not a regular maximum, where
   optimizers stall. Each observation brings its own family of traps, and a
-  fit's free shape slopes can reach them by moving one high-leverage
-  observation, even when the true coefficients keep every observation far
+  fit's free shape slopes can reach them, most easily at observations with
+  large covariate values, even when the true coefficients keep every observation far
   from the set; one shape covariate is enough. With strong shape effects at
   d = 5 and 8 (`examples/hard_scenario.rs`), 0–2 of 12 γ fits converge at
   every n from 200 to 2000; fits started at the true coefficients end in

@@ -1287,3 +1287,29 @@ fn gamma_regular_maximum() {
         }
     }
 }
+
+/// Are trapped observations high-leverage? Percentile of each trapped
+/// observation's covariate norm `‖x_i‖` among all `n`, over γ fits at
+/// `d = 5` with the shape on x1 alone and on x1, x3, x4.
+/// `cargo test --release --lib trapped_leverage -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn trapped_leverage() {
+    for cols in [vec![1usize], vec![1, 3, 4]] {
+        let b = shape_truth(5, &cols, 1.0);
+        let mut pct = vec![];
+        for seed in 500u64..516 {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let fit = config(5, Shape::Gamma).fit(&x, &y).unwrap();
+            let norms: Vec<f64> = (0..x.nrows()).map(|i| x.row(i).norm()).collect();
+            for &i in &fit.singular_obs {
+                pct.push(norms.iter().filter(|&&v| v < norms[i]).count() as f64 / 20.0);
+            }
+        }
+        pct.sort_by(f64::total_cmp);
+        println!(
+            "shape on {cols:?}: {} trapped observations, percentile of ‖x‖: {pct:?}",
+            pct.len()
+        );
+    }
+}
