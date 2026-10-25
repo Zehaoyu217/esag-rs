@@ -359,9 +359,10 @@ impl EsagRegressor {
         // starts around the default starts and the best point so far, until
         // one converges.
         // Where gamma's likelihood has cliffs and the winner sits with
-        // observations on the singular set, no start converges: the
-        // supremum is approached there (`docs/MATH.md` §2), and the waves
-        // below converged in 0–1 of 12 such fits. Skip them.
+        // observations on the singular set, the fit is in a trap, a
+        // non-regular local supremum (`docs/MATH.md` §2). Perturbed starts
+        // fall into other traps (they rescued 0 of 51 such fits), even
+        // starts at the true coefficients do. Skip them.
         let pinned = !best.converged
             && data.gamma_cliffs()
             && !singular_observations(&data, &best.coef).is_empty();
@@ -1225,10 +1226,9 @@ const SINGULAR_DISTANCE: f64 = 1e-2;
 /// direction near the pole `μ̂₀ = μ̂₁ = 0` of the frame `onb(μ)`, in either
 /// case with a gradient over [`SINGULAR_GRADIENT`] times the median. Near
 /// such a set the observation's density changes by `O(1)` as the
-/// coefficients turn around it, and the likelihood's supremum is
-/// approached by putting the observation on the set at its best angle
-/// (`docs/MATH.md` §2): optimisers cannot converge there. Empty for the
-/// log-tangent shape.
+/// coefficients turn around it, so the observation on the set at its best
+/// angle is a trap: a non-regular local supremum of the likelihood, where
+/// optimisers stall (`docs/MATH.md` §2). Empty for the log-tangent shape.
 pub(crate) fn singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
     if data.lt.is_some() {
         return vec![];
@@ -1332,10 +1332,12 @@ pub(crate) struct RegressionData {
 }
 
 impl RegressionData {
-    /// Whether the likelihood can have cliffs: gamma shape with groups
-    /// `j ≥ 2` whose trailing pair can vanish (`d ≥ 5`; at `d = 4` that pair
-    /// is the whole group) and covariates that move observations near the
-    /// singular set.
+    /// Whether the likelihood's cliffs and traps are handled as such
+    /// (restart waves skipped at trapped fits, empirical-information
+    /// metric for refits): gamma shape, `d ≥ 5` and covariates. At `d = 4`
+    /// group 2's trailing pair can vanish too, but traps are rarer there
+    /// and the restart waves still rescue fits (one of 12 on the hard
+    /// scenario at n = 2000), so `d = 4` keeps them.
     pub(crate) fn gamma_cliffs(&self) -> bool {
         self.lt.is_none() && self.d >= 5 && self.p > 0
     }
@@ -2006,9 +2008,9 @@ pub struct EsagRegressorFit {
     pub grad_norm: f64,
     /// Observations (row indices) at a singular set of the gamma
     /// parameterization, where `V(γ)` is discontinuous, with a large
-    /// gradient: the likelihood has no regular maximum at this fit (see
-    /// [`singular_observations`]). Empty for converged fits and for the
-    /// log-tangent shape.
+    /// gradient: the fit stopped in a trap, a non-regular local supremum,
+    /// not at a maximum (see [`singular_observations`]). Empty for
+    /// converged fits and for the log-tangent shape.
     #[serde(default)]
     pub singular_obs: Vec<usize>,
     /// Observations (row indices) whose fitted density exceeds the median
@@ -2473,7 +2475,7 @@ impl EsagRegressorFit {
         if !self.singular_obs.is_empty() {
             let k = self.singular_obs.len();
             notes.push(format!(
-                "{k} observation{} ({}) {} at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). The log-tangent\n    shape (Shape::LogTangent; shape=\"log-tangent\" in Python) describes the\n    same distributions with a smooth parameterization.",
+                "{k} observation{} ({}) {} at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The fit stopped in a\n    trap there: a local supremum of the likelihood that is not a regular\n    maximum, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2); restarts only find\n    other traps. The log-tangent shape (Shape::LogTangent;\n    shape=\"log-tangent\" in Python) describes the same distributions with a\n    smooth parameterization, which has no traps.",
                 if k == 1 { "" } else { "s" },
                 list(&self.singular_obs),
                 if k == 1 { "sits" } else { "sit" }

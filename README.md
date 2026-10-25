@@ -110,7 +110,7 @@ let pr  = prediction_region(&model, &x, &y, &[1.0], 5000, 100, &[0.95, 0.9], 3)?
 std::fs::write("model.json", model.to_json()?)?;     // save; EsagRegressorFit::from_json loads
 ```
 
-For larger regressions (d ≥ 5 with several covariates) the smooth shape is
+For regressions at d ≥ 4 with covariates the smooth shape is
 the reliable choice. Each observation's law is still an ESAG with the same
 number of parameters, but with covariates "shape linear in x" is a
 different regression model in each parameterization, so compare the two by
@@ -236,7 +236,7 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 179 tests, plus 34 slow studies,
+All `cargo test --release` suites pass: 179 tests, plus 36 slow studies,
 diagnostics and benchmarks marked `#[ignore]`. The Python package's 23
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
@@ -336,6 +336,8 @@ nothing). Fits with SEs on one core, 12 replications per cell:
 |---|---|---|---|---|---|---|
 | 3 | log-tangent | 0.6 ms | 0.9 ms | 2.5 ms | 36/36 | 0.12 |
 | 3 | γ | 1.7 ms | 3.4 ms | 12.6 ms | 36/36 | 0.12 |
+| 4 | log-tangent | 0.9 ms | 1.8 ms | 6.4 ms | 36/36 | 0.19 |
+| 4 | γ | 100 ms | 152 ms | 122 ms | 16/36 (3 on the singular set) | 0.23 |
 | 5 | log-tangent | 1.9 ms | 3.4 ms | 11.4 ms | 36/36 | 0.26 |
 | 5 | γ | 60 ms | 73 ms | 0.69 s | 2/36 (26 on the singular set) | 0.34 |
 | 8 | log-tangent | 12 ms | 17 ms | 53 ms | 35/36 | 0.44 |
@@ -343,8 +345,9 @@ nothing). Fits with SEs on one core, 12 replications per cell:
 
 The V̂(x) error is the mean geodesic distance from the true V(x) over 200
 new covariate points. γ at d ≥ 5 does not converge on this data because
-its likelihood has no regular maximum there (see "The γ parameterization:
-what porting found" below); the log-tangent model does.
+its fits stop in traps, local suprema at the singular set of the γ map
+(see "The γ parameterization: what porting found" below); the log-tangent
+model does.
 
 Bootstrap tests on the same data (n = 2000, B = 199, 200 replications,
 s.e. 0.015; at d = 8 score tests, 100 replications), rejection rates at 5%:
@@ -507,7 +510,7 @@ same LM and M replicates:
 
 † B = 50, scaled by 10. γ at d ≥ 5 is slower because its likelihood is
 rough there, not because its kernel is: refits need 50–800 evaluations and
-have local maxima, and with strong shape effects no regular maximum
+have local maxima, and with strong shape effects they stop in traps
 (`docs/MATH.md` §2, §6). A log-tangent replicate costs about 7 evaluations
 per refit, near the floor for a quasi-Newton refit from the original fit;
 its time is the per-observation eigen-decomposition (1.1 µs at d = 8). The
@@ -614,19 +617,25 @@ continuous. Consequences:
   likelihood is multimodal and optimizers stall with one observation pinned
   at the set; this, not arithmetic, is what made big fits slow.
   `Shape::LogTangent` has no such set.
-* **No regular maximum when V depends strongly on x.** Near the set an
-  observation's density depends on the angle of the vanishing pair, and a
-  tiny move of B turns that angle all the way round. So a fit gains `O(1)`
-  by putting such an observation on the set at its best angle: the
-  likelihood's supremum is approached there and not attained. With strong
-  shape effects at d = 5 and 8 (`examples/hard_scenario.rs`), 0–2 of 12 γ
-  fits converge at every n from 200 to 2000, the observation with the
-  largest gradient sits at its density's maximum over the angle with its
-  trailing pair nearly zero (10⁻⁷–10⁻³ of its group norm), and more
-  restarts only find higher
-  suprema (by up to 67 log-likelihood units). This is a property of the
-  γ-linear model, not of the optimizer; the log-tangent model on the same
-  kind of data converges in 251 of 252 fits from n = 200 on.
+* **Traps.** Near the set an observation's density depends on the angle
+  of the vanishing pair, and a tiny move of B turns that angle all the way
+  round. So every observation on the set at its best angle is a trap: a
+  local supremum of the likelihood that is not a regular maximum, where
+  optimizers stall. Each observation brings its own family of traps, and a
+  fit's free shape slopes can reach them by moving one high-leverage
+  observation, even when the true coefficients keep every observation far
+  from the set; one shape covariate is enough. With strong shape effects at
+  d = 5 and 8 (`examples/hard_scenario.rs`), 0–2 of 12 γ fits converge at
+  every n from 200 to 2000; fits started at the true coefficients end in
+  traps too (13 of 16 at d = 5); the observation with the largest gradient
+  sits at its density's maximum over the angle with its trailing pair
+  nearly zero (10⁻⁷–10⁻³ of its group norm); and more restarts only find
+  other traps. Regular maxima exist and, where found, were mostly higher
+  than the trap (4 of 5 comparisons), but gradient methods do not reach
+  them reliably. This is a property of the γ-linear model, not of the
+  optimizer; the log-tangent model on the same kind of data converges in
+  251 of 252 fits from n = 200 on, and at d = 4 in 36 of 36, 15–110×
+  faster than γ.
 * **The frame's pole.** `onb(μ)` is singular where `μ_0 = μ_1 = 0`. When
   the data's mean direction is near that set (for example near `e_d`), γ
   fits slow down even at d = 3 (105 vs 28 ms); the γ model is not

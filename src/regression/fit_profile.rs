@@ -1155,3 +1155,135 @@ fn big_fit_small_n_timing() {
         );
     }
 }
+
+/// The hard truth with the shape slopes kept only on `cols` (from the
+/// x1, x3, x4 of [`hard_truth`]) and scaled by `scale`.
+fn shape_truth(d: usize, cols: &[usize], scale: f64) -> DMatrix<f64> {
+    let mut b = hard_truth(d);
+    for j in 1..b.ncols() {
+        for k in d..b.nrows() {
+            b[(k, j)] *= if cols.contains(&j) { scale } else { 0.0 };
+        }
+    }
+    b
+}
+
+/// What brings γ full fits to the singular set: the truth, or the fit?
+/// For each group `j ≥ 2` the trailing pair, which alone sets the angle
+/// θ_j while the whole group sets the eigenvalue gap, is affine in `x`, so
+/// with two or more shape covariates the true `V(x)` could itself be
+/// singular inside the data. Prints, per truth, the share of observations
+/// whose true pair is within 5% of the singular set, and how γ (and
+/// log-tangent) full fits fare. Measured: no true pair comes within 26% of
+/// its group norm, yet with the shape on x1 alone 7 of 8 fits at `d = 5`
+/// end in traps: the fit's free slopes reach the set, the truth does not.
+/// `cargo test --release --lib gamma_trap_reach -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_trap_reach() {
+    let reps: u64 = std::env::var("R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let cases: Vec<(usize, &str, Vec<usize>, f64)> = vec![
+        (4, "x1", vec![1], 1.0),
+        (4, "x1,x3", vec![1, 3], 1.0),
+        (4, "x1,x3,x4", vec![1, 3, 4], 1.0),
+        (5, "x1", vec![1], 1.0),
+        (5, "x1,x3", vec![1, 3], 1.0),
+        (5, "x1,x3,x4", vec![1, 3, 4], 1.0),
+        (5, "x1,x3,x4", vec![1, 3, 4], 2.0 / 3.0),
+        (5, "x1,x3,x4", vec![1, 3, 4], 1.0 / 3.0),
+    ];
+    println!(
+        "d  shape slopes  scale | truth: near-singular obs  min pair | gamma: conv  pinned  ms/fit | LT: conv"
+    );
+    for (d, label, cols, scale) in cases {
+        let b = shape_truth(d, &cols, scale);
+        let (mut near, mut minr) = (0usize, f64::INFINITY);
+        let (mut conv, mut pinned, mut ms, mut ltconv) = (0, 0, 0.0, 0);
+        for r in 0..reps {
+            let seed = 500 + r;
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            for i in 0..x.nrows() {
+                let g: Vec<f64> = (d..b.nrows())
+                    .map(|k| b[(k, 0)] + (0..5).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+                    .collect();
+                let (ratio, _) = min_pair_ratio(&g, d);
+                near += (ratio < 0.05) as usize;
+                minr = minr.min(ratio);
+            }
+            let s = Instant::now();
+            let fit = config(d, Shape::Gamma).fit(&x, &y).unwrap();
+            ms += s.elapsed().as_secs_f64() * 1e3;
+            conv += fit.converged as usize;
+            pinned += (!fit.singular_obs.is_empty()) as usize;
+            let (x, y) = simulate(&b, 2000, seed, Shape::LogTangent);
+            ltconv += config(d, Shape::LogTangent).fit(&x, &y).unwrap().converged as usize;
+        }
+        println!(
+            "{d}  {label:<12}  {scale:.2}  | {:>6.2}%  {minr:.1e} | {conv:>2}/{reps}  {pinned:>2}/{reps}  {:>7.0} | {ltconv:>2}/{reps}",
+            100.0 * near as f64 / (2000 * reps) as f64,
+            ms / reps as f64
+        );
+    }
+}
+
+/// Smallest relative distance of any observation's γ to the singular sets
+/// (the frame pole, and the trailing pairs of groups `j ≥ 2`) at `b`.
+fn min_singular_distance(data: &RegressionData, b: &DMatrix<f64>) -> f64 {
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let mut eta = vec![0.0; bd];
+    let mut best = f64::INFINITY;
+    for i in 0..data.n {
+        for (k, e) in eta.iter_mut().enumerate() {
+            *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
+        }
+        let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
+        best = best.min(((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt());
+        best = best.min(min_pair_ratio(&eta[d..], d).0);
+    }
+    best
+}
+
+/// Does the γ full model have a regular local maximum near the truth, and
+/// is it the highest point? Fits from the default start and from the
+/// truth itself (`Init::Custom`), with log-likelihoods and the distance of
+/// the closest observation to the singular sets.
+/// `cargo test --release --lib gamma_regular_maximum -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_regular_maximum() {
+    let d = 5;
+    for (label, cols) in [("x1", vec![1usize]), ("x1,x3,x4", vec![1, 3, 4])] {
+        let b = shape_truth(d, &cols, 1.0);
+        println!("truth shape slopes {label}");
+        println!(
+            "seed  ll(truth) | default: ll  conv pinned mindist | from truth: ll  conv pinned mindist | gap"
+        );
+        for seed in 500u64..508 {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = config(d, Shape::Gamma);
+            let data = cfg.data(&x, &y).unwrap();
+            let lt = joint_loglik_and_grad(&data, &b, false).0;
+            let a = cfg.fit(&x, &y).unwrap();
+            let c = cfg
+                .clone()
+                .with_init(Init::Custom(b.clone()))
+                .fit(&x, &y)
+                .unwrap();
+            println!(
+                "{seed}  {lt:.2} | {:.2} {} {:>2} {:.1e} | {:.2} {} {:>2} {:.1e} | {:+.2}",
+                a.log_likelihood,
+                a.converged as u8,
+                a.singular_obs.len(),
+                min_singular_distance(&data, &a.coef),
+                c.log_likelihood,
+                c.converged as u8,
+                c.singular_obs.len(),
+                min_singular_distance(&data, &c.coef),
+                a.log_likelihood - c.log_likelihood
+            );
+        }
+    }
+}

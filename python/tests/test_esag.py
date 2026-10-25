@@ -219,6 +219,8 @@ def test_auto_shape():
     y /= np.linalg.norm(y, axis=1, keepdims=True)
     with pytest.warns(esag.ShapeWarning, match="log-tangent"):
         assert esag.ESAG(y, rng.normal(size=(50, 2))).shape == "log-tangent"
+    with pytest.warns(esag.ShapeWarning, match="d >= 4"):
+        assert esag.ESAG(y[:, :4], rng.normal(size=(50, 2))).shape == "log-tangent"
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert esag.ESAG(y).shape == "gamma"

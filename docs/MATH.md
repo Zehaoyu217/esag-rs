@@ -137,17 +137,18 @@ functions, document this. Two consequences:
   against a cliff with a huge gradient (one observation pinned at
   `‖(γ_{n−1}, γ_n)‖ ≈ 1e−12`). See "Starts" below for how fitting copes.
 
-**No regular maximum when V depends strongly on x.** Near the set, an
-observation's density depends on the angle of the vanishing pair, and a
-move of `B` of the size of that pair turns the angle all the way round. A
-fit can therefore raise one observation's density by `O(1)` at almost no
-cost to the others, by putting its `γ_i` on the set at the angle that suits
-it best. The supremum of `ℓ(B)` is then approached as `γ_i` reaches the set
-and is not attained, and no optimizer converges. When the shape slopes are
-large enough for the trailing pairs `Γ_pair x̃` to cross zero inside the data
-(a codimension-2 subspace of covariate space, which meets the data cloud
-whenever `p ≥ 2` and the shape varies enough), some observation is
-generically within `O(n^{−1/2})` of the set.
+**Traps.** Near the set, an observation's density depends on the angle of
+the vanishing pair, and a move of `B` of the size of that pair turns the
+angle all the way round. So wherever some `γ_i` is on the set at the angle
+that suits observation `i` best, `ℓ(B)` has a local supremum that is not a
+regular point: nearby, observation `i` can only lose and the others hardly
+change. Every observation brings such a codimension-2 family of traps in
+coefficient space, and a fit with shape covariates reaches them: its free
+shape slopes can put a high-leverage observation on the set at little cost
+to the rest, even when the true coefficients keep every observation far
+from it. L-BFGS that comes near a trap stalls against it with a huge
+gradient. Traps are local suprema; regular maxima exist too, but gradient
+methods do not reach them reliably.
 
 Evidence (the hard scenario of `examples/hard_scenario.rs`, `n = 2000`,
 5 covariates; `src/regression/fit_profile.rs`):
@@ -156,11 +157,22 @@ Evidence (the hard scenario of `examples/hard_scenario.rs`, `n = 2000`,
   largest gradient (230× the median) had its trailing pair at `1.2e−5` to
   `1e−3` of its group norm, and its log-density equalled the maximum over
   the pair's angle (−1.762 against a range of −3.349 to −1.762);
+* the true coefficients keep every observation far from the set (the
+  smallest trailing-pair ratio over 16,000 draws is 0.26–0.43), yet fits
+  started at them end in traps (13 of 16 at `d = 5`;
+  `gamma_regular_maximum`). Where one of the two fits of a dataset reached
+  a regular maximum and the other a trap, the regular maximum was higher in
+  4 of 5 cases (by 2.3–8.4; the trap was higher once, by 0.6);
+* one shape covariate is enough: with the true shape slopes on `x1` alone,
+  7 of 8 fits at `d = 5` end in traps, as many as with `x1, x3, x4`
+  (`gamma_trap_reach`). At `d = 4`, whose only trailing pair is group 2's,
+  21 of 24 fits converge at `n = 2000` (but 1 of 12 at `n = 200`, and
+  15–20× slower than log-tangent at every n);
 * the race never converged (0 of 12 at `d = 5` and `d = 8`, n = 500 and
-  2000); the perturbed restarts never rescued a fit with pinned observations
-  (0 of 51, hard and standard scenarios), and only found other
-  configurations on the set with a higher supremum, by up to 67
-  log-likelihood units: more search gives higher values;
+  2000); the perturbed restarts never rescued a trapped fit (0 of 51, hard
+  and standard scenarios), and only found other traps, up to 67
+  log-likelihood units higher: there are many, and more search finds
+  higher ones;
 * at small n the effect is the same (γ at `d = 5, 8`: 0–1 of 12 fits converge
   at every n from 100 to 1000).
 
@@ -168,8 +180,8 @@ Fits detect this: `EsagRegressorFit::singular_obs` lists the observations
 within `1e−2` of a singular set (relative to the group norm, or
 `√(μ̂_0² + μ̂_1²)` for the frame's pole) whose gradient exceeds 20 times the
 median; the restart waves are skipped when they are not empty (they cannot
-help), and the summary says that the estimate is not an MLE in the usual
-sense. On the standard scenario (`examples/big_fit.rs`, slopes ~0.3) the
+help), and the summary says that the fit stopped in a trap, so the estimate
+is not an MLE in the usual sense. On the standard scenario (`examples/big_fit.rs`, slopes ~0.3) the
 γ fits at `n = 2000` converge (11 of 12), and the waves still rescue some
 fits that stall without a pinned observation (4 of 9).
 
@@ -533,7 +545,7 @@ RoC, D, LR and LM for the false ones:
 `M` rejects the false nulls 3.5–31% of the time. (The γ and log-tangent data
 are generated from the same coefficients read in each parameterization, so
 their effect sizes differ; compare across rows with care.) γ at d ≥ 5 is
-not in the table: on this data its full model has no regular maximum (§2).
+not in the table: on this data its full fits stop in traps (§2).
 
 **Score statistic and score test.** With `s_i` the score of observation `i`
 over the full model's free coefficients at the restricted fit, `g = Σ s_i`

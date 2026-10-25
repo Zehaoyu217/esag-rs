@@ -153,8 +153,8 @@ class ESAG:
         Shape parameterization. ``"gamma"`` is the papers' (Paine et al.
         2018; Yu & Huang). ``"log-tangent"`` writes V through the matrix
         exponential of a traceless symmetric matrix in the tangent space;
-        it is smooth everywhere, so big regressions (d >= 5 with covariates)
-        fit quickly and reliably. ``"auto"`` uses gamma when d <= 4 or there
+        it is smooth everywhere, so regressions at d >= 4 with covariates
+        fit quickly and reliably. ``"auto"`` uses gamma when d = 3 or there
         are no covariates, and log-tangent otherwise, with a
         :class:`ShapeWarning` when it picks log-tangent. With covariates the
         two are different (non-nested) regression models for the shape, as
@@ -198,10 +198,10 @@ class ESAG:
         self.exog_names = ["const"] + [exog_names[j] for j in keep_cols]
         d = y.shape[1]
         if shape == "auto":
-            shape = "gamma" if d <= 4 or x.shape[1] == 0 else "log-tangent"
+            shape = "gamma" if d <= 3 or x.shape[1] == 0 else "log-tangent"
             if shape == "log-tangent":
                 warnings.warn(
-                    "shape='auto' chose the log-tangent model (d >= 5 with covariates), "
+                    "shape='auto' chose the log-tangent model (d >= 4 with covariates), "
                     "a different shape regression from the gamma model of Yu & Huang; "
                     "pass shape='gamma' for that model, or shape='log-tangent' to "
                     "silence this warning",
@@ -414,7 +414,8 @@ class ESAGResults(_CoefTable):
     df_resid = property(lambda self: self._native.df_resid)
     converged = property(lambda self: self._native.converged)
     #: Observations at a singular set of the gamma parameterization (empty
-    #: when the fit converged): the likelihood has no regular maximum there.
+    #: when the fit converged): the fit stopped in a trap there, a local
+    #: supremum of the likelihood that is not a regular maximum.
     singular_obs = property(lambda self: list(self._native.singular_obs))
     #: Observations whose fitted density exceeds the median one's by more
     #: than 12 nats in a fit that did not converge: V(x) heads for a

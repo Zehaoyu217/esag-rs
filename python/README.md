@@ -48,7 +48,7 @@ temp           -0.5738      0.026    -21.869     0.000      -0.625      -0.522
 | `res.conf_int(alpha)` | (equation, exog) × (lower, upper) |
 | `res.cov_params()` | covariance of the estimated coefficients |
 | `res.llf`, `aic`, `bic`, `nobs`, `df_model`, `df_resid`, `converged` | |
-| `res.singular_obs`, `res.degenerate_obs` | why a fit did not converge: observations on a singular set of γ (no regular maximum; use `shape="log-tangent"`), or with V(x) degenerating (the likelihood is unbounded; use `fit_regularized`) |
+| `res.singular_obs`, `res.degenerate_obs` | why a fit did not converge: observations on a singular set of γ (the fit stopped in a trap; use `shape="log-tangent"`), or with V(x) degenerating (the likelihood is unbounded; use `fit_regularized`) |
 | `res.predict(exog)`, `linear_predictor`, `resid`, `loglike_obs()`, `simulate()` | |
 | `res.summary(alpha)` | text summary (prints; `as_text()`; HTML in notebooks) |
 
@@ -110,14 +110,15 @@ weights from the plain penalty's selection.
 
 ### Shapes
 
-`shape="auto"` (default) fits the papers' γ parameterization when d ≤ 4 or
+`shape="auto"` (default) fits the papers' γ parameterization when d = 3 or
 there are no covariates, and the smooth log-tangent parameterization
 otherwise, and raises an `esag.ShapeWarning` when it makes that switch.
-The γ map has a singular set that makes big γ regressions slow and gives
-their likelihood local maxima (`docs/MATH.md` §2, §6). When V depends
-strongly on the covariates at d ≥ 5, the γ likelihood has no regular
-maximum at all: its supremum is approached by putting observations on that
-set, and `res.singular_obs` lists them. With covariates the
+The γ map has a singular set (from d = 4) that makes γ regressions slow and
+gives their likelihood traps: local suprema with an observation on the set,
+where fits stall even when started at the true coefficients
+(`docs/MATH.md` §2, §6); `res.singular_obs` lists those observations. On
+the hard scenario at d = 4, γ fits converge in 16 of 36 cases and take
+0.1–0.15 s; log-tangent fits converge in 36 of 36 and take 1–6 ms. With covariates the
 two are different regression models for the shape (the mean model is the
 same); compare them by AIC/BIC. Pass `shape="gamma"` or
 `shape="log-tangent"` to choose explicitly.
