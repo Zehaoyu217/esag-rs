@@ -682,6 +682,143 @@ mod timing {
         );
     }
 
+    /// Per-replicate costs of `run_test` on the hard scenario (both `μ` and
+    /// `V` depend on `x`), one core.
+    /// `RAYON_NUM_THREADS=1 cargo test --release --lib hard_replicates -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn hard_replicates() {
+        use crate::regression::Shape;
+        use crate::regression::fit_profile::{config, hard_truth, simulate};
+        let reps = 12;
+        let ds: Vec<usize> = std::env::var("D")
+            .unwrap_or_else(|_| "3,5,8".into())
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        for d in ds {
+            for shape in [Shape::LogTangent, Shape::Gamma] {
+                let (x, y) = simulate(&hard_truth(d), 2000, 7, shape);
+                let t = Instant::now();
+                let fit = config(d, shape).with_parallel(false).fit(&x, &y).unwrap();
+                println!(
+                    "d={d} {shape:?}: full fit {:.1} ms (converged {})",
+                    t.elapsed().as_secs_f64() * 1e3,
+                    fit.converged
+                );
+                for null in [
+                    Restriction::Isotropy,
+                    Restriction::ConstantShape,
+                    Restriction::GammaOfFeature(0),
+                    Restriction::MuOfFeature(1),
+                    Restriction::Feature(4),
+                ] {
+                    let mask0 = restriction_mask(&fit, &null).unwrap();
+                    let mut b0 = fit.coef.clone();
+                    for (v, &f) in b0.iter_mut().zip(mask0.iter()) {
+                        if !f {
+                            *v = 0.0;
+                        }
+                    }
+                    let mut cfg0 = refit_config(&fit);
+                    cfg0.mask = Some(mask0.clone());
+                    cfg0.precondition = None;
+                    let t = Instant::now();
+                    let fit0 = {
+                        let mut once = cfg0.clone();
+                        once.compute_hessian = true;
+                        let warm = once.fit_warm(&x, &y, &b0).unwrap();
+                        let mut auto = once.clone();
+                        auto.init = crate::regression::Init::Auto;
+                        auto.local_precondition = false;
+                        match auto.fit(&x, &y) {
+                            Ok(a) if a.log_likelihood > warm.log_likelihood => a,
+                            _ => warm,
+                        }
+                    };
+                    let t_fit0 = t.elapsed().as_secs_f64() * 1e3;
+                    cfg0.precondition = fit0
+                        .cov_params
+                        .as_ref()
+                        .and_then(crate::regression::precondition_from_cov);
+                    let shape_zeroed =
+                        (d..mask0.nrows()).all(|k| (0..mask0.ncols()).all(|j| !mask0[(k, j)]));
+                    let gamma_cone = shape == Shape::Gamma && shape_zeroed;
+                    let mut cfg_a = refit_config(&fit);
+                    let t = Instant::now();
+                    cfg_a.precondition = if gamma_cone {
+                        None
+                    } else {
+                        cfg_a.precondition_at(&x, &y, &fit0.coef, &fit.mask)
+                    };
+                    let t_pre = t.elapsed().as_secs_f64() * 1e3;
+                    let cfg_a2 = refit_config(&fit);
+                    let (mut t0, mut ta1, mut ta2, mut tm, mut tl) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                    let (mut f0e, mut fa1e, mut fa2e) = (0, 0, 0);
+                    let mut n2 = 0;
+                    for r in 0..reps {
+                        let mut rng = crate::stream_rng(1, 5, r as u64);
+                        let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+                        let t = Instant::now();
+                        let f0 = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+                        t0 += t.elapsed().as_secs_f64();
+                        f0e += f0.n_fev;
+                        let mut ba = f0.coef.clone();
+                        for &(k, j) in &fit.free {
+                            if !mask0[(k, j)] {
+                                ba[(k, j)] = if k < d || shape == Shape::LogTangent {
+                                    0.0
+                                } else {
+                                    1e-3
+                                };
+                            }
+                        }
+                        let t = Instant::now();
+                        let fa1 = cfg_a.fit_warm(&x, &yb, &ba).unwrap();
+                        ta1 += t.elapsed().as_secs_f64();
+                        fa1e += fa1.n_fev;
+                        if shape == Shape::Gamma || !fa1.converged {
+                            let t = Instant::now();
+                            let fa2 = cfg_a2.fit_warm(&x, &yb, &fit.coef).unwrap();
+                            ta2 += t.elapsed().as_secs_f64();
+                            fa2e += fa2.n_fev;
+                            n2 += 1;
+                        }
+                        let t = Instant::now();
+                        let _ = moment_stat(&f0, &x, &yb, 0, 1, 1, false).unwrap();
+                        tm += t.elapsed().as_secs_f64();
+                        let t = Instant::now();
+                        let _ = f0.score_statistic(&x, &yb, &fit.free);
+                        tl += t.elapsed().as_secs_f64();
+                    }
+                    let r = reps as f64;
+                    println!(
+                        "   {:<28} df {:>3} | fit0 {:6.1} ms, metric {:5.1} ms | per replicate: restricted {:5.1} ms ({:3.0} fev), full {:6.1} ms ({:3.0} fev){} , M {:4.1}, LM {:4.1} ms",
+                        restriction_label(&fit, &null),
+                        fit.free.iter().filter(|&&(k, j)| !mask0[(k, j)]).count(),
+                        t_fit0,
+                        t_pre,
+                        t0 / r * 1e3,
+                        f0e as f64 / r,
+                        ta1 / r * 1e3,
+                        fa1e as f64 / r,
+                        if n2 > 0 {
+                            format!(
+                                " + 2nd {:6.1} ms ({:3.0} fev, {n2}/{reps})",
+                                ta2 / n2 as f64 * 1e3,
+                                fa2e as f64 / n2 as f64
+                            )
+                        } else {
+                            String::new()
+                        },
+                        tm / r * 1e3,
+                        tl / r * 1e3
+                    );
+                }
+            }
+        }
+    }
+
     /// Cost of the score statistic against the rest of a replicate, n = 2000,
     /// 5 covariates. `cargo test --release --lib score_cost -- --ignored --nocapture`
     #[test]
@@ -885,6 +1022,109 @@ mod gamma_refits {
             eprintln!(
                 "{r:?}: warm restricted refit below the fresh fit in {worse}/40 (max gap {max:.3}), above it in {better}/40"
             );
+        }
+    }
+
+    /// Second starts for the bootstrap restricted refits: how often each
+    /// procedure ends below the best restricted maximum found by any start
+    /// (warm at the bootstrap truth, the observed full fit zeroed, the
+    /// bootstrap full refit zeroed, and a fit from scratch), and its cost.
+    /// `cargo test --release --lib restricted_second_start -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn restricted_second_start() {
+        use rayon::prelude::*;
+        let (d, p, n) = (5, 5, 2000);
+        let (x, y) = sim(d, p, n, 11);
+        let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+        for r in [
+            Restriction::MuOfFeature(0),
+            Restriction::GammaOfFeature(0),
+            Restriction::Feature(4),
+            Restriction::ConstantShape,
+        ] {
+            let mask0 = restriction_mask(&fit, &r).unwrap();
+            let zero = |b: &DMatrix<f64>| {
+                let mut b = b.clone();
+                for (v, &f) in b.iter_mut().zip(mask0.iter()) {
+                    if !f {
+                        *v = 0.0;
+                    }
+                }
+                b
+            };
+            let b0 = zero(&fit.coef);
+            let mut cfg0 = refit_config(&fit);
+            cfg0.mask = Some(mask0.clone());
+            cfg0.precondition = None;
+            let mut once = cfg0.clone();
+            once.compute_hessian = true;
+            let warm0 = once.fit_warm(&x, &y, &b0).unwrap();
+            let mut auto = once.clone();
+            auto.init = crate::regression::Init::Auto;
+            auto.local_precondition = false;
+            let fit0 = match auto.fit(&x, &y) {
+                Ok(a) if a.log_likelihood > warm0.log_likelihood => a,
+                _ => warm0,
+            };
+            cfg0.precondition = fit0
+                .cov_params
+                .as_ref()
+                .and_then(crate::regression::precondition_from_cov);
+            let cfg_a = refit_config(&fit);
+            let mut fresh_cfg = cfg0.clone();
+            fresh_cfg.init = crate::regression::Init::Auto;
+            fresh_cfg.local_precondition = false;
+            let reps = 60u64;
+            // per replicate: lls of (warm, from b0, from zeroed full refit,
+            // fresh) and evaluations of the first three
+            let rows: Vec<([f64; 4], [usize; 4])> = (0..reps)
+                .into_par_iter()
+                .map(|b| {
+                    let mut rng = crate::stream_rng(7, crate::streams::TEST_BOOT, b);
+                    let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+                    let warm = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+                    let from_b0 = cfg0.fit_warm(&x, &yb, &b0).unwrap();
+                    let fa = cfg_a.fit_warm(&x, &yb, &fit.coef).unwrap();
+                    let from_fa = cfg0.fit_warm(&x, &yb, &zero(&fa.coef)).unwrap();
+                    let fresh = fresh_cfg.fit(&x, &yb).unwrap();
+                    (
+                        [
+                            warm.log_likelihood,
+                            from_b0.log_likelihood,
+                            from_fa.log_likelihood,
+                            fresh.log_likelihood,
+                        ],
+                        [warm.n_fev, from_b0.n_fev, from_fa.n_fev, fresh.n_fev],
+                    )
+                })
+                .collect();
+            let report = |name: &str, pick: &dyn Fn(&[f64; 4]) -> f64| {
+                let gaps: Vec<f64> = rows
+                    .iter()
+                    .map(|(l, _)| l.iter().copied().fold(f64::NEG_INFINITY, f64::max) - pick(l))
+                    .collect();
+                let below = gaps.iter().filter(|&&g| g > 0.01).count();
+                let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+                let max = gaps.iter().copied().fold(0.0, f64::max);
+                eprintln!(
+                    "  {name:<28} below the best in {below:>2}/{reps} (mean gap {mean:.3}, max {max:.3})"
+                );
+            };
+            let fev = |k: usize| rows.iter().map(|(_, e)| e[k]).sum::<usize>() as f64 / reps as f64;
+            eprintln!(
+                "null {r:?}: evaluations warm {:.0}, from b0 {:.0}, from the zeroed full refit {:.0}, fresh {:.0}",
+                fev(0),
+                fev(1),
+                fev(2),
+                fev(3)
+            );
+            report("warm only", &|l| l[0]);
+            report("warm + observed fit zeroed", &|l| l[0].max(l[1]));
+            report("warm + full refit zeroed", &|l| l[0].max(l[2]));
+            report("all three", &|l| l[0].max(l[1]).max(l[2]));
+            report("warm + fresh", &|l| l[0].max(l[3]));
+            report("full refit zeroed + fresh", &|l| l[2].max(l[3]));
         }
     }
 

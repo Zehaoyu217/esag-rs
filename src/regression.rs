@@ -286,7 +286,37 @@ impl EsagRegressor {
                 self.seed,
             ));
         }
-        let mut best = self.race(&data, &starts, &mask, self.max_iter);
+        // The log-tangent likelihood is smooth, and the moment start reaches
+        // the maximum the R-style start does (192 of 192 simulated datasets,
+        // `docs/MATH.md`, "Starts"): race the second start only if the first
+        // fails the convergence check. For gamma the starts end at different
+        // maxima in up to 10 of 16 datasets, so they are always raced.
+        let single = data.lt.is_some()
+            && matches!(self.init, Init::Auto)
+            && self.n_restarts == 0
+            && starts.len() > 1;
+        let mut best = if single {
+            // whitened with the exact information at the moment start, L-BFGS
+            // needs 9–10 evaluations instead of 23–34 (an exact Hessian costs
+            // 2–4 gradients)
+            let free = free_params(&mask);
+            let mut first_cfg = self.clone();
+            first_cfg.local_precondition = false;
+            first_cfg.precondition = info_precondition(&data, &starts[0], &free, self.parallel);
+            let first = if first_cfg.precondition.is_some() {
+                first_cfg.optimize(&data, &starts[0], &free, self.max_iter)
+            } else {
+                self.race(&data, &starts[..1], &mask, self.max_iter)
+            };
+            if first.converged {
+                first
+            } else {
+                let second = self.race(&data, &starts[1..], &mask, self.max_iter);
+                if second.beats(&first) { second } else { first }
+            }
+        } else {
+            self.race(&data, &starts, &mask, self.max_iter)
+        };
         // Safety net: if no start passed the convergence check (typically an
         // observation pinned at a singular point of the gamma
         // parameterization, see `docs/MATH.md`), race waves of perturbed
@@ -611,7 +641,9 @@ impl EsagRegressor {
             };
         // whitened with an inverse information, the Hessian is near I: start
         // with the Newton step, and stop once the predicted remaining gain
-        // ½‖g_z‖² is below REFIT_DECREMENT
+        // ½‖g_z‖² is below REFIT_DECREMENT (HANDOFF_DECREMENT when `finalize`
+        // polishes with Newton steps). The absolute gradient rule of `cfg`
+        // is in θ units and does not apply to g_z.
         let whitened = |l: &DMatrix<f64>, start: &[f64], iters: usize| -> OptimResult {
             let w = Whitened {
                 inner: &obj,
@@ -620,7 +652,12 @@ impl EsagRegressor {
             };
             let wcfg = LbfgsConfig {
                 unit_scale: true,
-                tol_decrement: REFIT_DECREMENT,
+                tol_decrement: if self.compute_hessian {
+                    HANDOFF_DECREMENT
+                } else {
+                    REFIT_DECREMENT
+                },
+                tol_grad_abs: 0.0,
                 max_iter: iters,
                 ..cfg.clone()
             };
@@ -1255,18 +1292,28 @@ impl EsagRegressor {
         mask: &DMatrix<bool>,
     ) -> Option<Arc<DMatrix<f64>>> {
         let data = self.data(x, y).ok()?;
-        let free = free_params(mask);
-        let (_, _, h) = joint_loglik_grad_hess(&data, b, true);
-        let (bd, full) = (data.b_dim, data.b_dim * data.p_total);
-        let nf = free.len();
-        let info = DMatrix::from_fn(nf, nf, |a, c| {
-            let (ka, ja) = free[a];
-            let (kc, jc) = free[c];
-            -h[(ja * bd + ka) * full + jc * bd + kc]
-        });
-        let cov = info.cholesky()?.inverse();
-        precondition_from_cov(&cov)
+        info_precondition(&data, b, &free_params(mask), true)
     }
+}
+
+/// The Cholesky factor of the inverse observed information at `b` over
+/// `free`, if the information is positive definite there.
+fn info_precondition(
+    data: &RegressionData,
+    b: &DMatrix<f64>,
+    free: &[(usize, usize)],
+    parallel: bool,
+) -> Option<Arc<DMatrix<f64>>> {
+    let (_, _, h) = joint_loglik_grad_hess(data, b, parallel);
+    let (bd, full) = (data.b_dim, data.b_dim * data.p_total);
+    let nf = free.len();
+    let info = DMatrix::from_fn(nf, nf, |a, c| {
+        let (ka, ja) = free[a];
+        let (kc, jc) = free[c];
+        -h[(ja * bd + ka) * full + jc * bd + kc]
+    });
+    let cov = info.cholesky()?.inverse();
+    precondition_from_cov(&cov)
 }
 
 /// The refit preconditioner from the empirical information
@@ -1306,6 +1353,21 @@ fn empirical_precondition(
     precondition_from_cov(&info.cholesky()?.inverse())
 }
 
+/// `info += SᵀS` on and below the diagonal (column blocks of 64; the upper
+/// blocks are left alone): the symmetric Gram matrix at about half the cost.
+fn gram_lower_add(info: &mut DMatrix<f64>, s: &DMatrix<f64>) {
+    const BS: usize = 64;
+    let k = s.ncols();
+    for a in (0..k).step_by(BS) {
+        let na = BS.min(k - a);
+        for b in (0..=a).step_by(BS) {
+            let nb = BS.min(k - b);
+            info.view_mut((a, b), (na, nb))
+                .gemm_tr(1.0, &s.columns(a, na), &s.columns(b, nb), 1.0);
+        }
+    }
+}
+
 /// Lower Cholesky factor of a covariance matrix (the preconditioner for
 /// refits), if it is positive definite.
 pub(crate) fn precondition_from_cov(cov: &DMatrix<f64>) -> Option<Arc<DMatrix<f64>>> {
@@ -1323,6 +1385,9 @@ const TRAP_RATIO: f64 = 1e5;
 /// At 1e-6 every coefficient is within ~0.0014 standard errors of the
 /// maximum and the log-likelihood within 1e-6, far below bootstrap noise.
 const REFIT_DECREMENT: f64 = 1e-6;
+/// The same rule for whitened fits whose result `finalize` polishes with
+/// Newton steps on the exact Hessian (fits with standard errors).
+const HANDOFF_DECREMENT: f64 = 1e-5;
 /// Consecutive trapped evaluations after which a start is abandoned.
 const TRAP_STREAK: usize = 25;
 
@@ -1844,22 +1909,27 @@ impl EsagRegressorFit {
                     s[(r, a)] = ge[k] * data.x[i * pt + j];
                 }
             }
-            info.gemm_tr(1.0, &s, &s, 1.0);
+            gram_lower_add(&mut info, &s);
             for a in 0..nf {
                 g[a] += s.column(a).sum();
             }
         }
-        let quad = |idx: &[usize]| -> Option<f64> {
-            let sub = DMatrix::from_fn(idx.len(), idx.len(), |a, c| info[(idx[a], idx[c])]);
-            let gs = DVector::from_iterator(idx.len(), idx.iter().map(|&a| g[a]));
-            Some(gs.dot(&sub.cholesky()?.solve(&gs)))
-        };
-        let all: Vec<usize> = (0..nf).collect();
-        let kept: Vec<usize> = (0..nf).filter(|&a| self.mask[full[a]]).collect();
-        Ok(match (quad(&all), quad(&kept)) {
-            (Some(q), Some(qf)) => q - qf,
-            _ => f64::NAN,
-        })
+        // Order the kept coefficients first: the Cholesky factor `L` of `I`
+        // then holds that of `I_ff` as its leading block, and with `Lz = g`,
+        // `LM = Σ_{a ≥ k_f} z_a²` (one factorization, and no difference of
+        // two large quadratic forms).
+        let mut order: Vec<usize> = (0..nf).filter(|&a| self.mask[full[a]]).collect();
+        let kf = order.len();
+        order.extend((0..nf).filter(|&a| !self.mask[full[a]]));
+        let sub = DMatrix::from_fn(nf, nf, |a, c| {
+            let (u, v) = (order[a].max(order[c]), order[a].min(order[c]));
+            info[(u, v)]
+        });
+        let gs = DVector::from_iterator(nf, order.iter().map(|&a| g[a]));
+        Ok(sub
+            .cholesky()
+            .and_then(|ch| ch.l().solve_lower_triangular(&gs))
+            .map_or(f64::NAN, |z| z.rows(kf, nf - kf).norm_squared()))
     }
 
     /// The distribution for one linear predictor `eta` (in this model's
@@ -2310,3 +2380,7 @@ mod kernel_timing {
         }
     }
 }
+
+/// Where a full fit spends its time when both `μ` and `V` depend on `x`.
+#[cfg(test)]
+pub(crate) mod fit_profile;
