@@ -13,7 +13,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use esag::FastRng;
 use esag::distribution::Esag;
-use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region};
+use esag::inference::{
+    GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region, score_test,
+};
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, Target};
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
@@ -71,6 +73,9 @@ enum NullKind {
     Gamma,
     /// both mu and gamma coefficients of --feature are 0
     Feature,
+    /// the shape coefficients of every feature are 0 (an anisotropic shape,
+    /// the same at every x)
+    ConstantShape,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -188,7 +193,7 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
-    /// Bootstrap hypothesis test (RoC, D, M, LR) against a restricted model.
+    /// Bootstrap hypothesis test (RoC, D, M, LR, LM) against a restricted model.
     Test {
         model: PathBuf,
         data: PathBuf,
@@ -209,6 +214,9 @@ enum Cmd {
         mc: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Score test: refit only the restricted model (LM and M), 2-4x faster.
+        #[arg(long)]
+        score: bool,
     },
     /// LASSO-type penalized fit along a lambda path with lambda selection
     /// (Yu & Huang, Project 3; see docs/MATH.md section 8).
@@ -455,6 +463,7 @@ fn run() -> Res<()> {
             boot,
             mc,
             seed,
+            score,
         } => {
             let fit = load_model(&model)?;
             let (xm, ym, _) = load_xy(&data, &y, &x)?;
@@ -463,9 +472,14 @@ fn run() -> Res<()> {
                 NullKind::Mu => Restriction::MuOfFeature(feature),
                 NullKind::Gamma => Restriction::GammaOfFeature(feature),
                 NullKind::Feature => Restriction::Feature(feature),
+                NullKind::ConstantShape => Restriction::ConstantShape,
             };
             let t0 = Instant::now();
-            let r = hypothesis_test(&fit, &xm, &ym, restriction, boot, mc, seed)?;
+            let r = if score {
+                score_test(&fit, &xm, &ym, restriction, boot, mc, seed)?
+            } else {
+                hypothesis_test(&fit, &xm, &ym, restriction, boot, mc, seed)?
+            };
             outln!("{}", r.summary());
             outln!("{:.2} s", t0.elapsed().as_secs_f64());
         }

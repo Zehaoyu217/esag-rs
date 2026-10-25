@@ -396,28 +396,27 @@ impl PyResults {
         n_boot: usize,
         seed: u64,
     ) -> PyResult<PyTest> {
-        let j = match feature {
-            Some(f) => Some(match f.parse::<usize>() {
-                Ok(i) => i,
-                Err(_) => self.inner.feature_index(f).map_err(err)?,
-            }),
-            None => None,
-        };
-        let need = |j: Option<usize>| j.ok_or_else(|| err(format!("null {null:?} needs feature=")));
-        let restriction = match null.to_ascii_lowercase().replace('-', "_").as_str() {
-            "isotropy" | "isotropic" => Restriction::Isotropy,
-            "mu" | "mean" => Restriction::MuOfFeature(need(j)?),
-            "shape" | "gamma" => Restriction::GammaOfFeature(need(j)?),
-            "feature" | "covariate" | "both" => Restriction::Feature(need(j)?),
-            other => {
-                return Err(err(format!(
-                    "unknown null {other:?} (isotropy, mu, shape, feature)"
-                )));
-            }
-        };
+        let restriction = self.restriction(null, feature)?;
         let res = &self.inner;
         let t = py
             .detach(|| res.test(restriction, n_boot, seed))
+            .map_err(err)?;
+        Ok(PyTest { inner: t })
+    }
+    /// Bootstrap score test (restricted refits only: LM and M).
+    #[pyo3(signature = (null, feature=None, n_boot=500, seed=1))]
+    fn score_test(
+        &self,
+        py: Python<'_>,
+        null: &str,
+        feature: Option<&str>,
+        n_boot: usize,
+        seed: u64,
+    ) -> PyResult<PyTest> {
+        let restriction = self.restriction(null, feature)?;
+        let res = &self.inner;
+        let t = py
+            .detach(|| res.score_test(restriction, n_boot, seed))
             .map_err(err)?;
         Ok(PyTest { inner: t })
     }
@@ -548,6 +547,31 @@ impl PyResults {
 }
 
 /// Results of a bootstrap hypothesis test.
+impl PyResults {
+    fn restriction(&self, null: &str, feature: Option<&str>) -> PyResult<Restriction> {
+        let j = match feature {
+            Some(f) => Some(match f.parse::<usize>() {
+                Ok(i) => i,
+                Err(_) => self.inner.feature_index(f).map_err(err)?,
+            }),
+            None => None,
+        };
+        let need = |j: Option<usize>| j.ok_or_else(|| err(format!("null {null:?} needs feature=")));
+        Ok(match null.to_ascii_lowercase().replace('-', "_").as_str() {
+            "isotropy" | "isotropic" => Restriction::Isotropy,
+            "mu" | "mean" => Restriction::MuOfFeature(need(j)?),
+            "shape" | "gamma" => Restriction::GammaOfFeature(need(j)?),
+            "feature" | "covariate" | "both" => Restriction::Feature(need(j)?),
+            "constant_shape" | "shape_constant" => Restriction::ConstantShape,
+            other => {
+                return Err(err(format!(
+                    "unknown null {other:?} (isotropy, mu, shape, feature, constant_shape)"
+                )));
+            }
+        })
+    }
+}
+
 #[pyclass(name = "TestResult", module = "esag._esag")]
 struct PyTest {
     inner: HypothesisTestResult,
@@ -562,7 +586,7 @@ impl PyTest {
     fn null(&self) -> String {
         self.inner.null.clone()
     }
-    /// `{"RoC": …, "D": …, "M": …, "LR": …}`
+    /// `{"RoC": …, "D": …, "M": …, "LR": …, "LM": …}`
     #[getter]
     fn statistic<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
@@ -570,9 +594,11 @@ impl PyTest {
         d.set_item("D", self.inner.d_stat)?;
         d.set_item("M", self.inner.m_stat)?;
         d.set_item("LR", self.inner.lr)?;
+        d.set_item("LM", self.inner.lm)?;
         Ok(d)
     }
-    /// Bootstrap p-values (and `"LR_chi2"`, the asymptotic one).
+    /// Bootstrap p-values (and `"LR_chi2"`, `"LM_chi2"`, the asymptotic
+    /// ones; `NaN` where a score test has none).
     #[getter]
     fn pvalue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
@@ -581,6 +607,8 @@ impl PyTest {
         d.set_item("M", self.inner.p_m)?;
         d.set_item("LR", self.inner.p_lr)?;
         d.set_item("LR_chi2", self.inner.p_lr_chisq)?;
+        d.set_item("LM", self.inner.p_lm)?;
+        d.set_item("LM_chi2", self.inner.p_lm_chisq)?;
         Ok(d)
     }
     #[getter]
@@ -615,6 +643,7 @@ impl PyTest {
         d.set_item("D", self.inner.boot_d.clone())?;
         d.set_item("M", self.inner.boot_m.clone())?;
         d.set_item("LR", self.inner.boot_lr.clone())?;
+        d.set_item("LM", self.inner.boot_lm.clone())?;
         Ok(d)
     }
 }

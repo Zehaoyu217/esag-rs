@@ -16,7 +16,7 @@ pub use regions::{
     PredictionRegion, bootstrap_refits, confidence_region_sample, prediction_region,
     prediction_regions, region_coverage,
 };
-pub use tests::{HypothesisTestResult, Restriction, hypothesis_test};
+pub use tests::{HypothesisTestResult, Restriction, hypothesis_test, score_test};
 
 use crate::regression::{EsagRegressor, EsagRegressorFit};
 

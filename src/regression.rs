@@ -1804,6 +1804,64 @@ impl EsagRegressorFit {
         }
     }
 
+    /// Score (Lagrange-multiplier) statistic, at this restricted fit, of the
+    /// coefficients in `full` that it holds at zero, in the
+    /// empirical-information form: with `s_i` the score of observation `i`
+    /// over `full`, `g = Σ s_i` and `I = Σ s_i s_iᵀ`,
+    /// `LM = gᵀ I⁻¹ g − g_fᵀ I_ff⁻¹ g_f` (`f`: the coefficients this fit
+    /// frees; the second term removes what the optimizer left of their
+    /// gradient). It needs no fit of the full model. `NaN` if `I` is
+    /// singular.
+    pub(crate) fn score_statistic(
+        &self,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        full: &[(usize, usize)],
+    ) -> Result<f64> {
+        const CHUNK: usize = 256;
+        let mut data = RegressionData::new(x, y, self.fit_intercept)?;
+        data.lt = self.lt_frame();
+        let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+        let nf = full.len();
+        let mut info = DMatrix::<f64>::zeros(nf, nf);
+        let mut g = DVector::<f64>::zeros(nf);
+        let mut ge = vec![0.0; bd];
+        for start in (0..data.n).step_by(CHUNK) {
+            let end = (start + CHUNK).min(data.n);
+            let m = end - start;
+            let xt = nalgebra::DMatrixView::from_slice(&data.x[start * pt..end * pt], pt, m);
+            let eta = &self.coef * xt;
+            let mut s = DMatrix::<f64>::zeros(m, nf);
+            for r in 0..m {
+                let i = start + r;
+                kernel_grad(
+                    &data,
+                    &eta.as_slice()[r * bd..(r + 1) * bd],
+                    &data.y[i * d..(i + 1) * d],
+                    &mut ge,
+                );
+                for (a, &(k, j)) in full.iter().enumerate() {
+                    s[(r, a)] = ge[k] * data.x[i * pt + j];
+                }
+            }
+            info.gemm_tr(1.0, &s, &s, 1.0);
+            for a in 0..nf {
+                g[a] += s.column(a).sum();
+            }
+        }
+        let quad = |idx: &[usize]| -> Option<f64> {
+            let sub = DMatrix::from_fn(idx.len(), idx.len(), |a, c| info[(idx[a], idx[c])]);
+            let gs = DVector::from_iterator(idx.len(), idx.iter().map(|&a| g[a]));
+            Some(gs.dot(&sub.cholesky()?.solve(&gs)))
+        };
+        let all: Vec<usize> = (0..nf).collect();
+        let kept: Vec<usize> = (0..nf).filter(|&a| self.mask[full[a]]).collect();
+        Ok(match (quad(&all), quad(&kept)) {
+            (Some(q), Some(qf)) => q - qf,
+            _ => f64::NAN,
+        })
+    }
+
     /// The distribution for one linear predictor `eta` (in this model's
     /// shape parameterization; pass `self.lt_frame()` for log-tangent fits).
     pub fn distribution_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Result<Esag> {

@@ -35,6 +35,10 @@ pub enum Restriction {
     GammaOfFeature(usize),
     /// Both `mu` and `gamma` coefficients of feature `j` are zero.
     Feature(usize),
+    /// The shape coefficients of every feature are zero: the shape of
+    /// `V(x)` (its eigenvalues, and its axes relative to `μ(x)`) is the same
+    /// at every `x`, generally anisotropic.
+    ConstantShape,
     /// A custom free-parameter mask (`eta_len(d) × p_total`).
     Custom(DMatrix<bool>),
 }
@@ -55,6 +59,18 @@ pub struct HypothesisTestResult {
     pub p_d: f64,
     pub p_m: f64,
     pub p_lr: f64,
+    /// Score (Lagrange-multiplier) statistic at the restricted fit, in the
+    /// empirical-information form, and its bootstrap p-value. Like `M` it
+    /// needs no full-model fit; unlike `M` it has power against covariate
+    /// effects (`docs/MATH.md` §6). `NaN` for the gamma isotropy null:
+    /// gamma = 0 is a cone of the parameterization, without a score.
+    #[serde(default)]
+    pub lm: f64,
+    #[serde(default)]
+    pub p_lm: f64,
+    /// Asymptotic χ² p-value for `LM` with `df` restricted parameters.
+    #[serde(default)]
+    pub p_lm_chisq: f64,
     /// Asymptotic χ² p-value for `LR` with `df` restricted parameters
     /// (indicative only; for the isotropy null the parameter lies on a
     /// non-differentiable point of the parameterization).
@@ -77,10 +93,13 @@ pub struct HypothesisTestResult {
     pub boot_d: Vec<f64>,
     pub boot_m: Vec<f64>,
     pub boot_lr: Vec<f64>,
+    #[serde(default)]
+    pub boot_lm: Vec<f64>,
 }
 
-/// One bootstrap replicate: RoC, D, M, LR, and whether both refits converged.
-type Replicate = (f64, f64, f64, f64, bool);
+/// One bootstrap replicate: RoC, D, M, LR, LM, and whether both refits
+/// converged.
+type Replicate = (f64, f64, f64, f64, f64, bool);
 
 fn restriction_label(fit: &EsagRegressorFit, r: &Restriction) -> String {
     let name = |j: usize| {
@@ -95,6 +114,7 @@ fn restriction_label(fit: &EsagRegressorFit, r: &Restriction) -> String {
         Restriction::MuOfFeature(j) => format!("mu free of {}", name(*j)),
         Restriction::GammaOfFeature(j) => format!("shape free of {}", name(*j)),
         Restriction::Feature(j) => format!("no effect of {}", name(*j)),
+        Restriction::ConstantShape => "shape free of every covariate".into(),
         Restriction::Custom(_) => "custom restriction".into(),
     }
 }
@@ -129,17 +149,35 @@ impl HypothesisTestResult {
             "", "statistic", "P (bootstrap)", "P (asymptotic)"
         );
         let _ = writeln!(s, "{}", "-".repeat(WIDTH));
-        let _ = writeln!(s, "{:<10}{:>16.6}{:>18.3}", "RoC", self.roc, self.p_roc);
-        let _ = writeln!(s, "{:<10}{:>16.6}{:>18.3}", "D", self.d_stat, self.p_d);
-        let _ = writeln!(s, "{:<10}{:>16.4e}{:>18.3}", "M", self.m_stat, self.p_m);
+        // a score test has no bootstrap p-values for RoC, D and LR
+        let p = |v: f64| {
+            if v.is_nan() {
+                "—".to_string()
+            } else {
+                format!("{v:.3}")
+            }
+        };
+        let _ = writeln!(s, "{:<10}{:>16.6}{:>18}", "RoC", self.roc, p(self.p_roc));
+        let _ = writeln!(s, "{:<10}{:>16.6}{:>18}", "D", self.d_stat, p(self.p_d));
+        let _ = writeln!(s, "{:<10}{:>16.4e}{:>18}", "M", self.m_stat, p(self.p_m));
         let _ = writeln!(
             s,
-            "{:<10}{:>16.4}{:>18.3}{:>22}",
+            "{:<10}{:>16.4}{:>18}{:>22}",
             "LR",
             self.lr,
-            self.p_lr,
+            p(self.p_lr),
             format!("{:.3e} (chi2_{})", self.p_lr_chisq, self.df)
         );
+        if self.lm.is_finite() {
+            let _ = writeln!(
+                s,
+                "{:<10}{:>16.4}{:>18}{:>22}",
+                "LM",
+                self.lm,
+                p(self.p_lm),
+                format!("{:.3e} (chi2_{})", self.p_lm_chisq, self.df)
+            );
+        }
         let _ = writeln!(s, "{}", "=".repeat(WIDTH));
         s
     }
@@ -168,6 +206,15 @@ fn restriction_mask(fit: &EsagRegressorFit, r: &Restriction) -> Result<DMatrix<b
             let mut m = mu_restricted_mask(d, pt, c);
             for k in d..m.nrows() {
                 m[(k, c)] = false;
+            }
+            m
+        }
+        Restriction::ConstantShape => {
+            let mut m = DMatrix::from_element(fit.coef.nrows(), pt, true);
+            for k in d..m.nrows() {
+                for j in off..pt {
+                    m[(k, j)] = false;
+                }
             }
             m
         }
@@ -311,6 +358,39 @@ pub fn hypothesis_test(
     n_mc: usize,
     seed: u64,
 ) -> Result<HypothesisTestResult> {
+    run_test(fit_full, x, y, restriction, n_boot, n_mc, seed, true)
+}
+
+/// [`hypothesis_test`] with the statistics of the restricted fit only, the
+/// score statistic `LM` and `M`: each replicate refits the restricted model
+/// and nothing else. The full-model refits are most of the cost of a test
+/// (all of its local maxima for the gamma shape at d ≥ 5 with covariates),
+/// so this is 2–4× faster; `LM` has the size and power of `LR`
+/// (`docs/MATH.md` §6). RoC, D and LR are reported at the data, without
+/// bootstrap p-values (`NaN`).
+pub fn score_test(
+    fit_full: &EsagRegressorFit,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    restriction: Restriction,
+    n_boot: usize,
+    n_mc: usize,
+    seed: u64,
+) -> Result<HypothesisTestResult> {
+    run_test(fit_full, x, y, restriction, n_boot, n_mc, seed, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_test(
+    fit_full: &EsagRegressorFit,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    restriction: Restriction,
+    n_boot: usize,
+    n_mc: usize,
+    seed: u64,
+    full_refits: bool,
+) -> Result<HypothesisTestResult> {
     let d = fit_full.d;
     let mask0 = restriction_mask(fit_full, &restriction)?;
     let df = fit_full
@@ -360,7 +440,7 @@ pub fn hypothesis_test(
         .cov_params
         .as_ref()
         .and_then(crate::regression::precondition_from_cov);
-    cfg_a.precondition = if gamma_cone {
+    cfg_a.precondition = if gamma_cone || !full_refits {
         None
     } else {
         cfg_a.precondition_at(x, y, &fit0.coef, &fit_full.mask)
@@ -380,6 +460,13 @@ pub fn hypothesis_test(
     let (roc, d_stat) = roc_and_d(&eta0, &eta_a, d);
     let m_stat = moment_stat(&fit0, x, y, n_mc, seed, 0, true)?;
     let lr = -2.0 * (fit0.log_likelihood - fit_full.log_likelihood);
+    // the gamma cone at zero shape has no score
+    let score_defined = !gamma_cone;
+    let lm = if score_defined {
+        fit0.score_statistic(x, y, &fit_full.free)?
+    } else {
+        f64::NAN
+    };
 
     let boot: Vec<Option<Replicate>> = (0..n_boot)
         .into_par_iter()
@@ -387,47 +474,57 @@ pub fn hypothesis_test(
             let mut rng = crate::stream_rng(seed, crate::streams::TEST_BOOT, b as u64);
             let yb = fit0.sample_responses(x, &mut rng).ok()?;
             let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
-            // full-model start: the restricted refit with the extra coefficients
-            // at their null value (see `extra_start`)
-            let mut ba = f0.coef.clone();
-            for &(k, j) in &fit_full.free {
-                if !mask0[(k, j)] {
-                    ba[(k, j)] = extra_start(k);
-                }
-            }
-            // full refit: best of two starts (from the restricted refit, and
-            // from the original full MLE) so that LR^(b) is not deflated by a
-            // refit stuck below the maximum
-            let fa1 = cfg_a.fit_warm(x, &yb, &ba).ok();
-            // the second start guards against the local maxima that the gamma
-            // parameterization creates near its singular set (the cone at
-            // gamma = 0 above all); the log-tangent likelihood is smooth
-            // there, so it is only used if the first refit fails
-            let need_second =
-                fit_full.config.shape == Shape::Gamma || !fa1.as_ref().is_some_and(|f| f.converged);
-            let fa2 = if need_second {
-                cfg_a2.fit_warm(x, &yb, &fit_full.coef).ok()
-            } else {
-                None
-            };
-            let fa = match (fa1, fa2) {
-                (Some(a), Some(b)) => {
-                    if a.log_likelihood >= b.log_likelihood {
-                        a
-                    } else {
-                        b
+            let (r, dd, l, ok_a) = if full_refits {
+                // full-model start: the restricted refit with the extra coefficients
+                // at their null value (see `extra_start`)
+                let mut ba = f0.coef.clone();
+                for &(k, j) in &fit_full.free {
+                    if !mask0[(k, j)] {
+                        ba[(k, j)] = extra_start(k);
                     }
                 }
-                (Some(a), None) | (None, Some(a)) => a,
-                (None, None) => return None,
+                // full refit: best of two starts (from the restricted refit, and
+                // from the original full MLE) so that LR^(b) is not deflated by a
+                // refit stuck below the maximum
+                let fa1 = cfg_a.fit_warm(x, &yb, &ba).ok();
+                // the second start guards against the local maxima that the gamma
+                // parameterization creates near its singular set (the cone at
+                // gamma = 0 above all); the log-tangent likelihood is smooth
+                // there, so it is only used if the first refit fails
+                let need_second = fit_full.config.shape == Shape::Gamma
+                    || !fa1.as_ref().is_some_and(|f| f.converged);
+                let fa2 = if need_second {
+                    cfg_a2.fit_warm(x, &yb, &fit_full.coef).ok()
+                } else {
+                    None
+                };
+                let fa = match (fa1, fa2) {
+                    (Some(a), Some(b)) => {
+                        if a.log_likelihood >= b.log_likelihood {
+                            a
+                        } else {
+                            b
+                        }
+                    }
+                    (Some(a), None) | (None, Some(a)) => a,
+                    (None, None) => return None,
+                };
+                let e0 = f0.linear_predictor(x).ok()?;
+                let ea = fa.linear_predictor(x).ok()?;
+                let (r, dd) = roc_and_d(&e0, &ea, d);
+                let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
+                (r, dd, l, fa.converged)
+            } else {
+                (f64::NAN, f64::NAN, f64::NAN, true)
             };
-            let e0 = f0.linear_predictor(x).ok()?;
-            let ea = fa.linear_predictor(x).ok()?;
-            let (r, dd) = roc_and_d(&e0, &ea, d);
             // sequential: replicates already run in parallel
             let m = moment_stat(&f0, x, &yb, n_mc, seed, 1 + b as u64, n_mc > 0).ok()?;
-            let l = -2.0 * (f0.log_likelihood - fa.log_likelihood);
-            Some((r, dd, m, l, f0.converged && fa.converged))
+            let s = if score_defined {
+                f0.score_statistic(x, &yb, &fit_full.free).ok()?
+            } else {
+                f64::NAN
+            };
+            Some((r, dd, m, l, s, f0.converged && ok_a))
         })
         .collect();
 
@@ -435,22 +532,39 @@ pub fn hypothesis_test(
     let mut bd = vec![];
     let mut bm = vec![];
     let mut bl = vec![];
+    let mut bs = vec![];
     let mut n_failed = 0;
     let mut n_unconverged = 0;
     for r in boot {
         match r {
-            Some((a, b, c, e, ok)) => {
+            Some((a, b, c, e, g, ok)) => {
                 n_unconverged += usize::from(!ok);
                 br.push(a);
                 bd.push(b);
                 bm.push(c);
                 bl.push(e);
+                bs.push(g);
             }
             None => n_failed += 1,
         }
     }
     let nb = br.len().max(1) as f64;
-    let pv = |obs: f64, v: &[f64]| v.iter().filter(|&&s| obs < s).count() as f64 / nb;
+    let pv = |obs: f64, v: &[f64]| {
+        if full_refits {
+            v.iter().filter(|&&s| obs < s).count() as f64 / nb
+        } else {
+            f64::NAN
+        }
+    };
+    // replicates whose score information was singular are left out
+    let p_lm = {
+        let ok: Vec<f64> = bs.iter().copied().filter(|v| v.is_finite()).collect();
+        if lm.is_finite() && !ok.is_empty() {
+            ok.iter().filter(|&&s| lm < s).count() as f64 / ok.len() as f64
+        } else {
+            f64::NAN
+        }
+    };
     let null = restriction_label(fit_full, &restriction);
     Ok(HypothesisTestResult {
         null,
@@ -462,6 +576,9 @@ pub fn hypothesis_test(
         p_d: pv(d_stat, &bd),
         p_m: pv(m_stat, &bm),
         p_lr: pv(lr, &bl),
+        lm,
+        p_lm,
+        p_lm_chisq: chisq_sf(lm, df as f64),
         p_lr_chisq: chisq_sf(lr.max(0.0), df as f64),
         df,
         loglik_restricted: fit0.log_likelihood,
@@ -470,10 +587,11 @@ pub fn hypothesis_test(
         n_boot: br.len(),
         n_failed,
         n_unconverged,
-        boot_roc: br,
-        boot_d: bd,
+        boot_roc: if full_refits { br } else { vec![] },
+        boot_d: if full_refits { bd } else { vec![] },
         boot_m: bm,
-        boot_lr: bl,
+        boot_lr: if full_refits { bl } else { vec![] },
+        boot_lm: bs,
     })
 }
 
@@ -560,6 +678,53 @@ mod timing {
             t_m / r * 1e3
         );
     }
+
+    /// Cost of the score statistic against the rest of a replicate, n = 2000,
+    /// 5 covariates. `cargo test --release --lib score_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn score_cost() {
+        use crate::regression::Shape;
+        for d in [3, 5, 8] {
+            let (x, y) = super::gamma_refits::sim(d, 5, 2000, 11);
+            for shape in [Shape::Gamma, Shape::LogTangent] {
+                let fit = EsagRegressor::new().with_shape(shape).fit(&x, &y).unwrap();
+                let mask0 = restriction_mask(&fit, &Restriction::GammaOfFeature(0)).unwrap();
+                let mut b0 = fit.coef.clone();
+                for (v, &f) in b0.iter_mut().zip(mask0.iter()) {
+                    if !f {
+                        *v = 0.0;
+                    }
+                }
+                let mut cfg0 = refit_config(&fit);
+                cfg0.mask = Some(mask0);
+                let fit0 = cfg0.fit_warm(&x, &y, &b0).unwrap();
+                let reps = 10;
+                let (mut t_lm, mut t_m, mut t_0) = (0.0, 0.0, 0.0);
+                for r in 0..reps {
+                    let mut rng = crate::stream_rng(1, 5, r);
+                    let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+                    let t = Instant::now();
+                    let f0 = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+                    t_0 += t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    let _ = f0.score_statistic(&x, &yb, &fit.free).unwrap();
+                    t_lm += t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    let _ = moment_stat(&f0, &x, &yb, 0, 1, 1, false).unwrap();
+                    t_m += t.elapsed().as_secs_f64();
+                }
+                let r = reps as f64;
+                println!(
+                    "d={d} {shape:?} ({} coefficients): LM {:.2} ms, M {:.2} ms, restricted refit {:.2} ms",
+                    fit.free.len(),
+                    t_lm / r * 1e3,
+                    t_m / r * 1e3,
+                    t_0 / r * 1e3
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -577,7 +742,7 @@ mod gamma_refits {
     use std::time::Instant;
 
     /// `examples/big_fit.rs::sim` (gamma truth).
-    fn sim(d: usize, p: usize, n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f64>) {
+    pub(super) fn sim(d: usize, p: usize, n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f64>) {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
         let bd = crate::dims::eta_len(d);
         let b = DMatrix::from_fn(bd, p + 1, |k, j| {
@@ -663,6 +828,61 @@ mod gamma_refits {
             }
         }
         (f_cur, 40)
+    }
+
+    /// Do bootstrap restricted refits (one warm start, at the bootstrap
+    /// truth) reach the restricted maximum? Against a second fit from
+    /// scratch (`Init::Auto`), on data from the anisotropic truth.
+    /// `cargo test --release --lib restricted_refit_maxima -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn restricted_refit_maxima() {
+        use rayon::prelude::*;
+        let (d, p, n) = (5, 5, 2000);
+        let (x, y) = sim(d, p, n, 11);
+        let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+        for r in [
+            Restriction::MuOfFeature(0),
+            Restriction::GammaOfFeature(0),
+            Restriction::Feature(4),
+        ] {
+            let mask0 = restriction_mask(&fit, &r).unwrap();
+            let mut b0 = fit.coef.clone();
+            for (v, &f) in b0.iter_mut().zip(mask0.iter()) {
+                if !f {
+                    *v = 0.0;
+                }
+            }
+            let mut cfg0 = refit_config(&fit);
+            cfg0.mask = Some(mask0.clone());
+            cfg0.precondition = None;
+            let mut once = cfg0.clone();
+            once.compute_hessian = true;
+            let fit0 = once.fit_warm(&x, &y, &b0).unwrap();
+            cfg0.precondition = fit0
+                .cov_params
+                .as_ref()
+                .and_then(crate::regression::precondition_from_cov);
+            let mut auto = cfg0.clone();
+            auto.init = crate::regression::Init::Auto;
+            auto.local_precondition = false;
+            let gaps: Vec<f64> = (0..40u64)
+                .into_par_iter()
+                .map(|b| {
+                    let mut rng = crate::stream_rng(7, crate::streams::TEST_BOOT, b);
+                    let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+                    let warm = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+                    let fresh = auto.fit(&x, &yb).unwrap();
+                    fresh.log_likelihood - warm.log_likelihood
+                })
+                .collect();
+            let worse = gaps.iter().filter(|&&g| g > 0.01).count();
+            let better = gaps.iter().filter(|&&g| g < -0.01).count();
+            let max = gaps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            eprintln!(
+                "{r:?}: warm restricted refit below the fresh fit in {worse}/40 (max gap {max:.3}), above it in {better}/40"
+            );
+        }
     }
 
     /// `cargo test --release --lib gamma_refits -- --ignored --nocapture`

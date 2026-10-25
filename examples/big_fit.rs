@@ -24,10 +24,15 @@ pub fn sim_shape(
     seed: u64,
     shape: Shape,
 ) -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>) {
-    let lt = esag::logtangent::LtFrame::standard(d);
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let b = truth(d, p);
+    let (x, y) = sim_from(&b, n, seed, shape);
+    (x, y, b)
+}
+
+/// The true coefficients of [`sim_shape`] (`eta_len(d) × (p + 1)`).
+pub fn truth(d: usize, p: usize) -> DMatrix<f64> {
     let bd = esag::dims::eta_len(d);
-    let b = DMatrix::from_fn(bd, p + 1, |k, j| {
+    DMatrix::from_fn(bd, p + 1, |k, j| {
         let s = (k * 7 + j * 3) as f64;
         if j == 0 {
             if k < d {
@@ -40,7 +45,22 @@ pub fn sim_shape(
         } else {
             0.2 * (s * 1.1).sin()
         }
-    });
+    })
+}
+
+/// `n` responses from the regression with coefficients `b`
+/// (`eta_len(d) × (p + 1)`) and standard-normal covariates.
+pub fn sim_from(
+    b: &DMatrix<f64>,
+    n: usize,
+    seed: u64,
+    shape: Shape,
+) -> (DMatrix<f64>, DMatrix<f64>) {
+    let p = b.ncols() - 1;
+    let bd = b.nrows();
+    let d = esag::dims::dim_from_eta_len(bd).unwrap();
+    let lt = esag::logtangent::LtFrame::standard(d);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let x = DMatrix::from_fn(n, p, |_, _| StandardNormal.sample(&mut rng));
     let mut y = DMatrix::zeros(n, d);
     let mut buf = vec![0.0; d];
@@ -61,7 +81,7 @@ pub fn sim_shape(
             y[(i, k)] = buf[k];
         }
     }
-    (x, y, b)
+    (x, y)
 }
 
 fn main() {

@@ -70,7 +70,7 @@ TARGETS = ("slopes", "mean", "shape_slopes", "shape")
 #: ``fit_regularized(groups=...)``: how the target is grouped.
 GROUPINGS = ("covariate", "covariate_part", "parameter", "all", "gamma")
 #: ``ESAGResults.test(null=...)`` choices.
-NULLS = ("isotropy", "mu", "shape", "feature")
+NULLS = ("isotropy", "mu", "shape", "feature", "constant_shape")
 
 
 class Summary:
@@ -452,14 +452,17 @@ class ESAGResults(_CoefTable):
     # inference ---------------------------------------------------------------
     def test(self, null: str = "isotropy", exog: Union[None, str, int] = None,
              n_boot: int = 500, seed: int = 1) -> "TestResults":
-        """Parametric-bootstrap test of a restriction (RoC, D, M, LR together).
+        """Parametric-bootstrap test of a restriction (RoC, D, M, LR and the
+        score statistic LM together).
 
         ``null`` is one of :data:`NULLS`:
 
         * ``"isotropy"``: the shape is zero (isotropic projected normal);
         * ``"mu"``: the mean direction does not depend on ``exog``;
         * ``"shape"``: the shape does not depend on ``exog``;
-        * ``"feature"``: ``exog`` has no effect at all.
+        * ``"feature"``: ``exog`` has no effect at all;
+        * ``"constant_shape"``: the shape does not depend on any covariate
+          (V(x) has the same, generally anisotropic, eigenvalues at every x).
 
         ``exog`` names a covariate (or its 0-based index among the
         covariates).
@@ -467,6 +470,20 @@ class ESAGResults(_CoefTable):
         if isinstance(exog, (int, np.integer)):
             exog = str(int(exog))
         return TestResults(self._native.test(null=null, feature=exog, n_boot=n_boot, seed=seed))
+
+    def score_test(self, null: str, exog: Union[None, str, int] = None,
+                   n_boot: int = 500, seed: int = 1) -> "TestResults":
+        """:meth:`test` from the restricted fit alone: the score statistic LM
+        and M, with bootstrap p-values from restricted refits only.
+
+        The full-model refits are most of the cost of :meth:`test`, so this is
+        2-4x faster, and LM has the size and power of LR. RoC, D and LR are
+        reported at the data, without bootstrap p-values (NaN).
+        """
+        if isinstance(exog, (int, np.integer)):
+            exog = str(int(exog))
+        return TestResults(self._native.score_test(null=null, feature=exog, n_boot=n_boot,
+                                                   seed=seed))
 
     def gof(self, n_boot: int = 200, seed: int = 1, one_sample: bool = False) -> dict:
         """Bootstrap goodness-of-fit test of the ESAG model (Algorithm 1)."""
@@ -575,7 +592,7 @@ class CovarianceEstimate:
 
 
 class TestResults:
-    """Results of :meth:`ESAGResults.test`."""
+    """Results of :meth:`ESAGResults.test` and :meth:`ESAGResults.score_test`."""
 
     __test__ = False  # not a pytest class
 
@@ -584,9 +601,9 @@ class TestResults:
 
     null = property(lambda self: self._native.null)
     statistic = property(lambda self: self._native.statistic,
-                         doc="Observed statistics: RoC, D, M, LR.")
+                         doc="Observed statistics: RoC, D, M, LR, LM.")
     pvalue = property(lambda self: self._native.pvalue,
-                      doc="Bootstrap p-values, plus LR_chi2 (asymptotic).")
+                      doc="Bootstrap p-values, plus LR_chi2 and LM_chi2 (asymptotic).")
     df = property(lambda self: self._native.df)
     n_boot = property(lambda self: self._native.n_boot)
     n_failed = property(lambda self: self._native.n_failed)
@@ -599,7 +616,7 @@ class TestResults:
     @property
     def table(self):
         stat, p = self.statistic, self.pvalue
-        names = ["RoC", "D", "M", "LR"]
+        names = ["RoC", "D", "M", "LR", "LM"]
         if _pd is None:
             return {k: (stat[k], p[k]) for k in names}
         return _pd.DataFrame({"statistic": [stat[k] for k in names],

@@ -20,7 +20,7 @@
 use crate::error::{EsagError, Result};
 use crate::inference::{
     CovarianceEstimate, GofMethod, GofResult, HypothesisTestResult, PredictionRegion, Restriction,
-    bootstrap_gof, covariance_intervals, hypothesis_test, prediction_region,
+    bootstrap_gof, covariance_intervals, hypothesis_test, prediction_region, score_test,
 };
 use crate::penalized::{PenalizedEsag, PenalizedPath};
 use crate::regression::{EsagRegressor, EsagRegressorFit, Shape};
@@ -164,6 +164,24 @@ impl EsagResults {
         seed: u64,
     ) -> Result<HypothesisTestResult> {
         hypothesis_test(
+            &self.fit,
+            &self.model.exog,
+            &self.model.endog,
+            restriction,
+            n_boot,
+            0,
+            seed,
+        )
+    }
+    /// The same test from the restricted fit alone (score statistic `LM` and
+    /// `M`; see [`crate::inference::score_test`]): 2–4× faster.
+    pub fn score_test(
+        &self,
+        restriction: Restriction,
+        n_boot: usize,
+        seed: u64,
+    ) -> Result<HypothesisTestResult> {
+        score_test(
             &self.fit,
             &self.model.exog,
             &self.model.endog,

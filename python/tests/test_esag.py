@@ -121,13 +121,31 @@ def test_bootstrap_tests(res):
     assert iso.pvalue["LR"] < 0.01 and iso.pvalue["RoC"] < 0.01
     assert min(noise.pvalue[k] for k in ["RoC", "D", "LR"]) > 0.01
     assert noise.df == 5 and noise.n_boot == 200 and noise.n_failed == 0
-    assert set(noise.statistic) == {"RoC", "D", "M", "LR"}
+    assert set(noise.statistic) == {"RoC", "D", "M", "LR", "LM"}
     assert len(noise.bootstrap["LR"]) == 200
-    assert list(noise.table.index) == ["RoC", "D", "M", "LR"]
+    assert list(noise.table.index) == ["RoC", "D", "M", "LR", "LM"]
+    assert noise.pvalue["LM"] > 0.01 and np.isnan(iso.pvalue["LM"])  # gamma cone
     s = str(noise.summary())
     assert "ESAG Bootstrap Hypothesis Test" in s and "no effect of noise" in s
     assert res.test("mu", 2, n_boot=50).null == "mu free of noise"
     assert elapsed < 30
+
+
+def test_score_test(res):
+    full = res.test("feature", "noise", n_boot=100)
+    fast = res.score_test("feature", "noise", n_boot=100)
+    # the same restricted refits: identical LM and M replicates
+    np.testing.assert_array_equal(fast.bootstrap["LM"], full.bootstrap["LM"])
+    np.testing.assert_array_equal(fast.bootstrap["M"], full.bootstrap["M"])
+    assert fast.pvalue["LM"] == full.pvalue["LM"] > 0.01
+    assert np.isnan(fast.pvalue["LR"]) and len(fast.bootstrap["LR"]) == 0
+    assert fast.statistic["LR"] == full.statistic["LR"]
+    assert abs(fast.statistic["LM"] - fast.statistic["LR"]) < 0.5 + 0.1 * fast.statistic["LR"]
+    assert "—" in str(fast.summary())
+    const = res.score_test("constant_shape", n_boot=50)
+    assert const.null == "shape free of every covariate"
+    assert const.df == 2 * (len(res.model.exog_names) - 1)
+    assert 0.0 <= const.pvalue["LM"] <= 1.0
 
 
 @pytest.mark.parametrize("penalty,kw", [
