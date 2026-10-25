@@ -44,5 +44,6 @@ pub(crate) fn refit_config(fit: &EsagRegressorFit) -> EsagRegressor {
         .cov_params
         .as_ref()
         .and_then(crate::regression::precondition_from_cov);
+    cfg.local_precondition = true;
     cfg
 }

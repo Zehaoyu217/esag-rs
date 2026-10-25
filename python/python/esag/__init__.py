@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Sequence, Union
 
+import warnings
+
 import numpy as np
 
 from . import _esag
@@ -39,6 +41,7 @@ __all__ = [
     "RegularizedResults",
     "TestResults",
     "CovarianceEstimate",
+    "ShapeWarning",
     "Summary",
     "Distribution",
     "PENALTIES",
@@ -47,6 +50,10 @@ __all__ = [
     "NULLS",
     "__version__",
 ]
+
+class ShapeWarning(UserWarning):
+    """``shape="auto"`` chose the log-tangent model instead of gamma."""
+
 
 #: ``fit_regularized(penalty=...)`` choices.
 PENALTIES = (
@@ -148,17 +155,20 @@ class ESAG:
         exponential of a traceless symmetric matrix in the tangent space;
         it is smooth everywhere, so big regressions (d >= 5 with covariates)
         fit quickly and reliably. ``"auto"`` uses gamma when d <= 4 or there
-        are no covariates, and log-tangent otherwise. With covariates the two
-        are different (non-nested) regression models for the shape, as the
-        shape coefficients enter linearly in different coordinates; the mean
-        model is the same. Compare them by AIC/BIC.
+        are no covariates, and log-tangent otherwise, with a
+        :class:`ShapeWarning` when it picks log-tangent. With covariates the
+        two are different (non-nested) regression models for the shape, as
+        the shape coefficients enter linearly in different coordinates; the
+        mean model is the same. Compare them by AIC/BIC.
     missing : {"none", "drop"}
         ``"drop"`` removes rows with NaN in endog or exog; ``"none"`` raises.
     lt_reference : array-like of length d, optional
         Reference direction of the log-tangent frame (default: the data's
-        mean direction, stored with the fit). The log-tangent regression
-        model depends on it, since s linear in x in one frame is not linear
-        in another. Set it to fit a model defined in a given frame (e.g. a
+        mean direction, stored with the fit as ``results.lt_reference`` and
+        printed in the summary). The log-tangent regression model depends on
+        it, since s linear in x in one frame is not linear in another. Pass
+        ``lt_reference=results.lt_reference`` to fit the same model to other
+        data, or set it to fit a model defined in a given frame (e.g. a
         simulation truth); it has no effect for ``shape="gamma"``.
     """
 
@@ -189,6 +199,15 @@ class ESAG:
         d = y.shape[1]
         if shape == "auto":
             shape = "gamma" if d <= 4 or x.shape[1] == 0 else "log-tangent"
+            if shape == "log-tangent":
+                warnings.warn(
+                    "shape='auto' chose the log-tangent model (d >= 5 with covariates), "
+                    "a different shape regression from the gamma model of Yu & Huang; "
+                    "pass shape='gamma' for that model, or shape='log-tangent' to "
+                    "silence this warning",
+                    ShapeWarning,
+                    stacklevel=2,
+                )
         self.shape = shape
         self.endog = y
         self.exog = x
@@ -395,6 +414,11 @@ class ESAGResults(_CoefTable):
     df_resid = property(lambda self: self._native.df_resid)
     converged = property(lambda self: self._native.converged)
     n_iter = property(lambda self: self._native.n_iter)
+    lt_reference = property(
+        lambda self: None if self._native.lt_reference is None
+        else np.asarray(self._native.lt_reference),
+        doc="Reference direction m of the log-tangent frame (None for gamma). "
+            "ESAG(..., lt_reference=m) fits the same model to other data.")
 
     def summary(self, alpha: float = 0.05) -> Summary:
         return Summary(self._native.summary(alpha))

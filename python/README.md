@@ -101,9 +101,12 @@ reported on the original scale.
 
 `shape="auto"` (default) fits the papers' γ parameterization when d ≤ 4 or
 there are no covariates, and the smooth log-tangent parameterization
-otherwise. The γ map has a singular set that makes big γ regressions slow
-and unreliable. With covariates the two are different regression models
-for the shape (the mean model is the same); compare them by AIC/BIC.
+otherwise, and raises an `esag.ShapeWarning` when it makes that switch.
+The γ map has a singular set that makes big γ regressions slow and gives
+their likelihood local maxima (`docs/MATH.md` §2, §6). With covariates the
+two are different regression models for the shape (the mean model is the
+same); compare them by AIC/BIC. Pass `shape="gamma"` or
+`shape="log-tangent"` to choose explicitly.
 
 ### The covariance V(x)
 
@@ -122,8 +125,10 @@ simulations (n = 2000, 5 covariates, d = 3 and 5) they cover 93–98% at level
 95%; V-hat converges at the 1/√n rate (`docs/MATH.md` §5b).
 
 With `shape="log-tangent"`, the model depends on the frame's reference
-direction (`lt_reference=`, default: the data's mean direction); see
-`docs/MATH.md` §7.
+direction m (`lt_reference=`, default: the data's mean direction). The
+summary prints it, and `res.lt_reference` returns it, so the same model can
+be fitted to other data with `ESAG(Y2, X2, shape="log-tangent",
+lt_reference=res.lt_reference)`; see `docs/MATH.md` §7.
 
 ### Distributions
 

@@ -228,8 +228,8 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 171 tests, plus 12 slow studies,
-diagnostics and benchmarks marked `#[ignore]`. The Python package's 20
+All `cargo test --release` suites pass: 174 tests, plus 13 slow studies,
+diagnostics and benchmarks marked `#[ignore]`. The Python package's 22
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced
@@ -341,7 +341,9 @@ refitted and reduced to four numbers one at a time.
   warm-started at the original fit and whitened with its inverse
   information, takes a Newton-sized first step, and stops on a statistical
   rule: coefficients within 0.0014 SE, log-likelihood within 1e−6. A refit
-  takes 6–10 likelihood passes at n = 2000.
+  takes 6–10 likelihood passes at n = 2000. Where γ has cliffs (d ≥ 5 with
+  covariates) the metric is the empirical information at the refit's
+  start, recomputed every 50 iterations.
 * **A smooth shape model where γ is singular.** The log-tangent shape
   removes the discontinuities of γ ↦ V that make big γ regressions take
   hundreds of iterations or fail.
@@ -372,14 +374,18 @@ x5):
 
 | d | log-tangent, 1 core | log-tangent, 15 threads | γ, 1 core | γ, 15 threads |
 |---|---|---|---|---|
-| 3 | 1.6–1.8 s | 0.16–0.17 s | 2.5–6.2 s | 0.26–0.62 s |
-| 5 | 5.5–8.4 s | 0.47–0.70 s | 27–79 s; isotropy 370 s* | 3.1–8.4 s† |
-| 8 | 24–32 s | 2.4–3.0 s | 198–711 s | 21–74 s† |
+| 3 | 1.7–1.9 s | 0.16–0.17 s | 2.6–6.6 s | 0.26–0.62 s |
+| 5 | 5.8–8.8 s | 0.47–0.70 s | 28–49 s; isotropy 191 s* | 2.4–4.3 s; isotropy 16 s* |
+| 8 | 24–32 s | 2.4–3.0 s | 130–360 s; isotropy 540 s*† | 12–33 s; isotropy 51 s* |
 
 \* In γ, the isotropy null of a d ≥ 5 regression lies on the singular set
-(§2 of `docs/MATH.md`), so full refits of null replicates do not converge;
-the log-tangent shape has no such problem. † Measured before the latest
-refit and quadrature changes. The Python session in
+(§2 of `docs/MATH.md`), so full refits of null replicates do not converge
+and the bootstrap LR is unreliable (§6); the log-tangent shape has no such
+problem. † B = 50, scaled by 10. γ at d ≥ 5 is slower because its
+likelihood is rough there, not because its kernel is: refits need 50–200
+evaluations and have local maxima. Refits now use the empirical information
+as their metric, which made these tests 1.4–2.5× faster than the previous
+version (d = 5, one core: 28–82 s, isotropy 387 s). The Python session in
 `python/examples/demo.py` (d = 3, γ, five nulls, five penalties) runs each
 test in 1.1–1.8 s and each penalty path in 0.6–1.3 s.
 

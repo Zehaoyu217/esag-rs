@@ -337,6 +337,11 @@ impl PyResults {
     fn n_iter(&self) -> usize {
         self.inner.n_iter
     }
+    /// Reference direction of the log-tangent frame (`None` for gamma).
+    #[getter]
+    fn lt_reference(&self) -> Option<Vec<f64>> {
+        self.inner.lt_frame().map(|f| f.reference().to_vec())
+    }
     #[pyo3(signature = (alpha=0.05))]
     fn summary(&self, alpha: f64) -> String {
         self.inner.summary_alpha(alpha)

@@ -470,7 +470,11 @@ impl PenalizedEsag {
             Selection::Bic => points.iter().map(|p| p.bic).collect(),
             Selection::Aic => points.iter().map(|p| p.aic).collect(),
             Selection::CrossValidation { folds, seed, score } => {
-                let v = self.cross_validate(x, y, &prep.lambdas, folds, seed, score)?;
+                // every fold fits the model of the full data: the same
+                // log-tangent frame, not one from its own training rows
+                let mut same_frame = self.clone();
+                same_frame.lt_reference = prep.config.lt_reference.clone();
+                let v = same_frame.cross_validate(x, y, &prep.lambdas, folds, seed, score)?;
                 for (p, &c) in points.iter_mut().zip(&v) {
                     p.cv = Some(c);
                 }

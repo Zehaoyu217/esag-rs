@@ -332,6 +332,9 @@ pub fn hypothesis_test(
     cfg0.mask = Some(mask0.clone());
     cfg0.precondition = None;
     let mut cfg_a = refit_config(fit_full);
+    // the second full refit starts at the original full MLE, where that
+    // fit's own information is the metric
+    let cfg_a2 = refit_config(fit_full);
     // Full refits on null data start at the restricted refit (extra
     // coefficients at 0) and end near it, not near the original full
     // optimum: precondition them with the full model's observed information
@@ -347,6 +350,7 @@ pub fn hypothesis_test(
         let warm = once.fit_warm(x, y, &b0)?;
         let mut auto = once.clone();
         auto.init = crate::regression::Init::Auto;
+        auto.local_precondition = false;
         match auto.fit(x, y) {
             Ok(a) if a.log_likelihood > warm.log_likelihood => a,
             _ => warm,
@@ -402,7 +406,7 @@ pub fn hypothesis_test(
             let need_second =
                 fit_full.config.shape == Shape::Gamma || !fa1.as_ref().is_some_and(|f| f.converged);
             let fa2 = if need_second {
-                cfg_a.fit_warm(x, &yb, &fit_full.coef).ok()
+                cfg_a2.fit_warm(x, &yb, &fit_full.coef).ok()
             } else {
                 None
             };
@@ -555,5 +559,203 @@ mod timing {
             ita / reps as usize,
             t_m / r * 1e3
         );
+    }
+}
+
+#[cfg(test)]
+mod gamma_refits {
+    //! Where the γ likelihood has cliffs (d = 5, 5 covariates), how refit
+    //! metrics compare on the full refits of the `x5` test (MATH.md §6).
+    use super::*;
+    use crate::distribution::Esag;
+    use crate::regression::{
+        EsagRegressor, free_params, joint_loglik_and_grad, joint_loglik_grad_hess,
+    };
+    use nalgebra::DVector;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, StandardNormal};
+    use std::time::Instant;
+
+    /// `examples/big_fit.rs::sim` (gamma truth).
+    fn sim(d: usize, p: usize, n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f64>) {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let bd = crate::dims::eta_len(d);
+        let b = DMatrix::from_fn(bd, p + 1, |k, j| {
+            let s = (k * 7 + j * 3) as f64;
+            match (j, k < d) {
+                (0, true) => 1.6 * (1.0 + 0.8 * (s * 0.9).sin()),
+                (0, false) => 0.8 * (s * 1.3).sin(),
+                (_, true) => 0.35 * (s * 0.7).cos(),
+                (_, false) => 0.2 * (s * 1.1).sin(),
+            }
+        });
+        let x = DMatrix::from_fn(n, p, |_, _| StandardNormal.sample(&mut rng));
+        let mut y = DMatrix::zeros(n, d);
+        let mut buf = vec![0.0; d];
+        for i in 0..n {
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+                .collect();
+            let dist = Esag::from_eta(&eta).unwrap();
+            dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+            for k in 0..d {
+                y[(i, k)] = buf[k];
+            }
+        }
+        (x, y)
+    }
+
+    /// Damped Newton with the exact Hessian at every iterate; returns the
+    /// log-likelihood and the number of Hessians.
+    fn newton(
+        cfg: &EsagRegressor,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        b0: &DMatrix<f64>,
+        mask: &DMatrix<bool>,
+    ) -> (f64, usize) {
+        let data = cfg.data(x, y).unwrap();
+        let free = free_params(mask);
+        let (bd, full, nf) = (data.b_dim, data.b_dim * data.p_total, free.len());
+        let mut coef = b0.clone();
+        let mut f_cur = f64::NEG_INFINITY;
+        for nh in 1..=40 {
+            let (f, g, h) = joint_loglik_grad_hess(&data, &coef, false);
+            f_cur = f;
+            let gv = DVector::from_iterator(nf, free.iter().map(|&(k, j)| g[j * bd + k]));
+            let info = DMatrix::from_fn(nf, nf, |a, c| {
+                let ((ka, ja), (kc, jc)) = (free[a], free[c]);
+                -h[(ja * bd + ka) * full + jc * bd + kc]
+            });
+            let scale = info.diagonal().amax().max(1.0);
+            let mut accepted = false;
+            let mut lam = 0.0;
+            'damp: for _ in 0..12 {
+                let mut m = info.clone();
+                for a in 0..nf {
+                    m[(a, a)] += lam * scale;
+                }
+                if let Some(ch) = m.cholesky() {
+                    let step = ch.solve(&gv);
+                    let dec = gv.dot(&step);
+                    if 0.5 * dec < 1e-6 {
+                        return (f, nh);
+                    }
+                    let mut t = 1.0;
+                    for _ in 0..8 {
+                        let mut cand = coef.clone();
+                        for (a, &(k, j)) in free.iter().enumerate() {
+                            cand[(k, j)] += t * step[a];
+                        }
+                        let (f2, _) = joint_loglik_and_grad(&data, &cand, false);
+                        if f2.is_finite() && f2 >= f + 1e-4 * t * dec {
+                            coef = cand;
+                            accepted = true;
+                            break 'damp;
+                        }
+                        t *= 0.5;
+                    }
+                }
+                lam = if lam == 0.0 { 1e-6 } else { lam * 10.0 };
+            }
+            if !accepted {
+                return (f_cur, nh);
+            }
+        }
+        (f_cur, 40)
+    }
+
+    /// `cargo test --release --lib gamma_refits -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn refit_metrics() {
+        let (d, p, n) = (5, 5, 2000);
+        let (x, y) = sim(d, p, n, 11);
+        let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+        let mask0 = restriction_mask(&fit, &Restriction::Feature(4)).unwrap();
+        let mut b0 = fit.coef.clone();
+        for (v, &f) in b0.iter_mut().zip(mask0.iter()) {
+            if !f {
+                *v = 0.0;
+            }
+        }
+        let mut cfg0 = refit_config(&fit);
+        cfg0.mask = Some(mask0.clone());
+        cfg0.precondition = None;
+        let mut once = cfg0.clone();
+        once.compute_hessian = true;
+        let fit0 = once.fit_warm(&x, &y, &b0).unwrap();
+        cfg0.precondition = fit0
+            .cov_params
+            .as_ref()
+            .and_then(crate::regression::precondition_from_cov);
+        // the full model's information at the restricted fit (not positive
+        // definite here: `precondition_at` returns None)
+        let mut plain = refit_config(&fit);
+        plain.precondition = plain.precondition_at(&x, &y, &fit0.coef, &fit.mask);
+        plain.local_precondition = false;
+        let mut empirical = plain.clone();
+        empirical.local_precondition = true;
+        let reps = 30;
+        let mut rows: Vec<(&str, f64, usize, Vec<f64>)> =
+            ["no metric", "empirical", "local Hessian", "Newton"]
+                .iter()
+                .map(|&s| (s, 0.0, 0, vec![]))
+                .collect();
+        for r in 0..reps {
+            let mut rng = crate::stream_rng(7, crate::streams::TEST_BOOT, r);
+            let yb = fit0.sample_responses(&x, &mut rng).unwrap();
+            let f0 = cfg0.fit_warm(&x, &yb, &fit0.coef).unwrap();
+            let mut ba = f0.coef.clone();
+            for &(k, j) in &fit.free {
+                if !mask0[(k, j)] {
+                    ba[(k, j)] = if k < d { 0.0 } else { 1e-3 };
+                }
+            }
+            let mut ll = [0.0; 4];
+            for (v, row) in rows.iter_mut().enumerate() {
+                let t = Instant::now();
+                let (l, cost) = match v {
+                    0 => {
+                        let a = plain.fit_warm(&x, &yb, &ba).unwrap();
+                        (a.log_likelihood, a.n_fev)
+                    }
+                    1 => {
+                        let a = empirical.fit_warm(&x, &yb, &ba).unwrap();
+                        (a.log_likelihood, a.n_fev)
+                    }
+                    2 => {
+                        let mut c = plain.clone();
+                        c.precondition = c.precondition_at(&x, &yb, &ba, &fit.mask);
+                        let a = c.fit_warm(&x, &yb, &ba).unwrap();
+                        (a.log_likelihood, a.n_fev)
+                    }
+                    _ => newton(&plain, &x, &yb, &ba, &fit.mask),
+                };
+                row.1 += t.elapsed().as_secs_f64();
+                row.2 += cost;
+                ll[v] = l;
+            }
+            for (v, row) in rows.iter_mut().enumerate() {
+                row.3.push(ll[v] - ll[0]);
+            }
+        }
+        println!("{reps} full refits of the x5 test, d = 5, n = 2000 (one thread)");
+        for (name, t, cost, dl) in &rows {
+            println!(
+                "{name:<14} {:6.1} ms  {:5.1} {}  ll − no metric: higher {} lower {} (range {:+.3} … {:+.3})",
+                t / reps as f64 * 1e3,
+                *cost as f64 / reps as f64,
+                if *name == "Newton" {
+                    "Hessians"
+                } else {
+                    "evaluations"
+                },
+                dl.iter().filter(|&&v| v > 1e-3).count(),
+                dl.iter().filter(|&&v| v < -1e-3).count(),
+                dl.iter().cloned().fold(f64::INFINITY, f64::min),
+                dl.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            );
+        }
     }
 }

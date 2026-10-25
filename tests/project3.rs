@@ -295,3 +295,41 @@ fn driver_selection_in_regression() {
     // zero groups are exact zeros on the original scale too
     assert!(relaxed.coef.column(3).iter().all(|&v| v == 0.0));
 }
+
+#[test]
+fn cv_folds_fit_the_full_data_frame() {
+    // log-tangent CV: every fold uses the reference direction of the full
+    // data (by default its mean direction), not the one of its training rows
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+    let (d, n) = (4usize, 240usize);
+    let x = DMatrix::from_fn(n, 1, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let t = x[(i, 0)];
+        let dist = Esag::new(
+            &[1.0 + 0.4 * t, -0.5, 0.8, 2.0],
+            &[0.6 * t, -0.3, 0.4, 0.2, 0.1],
+        )
+        .unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    let mut m: Vec<f64> = (0..d).map(|k| y.column(k).sum()).collect();
+    let nrm = m.iter().map(|v| v * v).sum::<f64>().sqrt();
+    m.iter_mut().for_each(|v| *v /= nrm);
+    let default = PenalizedEsag::lasso().cv(4, 3).fit(&x, &y).unwrap();
+    let explicit = PenalizedEsag::lasso()
+        .lt_reference(m)
+        .cv(4, 3)
+        .fit(&x, &y)
+        .unwrap();
+    for (a, b) in default.criterion.iter().zip(&explicit.criterion) {
+        // 1e-3 relative when each fold took its own mean direction; the
+        // rest is the rounding of `m` amplified by the optimiser's tolerance
+        assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "{a} vs {b}");
+    }
+    assert_eq!(default.selected, explicit.selected);
+}

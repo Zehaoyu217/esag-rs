@@ -130,6 +130,11 @@ pub struct EsagRegressor {
     /// from the original fit's observed information.
     #[serde(skip)]
     pub(crate) precondition: Option<Arc<DMatrix<f64>>>,
+    /// Warm-started refit: where `precondition` is a poor metric (gamma
+    /// with cliffs) or missing, precondition with the empirical information
+    /// at the start instead.
+    #[serde(skip)]
+    pub(crate) local_precondition: bool,
 }
 
 impl Default for EsagRegressor {
@@ -158,6 +163,7 @@ impl EsagRegressor {
             response_names: None,
             lt_reference: None,
             precondition: None,
+            local_precondition: false,
         }
     }
     /// Whether to add an intercept column.
@@ -552,8 +558,7 @@ impl EsagRegressor {
             parallel: self.parallel,
             // groups j ≥ 2 (where observations can get pinned) exist from d = 4;
             // in practice traps need d ≥ 5 and covariates
-            trap_streak: (data.lt.is_none() && data.d >= 5 && data.p > 0)
-                .then(|| AtomicUsize::new(0)),
+            trap_streak: data.gamma_cliffs().then(|| AtomicUsize::new(0)),
         }
     }
 
@@ -593,42 +598,78 @@ impl EsagRegressor {
         let obj = self.objective(data, b0, free);
         let cfg = self.lbfgs_config(data, free.len(), max_iter);
         let x0: Vec<f64> = free.iter().map(|&(k, j)| b0[(k, j)]).collect();
-        let r = match &self.precondition {
-            Some(l) if l.nrows() == free.len() && l.ncols() == free.len() => {
-                let w = Whitened {
-                    inner: &obj,
-                    theta0: x0.clone(),
-                    l,
-                };
-                // whitened with the inverse information, the Hessian is near
-                // I: start with the Newton step, and stop once the predicted
-                // remaining gain ½‖g_z‖² is below REFIT_DECREMENT
-                let wcfg = LbfgsConfig {
-                    unit_scale: true,
-                    tol_decrement: REFIT_DECREMENT,
-                    ..cfg
-                };
-                let rz = minimize(&w, &vec![0.0; free.len()], &wcfg);
-                // back to θ; g_z = Lᵀ g_θ gives the θ-gradient without
-                // another evaluation
-                let x = w.theta(&rz.x);
-                let grad: Vec<f64> = l
-                    .tr_solve_lower_triangular(&DVector::from_column_slice(&rz.grad))
-                    .map(|g| g.iter().copied().collect())
-                    .unwrap_or_else(|| {
-                        let mut g = vec![0.0; x.len()];
-                        obj.value_and_gradient(&x, &mut g);
-                        g
-                    });
-                OptimResult {
-                    grad_norm_inf: grad.iter().fold(0.0f64, |m, v| m.max(v.abs())),
-                    x,
-                    f: rz.f,
-                    grad,
-                    n_iter: rz.n_iter,
-                    n_fev: rz.n_fev,
-                    status: rz.status,
+        // Where gamma's likelihood has cliffs, observations near the
+        // singular set (§2 of MATH.md) give it large curvature that changes
+        // quickly and depends on the responses, so the information of the
+        // original fit is a poor metric for a refit. The empirical
+        // information at the start tracks them, for about one evaluation.
+        let local =
+            if self.local_precondition && (data.gamma_cliffs() || self.precondition.is_none()) {
+                empirical_precondition(data, b0, free)
+            } else {
+                None
+            };
+        // whitened with an inverse information, the Hessian is near I: start
+        // with the Newton step, and stop once the predicted remaining gain
+        // ½‖g_z‖² is below REFIT_DECREMENT
+        let whitened = |l: &DMatrix<f64>, start: &[f64], iters: usize| -> OptimResult {
+            let w = Whitened {
+                inner: &obj,
+                theta0: start.to_vec(),
+                l,
+            };
+            let wcfg = LbfgsConfig {
+                unit_scale: true,
+                tol_decrement: REFIT_DECREMENT,
+                max_iter: iters,
+                ..cfg.clone()
+            };
+            let rz = minimize(&w, &vec![0.0; free.len()], &wcfg);
+            // back to θ; g_z = Lᵀ g_θ gives the θ-gradient without another
+            // evaluation
+            let x = w.theta(&rz.x);
+            let grad: Vec<f64> = l
+                .tr_solve_lower_triangular(&DVector::from_column_slice(&rz.grad))
+                .map(|g| g.iter().copied().collect())
+                .unwrap_or_else(|| {
+                    let mut g = vec![0.0; x.len()];
+                    obj.value_and_gradient(&x, &mut g);
+                    g
+                });
+            OptimResult {
+                grad_norm_inf: grad.iter().fold(0.0f64, |m, v| m.max(v.abs())),
+                x,
+                f: rz.f,
+                grad,
+                n_iter: rz.n_iter,
+                n_fev: rz.n_fev,
+                status: rz.status,
+            }
+        };
+        let r = match local.as_ref().or(self.precondition.as_ref()) {
+            Some(l) if local.is_some() => {
+                // the empirical information goes stale as the refit moves
+                // away from its start: recompute it every METRIC_REFRESH
+                // iterations (a third fewer evaluations for refits that
+                // travel far, as the second start of a full refit does)
+                let seg = METRIC_REFRESH.min(cfg.max_iter);
+                let mut r = whitened(l, &x0, seg);
+                let (mut it, mut fev) = (r.n_iter, r.n_fev);
+                while r.status == Status::MaxIterations && it < cfg.max_iter {
+                    let Some(l2) = empirical_precondition(data, &obj.assemble(&r.x), free) else {
+                        break;
+                    };
+                    let x = r.x.clone();
+                    r = whitened(&l2, &x, METRIC_REFRESH.min(cfg.max_iter - it));
+                    it += r.n_iter;
+                    fev += r.n_fev;
                 }
+                r.n_iter = it;
+                r.n_fev = fev;
+                r
+            }
+            Some(l) if l.nrows() == free.len() && l.ncols() == free.len() => {
+                whitened(l, &x0, cfg.max_iter)
             }
             _ => minimize(&obj, &x0, &cfg),
         };
@@ -789,6 +830,7 @@ impl EsagRegressor {
             config.lt_reference = Some(fr.reference().to_vec());
         }
         config.precondition = None;
+        config.local_precondition = false;
         Ok(EsagRegressorFit {
             d: data.d,
             n_features: data.p,
@@ -969,7 +1011,7 @@ impl RawFit {
 }
 
 /// Free coefficients `(row, column)` of a mask, column by column.
-fn free_params(mask: &DMatrix<bool>) -> Vec<(usize, usize)> {
+pub(crate) fn free_params(mask: &DMatrix<bool>) -> Vec<(usize, usize)> {
     (0..mask.ncols())
         .flat_map(|j| (0..mask.nrows()).map(move |k| (k, j)))
         .filter(|&(k, j)| mask[(k, j)])
@@ -995,6 +1037,10 @@ const PRUNE_AFTER: usize = 100;
 /// [`STALL_ROUNDS`] rounds, with a large gradient, has stalled.
 const STALL_PER_OBS: f64 = 1e-3;
 const STALL_ROUNDS: usize = 4;
+
+/// Iterations after which a refit preconditioned with the empirical
+/// information recomputes it at the current point.
+const METRIC_REFRESH: usize = 50;
 
 /// Mean gradient per observation at which L-BFGS hands over to the Newton
 /// polish when standard errors are requested.
@@ -1075,6 +1121,14 @@ pub(crate) struct RegressionData {
 }
 
 impl RegressionData {
+    /// Whether the likelihood can have cliffs: gamma shape with groups
+    /// `j ≥ 2` whose trailing pair can vanish (`d ≥ 5`; at `d = 4` that pair
+    /// is the whole group) and covariates that move observations near the
+    /// singular set.
+    pub(crate) fn gamma_cliffs(&self) -> bool {
+        self.lt.is_none() && self.d >= 5 && self.p > 0
+    }
+
     pub(crate) fn new(x: &DMatrix<f64>, y: &DMatrix<f64>, intercept: bool) -> Result<Self> {
         let n = y.nrows();
         let d = y.ncols();
@@ -1213,6 +1267,43 @@ impl EsagRegressor {
         let cov = info.cholesky()?.inverse();
         precondition_from_cov(&cov)
     }
+}
+
+/// The refit preconditioner from the empirical information
+/// `Σ_i s_i s_iᵀ` at `b`, with `s_i` the score of observation `i` over the
+/// free coefficients (`(k, j)` entry `∂ℓ_i/∂η_k · x̃_ij`), if it is positive
+/// definite.
+fn empirical_precondition(
+    data: &RegressionData,
+    b: &DMatrix<f64>,
+    free: &[(usize, usize)],
+) -> Option<Arc<DMatrix<f64>>> {
+    const CHUNK: usize = 256;
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let nf = free.len();
+    let mut info = DMatrix::<f64>::zeros(nf, nf);
+    let mut ge = vec![0.0; bd];
+    for start in (0..data.n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(data.n);
+        let m = end - start;
+        let xt = nalgebra::DMatrixView::from_slice(&data.x[start * pt..end * pt], pt, m);
+        let eta = b * xt;
+        let mut s = DMatrix::<f64>::zeros(m, nf);
+        for r in 0..m {
+            let i = start + r;
+            kernel_grad(
+                data,
+                &eta.as_slice()[r * bd..(r + 1) * bd],
+                &data.y[i * d..(i + 1) * d],
+                &mut ge,
+            );
+            for (a, &(k, j)) in free.iter().enumerate() {
+                s[(r, a)] = ge[k] * data.x[i * pt + j];
+            }
+        }
+        info.gemm_tr(1.0, &s, &s, 1.0);
+    }
+    precondition_from_cov(&info.cholesky()?.inverse())
 }
 
 /// Lower Cholesky factor of a covariance matrix (the preconditioner for
@@ -1981,6 +2072,13 @@ impl EsagRegressorFit {
             .collect();
         let mut s = header(title, &left, &right);
         s += &coef_blocks(&blocks, alpha);
+        if let (Shape::LogTangent, Some(m)) = (self.config.shape, &self.config.lt_reference) {
+            let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
+            s += &format!(
+                "Notes:\n[1] Log-tangent shape in the frame with reference direction\n    m = ({}).\n    The shape coefficients, and the model, depend on m: pass it as\n    lt_reference to fit the same model to other data.\n",
+                m.join(", ")
+            );
+        }
         s
     }
 

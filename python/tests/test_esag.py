@@ -1,4 +1,5 @@
 import json
+import warnings
 import time
 
 import numpy as np
@@ -195,9 +196,13 @@ def test_auto_shape():
     rng = np.random.default_rng(2)
     y = rng.normal(size=(50, 5))
     y /= np.linalg.norm(y, axis=1, keepdims=True)
-    assert esag.ESAG(y, rng.normal(size=(50, 2))).shape == "log-tangent"
-    assert esag.ESAG(y).shape == "gamma"
-    assert esag.ESAG(y[:, :3], rng.normal(size=(50, 2))).shape == "gamma"
+    with pytest.warns(esag.ShapeWarning, match="log-tangent"):
+        assert esag.ESAG(y, rng.normal(size=(50, 2))).shape == "log-tangent"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert esag.ESAG(y).shape == "gamma"
+        assert esag.ESAG(y[:, :3], rng.normal(size=(50, 2))).shape == "gamma"
+        assert esag.ESAG(y, rng.normal(size=(50, 2)), shape="log-tangent").shape == "log-tangent"
 
 
 def test_distribution():
@@ -268,3 +273,11 @@ def test_lt_reference_is_respected():
     b = esag.ESAG(y, x, shape="log-tangent").fit()
     assert json.loads(a.to_json())["config"]["lt_reference"] == [0, 0, 0, 1.0]
     assert json.loads(b.to_json())["config"]["lt_reference"] != [0, 0, 0, 1.0]
+    # the default reference is the data's mean direction, shown in the
+    # summary and reusable on other data
+    m = y.sum(axis=0) / np.linalg.norm(y.sum(axis=0))
+    np.testing.assert_allclose(b.lt_reference, m, atol=1e-12)
+    assert "reference direction" in str(b.summary())
+    assert a.lt_reference is not None and esag.ESAG(y, x, shape="gamma").fit().lt_reference is None
+    c = esag.ESAG(y[:150], x[:150], shape="log-tangent", lt_reference=b.lt_reference).fit()
+    np.testing.assert_allclose(c.lt_reference, b.lt_reference)

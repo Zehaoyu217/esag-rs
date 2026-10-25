@@ -377,6 +377,50 @@ at a replicate's own maximum has eigenvalues in about `(1 ± √(k/n))²` (k
 parameters). That is sampling variation of the information, not a defect of
 the preconditioner, and it is why L-BFGS still takes several iterations.
 
+**Refits where γ has cliffs (d ≥ 5 with covariates).** There the original
+fit's information is a poor metric. An observation whose trailing pair
+`(γ_{n−1}, γ_n)` in a group `j ≥ 2` has small norm `r` (§2) adds curvature
+of order `1/r²`. For the closest observations that is as much as the rest
+of the sample, and it depends on their responses, so it changes from
+replicate to replicate. Worse, the full model's information at the
+restricted fit, the metric for full refits in tests, is usually not
+positive definite there, and those refits ran unpreconditioned. So refits
+in this regime, and any refit without a positive-definite metric, are
+whitened with the empirical information `Σ_i s_iᵀ s_i` at their start
+(`s_i` the score of observation `i` over the free coefficients). It costs
+about one evaluation, it grows like `‖s_i‖² ~ 1/r²` exactly where the
+curvature does, and it is recomputed every 50 iterations because it goes
+stale as a refit travels. Exact Newton steps are no remedy: a refit needs
+about 14 Hessians (one is 32 evaluations at d = 5), against 4–5 on a smooth
+likelihood. On the `x5` test at d = 5 (n = 2000, 5 covariates), the
+evaluations per refit change as follows:
+
+| refit | before | after |
+|---|---|---|
+| restricted | 106 | 74 |
+| full, from the restricted refit | 244 | 84 |
+| full, from the original full fit | 310 | 194 |
+
+**Local maxima.** These likelihoods have many local maxima. Near each
+near-singular observation `ℓ` winds around the singular set, and on top of
+the smooth part this leaves several ridges. Refits from the same start that
+differ only in metric reach different maxima. Each is a true maximum
+(exact Newton decrement ≤ 1e−6), and the gaps go both ways:
+
+| test | replicates that differ | largest gap | mean (± s.e.) |
+|---|---|---|---|
+| `x5` | 45% | 4.5 | −0.13 ± 0.09 |
+| shape free of `x1` | 25% | 1.6 | 0.00 ± 0.03 |
+
+That is why the full model is refitted from two starts, and the bootstrap
+`LR` at d ≥ 5 still carries this search noise. Under the isotropy null
+every `γ_i` is near 0, so every observation is near the set. The full
+refits then never converge, and their log-likelihoods differ between
+metrics by up to 19 (mean +3.4 ± 2.1 for the new one). The γ isotropy
+`LR` at d ≥ 5 is therefore unreliable. `M` uses only the restricted fit
+and is unaffected. The log-tangent model has the same null hypothesis
+(`V ≡ I`) and a smooth likelihood around it.
+
 ## 7. Log-tangent shape parameterization (smooth option) (`src/logtangent.rs`)
 
 An opt-in alternative to `γ` that maps smoothly onto the same ESAG family,
@@ -391,7 +435,11 @@ by a `μ̂`-dependent amount. So "`s` linear in x" in one frame is not linear
 in another, and each reference direction defines its own regression model.
 The default `m` is the data's mean direction, which keeps `μ̂` far from the
 one singular point `−m`. It is stored with the fit and kept fixed by every
-refit, but it is chosen from the data. On data from a log-tangent model
+refit (and by every cross-validation fold of a penalized fit, which
+before took the mean direction of its own training rows and so fitted a
+slightly different model, up to 1e−3 relative in the CV score). Summaries
+print it, and `results.lt_reference` (Python) returns it for reuse on other
+data. It is still chosen from the data. On data from a log-tangent model
 defined with `m = e_d` (§5b), the fit with the default `m` has an error in
 `V̂` that stops shrinking at the `1/√n` rate. At d = 3, n = 10000 the
 geodesic error is 0.108, against 0.055 with `m = e_d`; at d = 8 it is 0.44
@@ -410,7 +458,8 @@ the `γ` fit has log-likelihood −2312.6 and the log-tangent fit −2381.4.
 Choose between them by AIC/BIC (same number of parameters) or by
 interpretation. The log-tangent model is the default only where the `γ`
 model's likelihood is unreliable to optimise (d ≥ 5 with covariates; the
-Python front end's `shape="auto"`).
+Python front end's `shape="auto"`, which raises a `ShapeWarning` when it
+makes that choice).
 
 **Definition.** Let `p = d − 1`. Fix a reference direction `m ∈ S^{d−1}` and
 an orthonormal basis `E` (`d × p`) of `m⊥` (`LtFrame`; by default `m = e_d`,
