@@ -49,6 +49,8 @@ def res(data):
 
 def test_fit_recovers_truth_and_labels(res):
     assert res.converged
+    # a converged fit has nothing to explain
+    assert res.singular_obs == [] and res.degenerate_obs == []
     assert list(res.params.index) == ["const", "temp", "ph", "noise"]
     assert list(res.params.columns) == ["mu[1]", "mu[2]", "mu[3]", "gamma[1]", "gamma[2]"]
     err = np.abs(res.params.values.T - b_true())

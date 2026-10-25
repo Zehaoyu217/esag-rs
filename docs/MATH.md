@@ -515,6 +515,26 @@ its fits (4 evaluations per bootstrap refit) cannot stall
 at 600 points, d = 3, 5, 8). Nothing of the kind holds once `V ≠ I`: the
 frame `Ξ(μ̂)` couples the mean and the shape.
 
+**Size and power on the hard scenario** (`examples/hard_scenario.rs
+tests`; correlated covariates, μ and V(x) strongly x-dependent; n = 2000,
+B = 199, 200 replications, s.e. 0.015). The true nulls are μ free of x3,
+the shape free of x2 and x5 without effect; the false ones are a constant
+shape, the shape free of x1, and x4 (a quarter-size effect) without effect.
+Rejection rates at 5%, over RoC, D, M, LR and LM for the true nulls and
+RoC, D, LR and LM for the false ones:
+
+| shape, d | true nulls | constant shape | shape free of x1 | x4 (weak) |
+|---|---|---|---|---|
+| log-tangent, 3 | 0.030–0.065 | 1.00 | 1.00 | 0.92–0.96 |
+| γ, 3 | 0.030–0.065 | 0.87–0.92 | 0.70–0.79 | 0.75–0.84 |
+| log-tangent, 5 | 0.045–0.075 | 1.00 | 1.00 | 0.87–0.96 |
+| log-tangent, 8 (score test, 100 replications; LM / M) | 0.020–0.070 / 0.030–0.040 | 1.00 | 1.00 | 0.93 |
+
+`M` rejects the false nulls 3.5–31% of the time. (The γ and log-tangent data
+are generated from the same coefficients read in each parameterization, so
+their effect sizes differ; compare across rows with care.) γ at d ≥ 5 is
+not in the table: on this data its full model has no regular maximum (§2).
+
 **Score statistic and score test.** With `s_i` the score of observation `i`
 over the full model's free coefficients at the restricted fit, `g = Σ s_i`
 and `I = Σ s_i s_iᵀ` (the empirical information),
@@ -953,6 +973,19 @@ MLE does not exist") three things change:
 At d = 5, n = 100 the five LASSO-type presets then select sparse models
 with regular relaxed refits (0–2 of the 6 true covariate parts, no false
 ones; at n = 100 the data cannot support more).
+
+**Support recovery on the hard scenario** (`examples/hard_scenario.rs
+lasso`; log-tangent, BIC at relaxed refits, n = 2000, 40 replications, 12
+at d = 8; strong parts: x1 on μ and the shape, x2 on μ, x3 on the shape):
+adaptive LASSO finds 4.00 of 4 strong parts at d = 3 and 5 with 0.00 and
+0.28 of 4 false parts (3.75 and 0.50 at d = 8); plain LASSO finds as many
+but admits 0.23–1.40 false parts; the group penalties (mean / shape parts
+per covariate) find all strong parts at d = 3 (3.55–3.88 at d = 5) with
+≤ 0.10 false, but at d = 8 none of the shape effects, because BIC charges
+`27 log n` for a 27-coefficient shape group. Five-fold cross-validation of
+the held-out log-likelihood errs the other way (nearly every part
+admitted). One path takes 82–103 ms at d = 3, 0.33–0.55 s at d = 5 and
+1.6–3.0 s at d = 8 on one core.
 
 Proximal Newton also stops once three successive steps no longer decrease
 `F` beyond rounding (relative 1e−13) with the KKT residual already below

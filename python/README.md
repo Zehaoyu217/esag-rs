@@ -155,7 +155,7 @@ dist.logpdf(y), dist.covariance, dist.second_moment, dist.mean_direction
 ## Tests and demo
 
 ```sh
-python -m pytest tests            # 22 tests, ~3 s
+python -m pytest tests            # 23 tests, ~3 s
 python examples/demo.py           # fit, five bootstrap tests, five penalties (d = 3)
 python examples/demo.py 5         # the same at d = 5
 ```

@@ -2473,15 +2473,16 @@ impl EsagRegressorFit {
         if !self.singular_obs.is_empty() {
             let k = self.singular_obs.len();
             notes.push(format!(
-                "{k} observation{} ({}) sit at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). shape=\"logtangent\"\n    fits the same distributions with a smooth parameterization.",
+                "{k} observation{} ({}) {} at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The likelihood has no\n    regular maximum here: its supremum is approached as such observations\n    reach the set, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2). The log-tangent\n    shape (Shape::LogTangent; shape=\"log-tangent\" in Python) describes the\n    same distributions with a smooth parameterization.",
                 if k == 1 { "" } else { "s" },
-                list(&self.singular_obs)
+                list(&self.singular_obs),
+                if k == 1 { "sits" } else { "sit" }
             ));
         }
         if !self.degenerate_obs.is_empty() {
             let k = self.degenerate_obs.len();
             notes.push(format!(
-                "The likelihood is unbounded: the fit drives V(x) towards a singular\n    matrix at {k} observation{} ({}), whose density then exceeds the median\n    observation's by more than 12 nats. With {} free coefficients for {}\n    observations the MLE does not exist. Use fewer shape covariates or a\n    penalized fit (fit_regularized, e.g. a ridge or lasso penalty).",
+                "The likelihood is unbounded: the fit drives V(x) towards a singular\n    matrix at {k} observation{} ({}), whose density then exceeds the median\n    observation's by more than 12 nats. With {} free coefficients for {}\n    observations the MLE does not exist. Use fewer shape covariates or a\n    penalized fit (PenalizedEsag; fit_regularized in Python).",
                 if k == 1 { "" } else { "s" },
                 list(&self.degenerate_obs),
                 self.free.len(),

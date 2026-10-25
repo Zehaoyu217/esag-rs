@@ -1110,3 +1110,48 @@ fn unbounded_fit_phases() {
         fit.degenerate_obs.len()
     );
 }
+
+/// Print the summary notes of an unbounded fit and a pinned gamma fit.
+#[test]
+#[ignore]
+fn show_notes() {
+    let (x, y) = simulate(&hard_truth(5), 100, 21, Shape::LogTangent);
+    let s = config(5, Shape::LogTangent).fit(&x, &y).unwrap().summary();
+    println!("{}", &s[s.find("Notes:").unwrap()..]);
+    let (x, y) = simulate(&hard_truth(5), 500, 900, Shape::Gamma);
+    let s = EsagRegressor::new()
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap()
+        .summary();
+    println!("{}", &s[s.find("Notes:").unwrap()..]);
+}
+
+/// Median fit time of the big_fit case d = 7, p = 5, n = 1000 (log-tangent
+/// data), threads as configured.
+#[test]
+#[ignore]
+fn big_fit_small_n_timing() {
+    let (d, n) = (7usize, 1000usize);
+    let b = standard_truth(d, 5);
+    let mut m = vec![0.0; d];
+    m[d - 1] = 1.0;
+    let (x, y) = simulate_with(&b, n, 11, Shape::LogTangent, 0.0, &m);
+    for parallel in [false, true] {
+        let cfg = EsagRegressor::new()
+            .with_shape(Shape::LogTangent)
+            .with_parallel(parallel);
+        let mut t: Vec<f64> = (0..15)
+            .map(|_| {
+                let s = Instant::now();
+                std::hint::black_box(cfg.fit(&x, &y).unwrap());
+                s.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        t.sort_by(f64::total_cmp);
+        println!(
+            "parallel {parallel}: median {:.1} ms, min {:.1} ms",
+            t[7], t[0]
+        );
+    }
+}

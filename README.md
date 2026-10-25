@@ -182,7 +182,10 @@ Huang (2025, Sec. 7.1). The full output is in
 0.6 s.
 
 `cargo run --release --example big_fit` fits d = 7–8 regressions with 5–6
-covariates in both shape parameterizations, and
+covariates in both shape parameterizations,
+`cargo run --release --example hard_scenario -- fit|tests|lasso` runs the
+fits, tests and penalized selection on a hard scenario (μ and V(x) strongly
+x-dependent, correlated covariates), and
 `cargo run --release --example project3_paper` runs the six paper methods
 and the eigen-gap penalty on an experiment-1 replicate.
 
@@ -233,8 +236,8 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 174 tests, plus 13 slow studies,
-diagnostics and benchmarks marked `#[ignore]`. The Python package's 22
+All `cargo test --release` suites pass: 179 tests, plus 34 slow studies,
+diagnostics and benchmarks marked `#[ignore]`. The Python package's 23
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced
@@ -343,12 +346,53 @@ new covariate points. γ at d ≥ 5 does not converge on this data because
 its likelihood has no regular maximum there (see "The γ parameterization:
 what porting found" below); the log-tangent model does.
 
+Bootstrap tests on the same data (n = 2000, B = 199, 200 replications,
+s.e. 0.015; at d = 8 score tests, 100 replications), rejection rates at 5%:
+
+| null | log-tangent d = 3 | γ d = 3 | log-tangent d = 5 | log-tangent d = 8, LM |
+|---|---|---|---|---|
+| μ free of x3 (true) | 0.035–0.050 | 0.030–0.060 | 0.055–0.065 | 0.070 |
+| shape free of x2 (true) | 0.035–0.065 | 0.045–0.065 | 0.045–0.060 | 0.020 |
+| x5 no effect (true) | 0.030–0.060 | 0.050–0.065 | 0.055–0.075 | 0.060 |
+| shape constant (false) | 1.00 | 0.87–0.92 | 1.00 | 1.00 |
+| shape free of x1 (false) | 1.00 | 0.70–0.79 | 1.00 | 1.00 |
+| x4 no effect, weak (false) | 0.92–0.96 | 0.75–0.84 | 0.87–0.96 | 0.93 |
+
+Ranges are over RoC, D, M, LR and LM for the true nulls and over RoC, D,
+LR and LM for the false ones. `M` rejects the false nulls only 3.5–31% of the
+time (it has no first-order power against slopes, `docs/MATH.md` §6).
+
 LASSO family on the same data (log-tangent, BIC at relaxed refits, 40
 replications; 12 at d = 8), covariate parts found:
 
 | d, n | penalty | strong parts (of 4) | weak x4 parts (of 2) | false (of 4) | time per path, one core |
 |---|---|---|---|---|---|
-HARD_LASSO_ROWS
+| 3, 2000 | LASSO | 4.00 | 1.27 | 0.23 | 95 ms |
+| 3, 2000 | adaptive LASSO | 4.00 | 0.97 | 0.00 | 0.10 s |
+| 3, 2000 | group LASSO (mean / shape parts) | 4.00 | 0.40 | 0.00 | 82 ms |
+| 3, 2000 | adaptive group LASSO | 4.00 | 0.45 | 0.00 | 85 ms |
+| 3, 2000 | sparse group LASSO (α = 0.5) | 4.00 | 0.85 | 0.03 | 96 ms |
+| 5, 2000 | LASSO | 3.98 | 1.57 | 1.40 | 0.47 s |
+| 5, 2000 | adaptive LASSO | 4.00 | 1.30 | 0.28 | 0.55 s |
+| 5, 2000 | group LASSO | 3.55 | 0.55 | 0.10 | 0.33 s |
+| 5, 2000 | adaptive group LASSO | 3.88 | 0.10 | 0.00 | 0.35 s |
+| 5, 2000 | sparse group LASSO | 3.77 | 0.78 | 0.20 | 0.45 s |
+| 8, 2000 | LASSO | 3.17 | 1.33 | 1.00 | 2.6 s |
+| 8, 2000 | adaptive LASSO | 3.75 | 1.25 | 0.50 | 3.0 s |
+| 8, 2000 | group LASSO | 2.00 | 0 | 0 | 1.6 s |
+| 8, 2000 | adaptive group LASSO | 2.00 | 0 | 0 | 1.8 s |
+| 8, 2000 | sparse group LASSO | 2.00 | 0.58 | 0 | 2.4 s |
+
+The strong parts are x1's mean and shape effects, x2's mean effect and x3's
+shape effect; x4's are a quarter as large. Adaptive LASSO finds every
+strong part at d = 3 and 5 with few false ones. At d = 8 a shape group has
+27 coefficients, and BIC's `27 · log n` charge per group keeps the group
+penalties from admitting any shape effect; 5-fold cross-validation (held-out
+log-likelihood) goes the other way and admits nearly everything (adaptive
+group LASSO: 4/4 strong, 1.75/2 weak, 1.5 false; the others 3.8–4 false).
+At n = 300 every method is conservative (1.2–3.2 strong parts at d = 3 and
+5). At n = 100, d = 5 (84 coefficients, where the unpenalized MLE does not
+exist) the paths still select regular sparse models (§8 of `docs/MATH.md`).
 
 **Estimating V(x)** (`cargo run --release --example v_recovery`; data from
 a known regression with 5 covariates + const). The geodesic error of V̂(x)
@@ -426,19 +470,21 @@ refitted and reduced to four numbers one at a time.
   for standard errors, and early pruning of dominated starts.
 
 `cargo run --release --example perf_suite` times a wider set of workloads
-(medians; the "now" column was measured with other processes running, load
-average about 5).
+(medians, all threads; γ shape):
 
-| workload | v0.1 | previous speed pass | now |
-|---|---|---|---|
-| fit with SEs, d = 3, n = 1000 | 8.7 ms | 1.4 ms | 1.4 ms |
-| fit with SEs, d = 5, n = 2000 | 2.77 s | 9.0 ms | 12 ms |
-| the paper's hydrochemistry fit (d = 4) | 18.2 ms | 1.9 ms | 1.0 ms |
-| bootstrap GoF, 200 replicates, n = 1000 | 139 ms | 45 ms | 36 ms |
-| prediction region, 100 refits, n = 1000 | 92 ms | 26 ms | 18 ms |
-| hypothesis test, 200 replicates, d = 3, n = 1000 | 811 ms | 382 ms | 106 ms |
-| hypothesis test, 300 replicates, hydrochemistry | 819 ms | 221 ms | 44 ms |
-| `regression_demo`, whole run | 6.3 s | 2.0 s | 0.6 s |
+| workload | v0.1 | previous speed pass | 2026-10-24 | now |
+|---|---|---|---|---|
+| fit with SEs, d = 3, n = 1000 | 8.7 ms | 1.4 ms | 1.4 ms | 1.2 ms |
+| fit with SEs, d = 5, n = 2000 | 2.77 s | 9.0 ms | 12 ms | 11 ms |
+| the paper's hydrochemistry fit (d = 4) | 18.2 ms | 1.9 ms | 1.0 ms | 1.0 ms |
+| bootstrap GoF, 200 replicates, n = 1000 | 139 ms | 45 ms | 36 ms | 23 ms |
+| prediction region, 100 refits, n = 1000 | 92 ms | 26 ms | 18 ms | 15 ms |
+| hypothesis test, 200 replicates, d = 3, n = 1000 | 811 ms | 382 ms | 106 ms | 72 ms |
+| hypothesis test, 300 replicates, hydrochemistry | 819 ms | 221 ms | 44 ms | 13 ms |
+| `regression_demo`, whole run | 6.3 s | 2.0 s | 0.6 s | 0.53 s |
+
+The 2026-10-24 column was measured with other processes running (load
+average about 5); "now" on an idle machine.
 
 Bootstrap hypothesis tests at B = 500, n = 2000, 5 covariates + const, on
 data whose V(x) is anisotropic (`cargo run --release --example test_bench
@@ -451,35 +497,37 @@ same LM and M replicates:
 | d | log-tangent, full | log-tangent, score | γ, full | γ, score |
 |---|---|---|---|---|
 | **one core** | | | | |
-| 3 | 2.0–2.3 s | 1.5–1.6 s | 3.4–4.2 s | 1.3–1.9 s |
-| 5 | 7.0–9.6 s | 4.4–5.9 s | 27–48 s; shape constant 98 s | 7.8–12 s; shape constant 3.3 s |
-| 8 | 30–36 s | 17–22 s | 129–348 s; shape constant 331 s† | 36–119 s; shape constant 14 s† |
+| 3 | 1.7–1.9 s | 1.3–1.4 s | 2.9–3.6 s | 1.1–1.6 s |
+| 5 | 5.0–8.9 s; shape constant 5.0 s | 2.4–5.3 s; shape constant 2.4 s | 24–44 s; shape constant 96 s | 6.6–11 s; shape constant 2.7 s |
+| 8 | 21–32 s; shape constant 21 s | 6.4–18 s; shape constant 6.4 s | 87–289 s; shape constant 285 s† | 28–100 s; shape constant 11 s† |
 | **15 threads** | | | | |
-| 3 | 0.19–0.21 s | 0.14–0.15 s | 0.31–0.38 s | 0.13–0.18 s |
-| 5 | 0.69–0.90 s | 0.46–0.60 s | 2.5–4.4 s; shape constant 8.6 s | 0.78–1.2 s; shape constant 0.35 s |
-| 8 | 3.2–3.8 s | 1.9–2.5 s | 12–34 s; shape constant 30 s | 3.6–9.5 s; shape constant 1.4 s |
+| 3 | 0.17–0.18 s | 0.12–0.13 s | 0.25–0.31 s | 0.11–0.15 s |
+| 5 | 0.46–0.78 s | 0.25–0.49 s | 2.3–3.9 s; shape constant 8.0 s | 0.63–1.0 s; shape constant 0.30 s |
+| 8 | 2.2–3.4 s | 0.80–1.9 s | 8.5–28 s | 1.0–8.3 s |
 
 † B = 50, scaled by 10. γ at d ≥ 5 is slower because its likelihood is
-rough there, not because its kernel is: refits need 50–200 evaluations and
-have local maxima (`docs/MATH.md` §6). Refits use the empirical information
-as their metric, which made the full tests 1.4–2.5× faster than the
-previous version. The score statistic's Gram matrix is O(n k²) for k
-coefficients, about 15% of a restricted refit (0.6 ms at d = 3, 14–18 ms at
-d = 8). It makes a full test up to 20% slower than before it was added
-(log-tangent d = 8, one core: 24–32 s before), and the score test is faster
-than either. The Python session in `python/examples/demo.py` (d = 3, γ, five
-nulls, five penalties) runs each test in 1.1–1.8 s and each penalty path in
-0.6–1.3 s.
+rough there, not because its kernel is: refits need 50–800 evaluations and
+have local maxima, and with strong shape effects no regular maximum
+(`docs/MATH.md` §2, §6). A log-tangent replicate costs about 7 evaluations
+per refit, near the floor for a quasi-Newton refit from the original fit;
+its time is the per-observation eigen-decomposition (1.1 µs at d = 8). The
+score statistic's information is assembled from its Kronecker structure:
+0.25 ms per replicate at d = 3 and 2.2–4.2 ms at d = 8. The Python session
+in `python/examples/demo.py` (d = 3, γ, five nulls, five penalties) runs
+each test in 1.1–1.8 s and each penalty path in 0.6–1.3 s.
 
 Large regressions (`cargo run --release --example big_fit`, fit with SEs;
 data drawn from the log-tangent model):
 
 | d, covariates | n | γ shape | log-tangent shape |
 |---|---|---|---|
-| 7, 5–6 | 1,000 | 0.37–0.41 s, did not converge | 7–9 ms, converged |
-| 7, 5–6 | 20,000 | 0.66–1.5 s | 69–73 ms |
-| 8, 5–6 | 1,000 | 0.30–0.38 s, did not converge | 14–16 ms, converged |
-| 8, 5–6 | 20,000 | 0.73–1.5 s, one not converged | 143–150 ms |
+| 7, 5–6 | 1,000 | 75–140 ms, did not converge | 7–9 ms, converged |
+| 7, 5–6 | 20,000 | 0.32–1.5 s, one not converged | 78 ms |
+| 8, 5–6 | 1,000 | 85–377 ms, did not converge | 14–17 ms, converged |
+| 8, 5–6 | 20,000 | 0.33–0.34 s, did not converge | 85–104 ms |
+
+(All threads. The γ fits that do not converge report the observations on
+the singular set, `singular_obs`, and no longer run the restart waves.)
 
 On data drawn from the γ model the γ fit takes 40 ms–1.5 s (bit-for-bit
 reproducible; fits that end at a cliff of the parameterization are flagged
@@ -622,10 +670,12 @@ src/penalized.rs                Project 3: LASSO-type penalized fits, λ paths, 
 src/stats/                      normal, χ², KS (exact and asymptotic, R-compatible), quantiles
 src/distribution.rs             Esag
 src/regression.rs, estimator.rs EsagRegressor / EsagEstimator (scikit-learn style)
+src/regression/fit_profile.rs   profiling and diagnostic studies of the fits (ignored tests)
 src/preprocessing.rs            MinMaxScaler
 src/inference/                  goodness of fit, prediction regions, hypothesis tests, bootstrap
 src/bin/esag.rs                 CLI
-examples/                       regression_demo, bench_vs_r, perf_suite, big_fit, project3_paper
+examples/                       regression_demo, bench_vs_r, perf_suite, big_fit, hard_scenario,
+                                  aniso_study, test_bench, v_recovery, project3_paper
 tests/                          R parity, paper reproduction, API, inference
 reference/r/                    the original R sources
 reference/checks/, project3/    R scripts behind the findings above
