@@ -25,6 +25,7 @@ pub mod error;
 pub mod estimator;
 pub mod frame;
 pub mod gamma_smooth;
+pub mod gamma_transported;
 pub mod hdual;
 pub mod inference;
 pub mod loglik;
