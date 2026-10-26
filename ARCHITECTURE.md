@@ -220,6 +220,14 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
     paper's six methods are offered as a reproduction mode in γ
     (`PenalizedEsag::paper`). `docs/project3/` holds
     the spec of the R code and the methodology review.
-* γ-speed branch: the exact Hessian of the γ log-density for every d
-  (`adjoint_hess.rs`, built on the adjoint's tape) replaces the hyper-dual
-  Hessian at d = 3 and central differences of the gradient at d ≥ 4.
+* γ-speed branch:
+  * the exact Hessian of the γ log-density for every d (`adjoint_hess.rs`,
+    built on the adjoint's tape) replaces the hyper-dual Hessian at d = 3
+    and central differences of the gradient at d ≥ 4, except in the
+    polish of fits that did not converge (`ObsHessian::Differences`);
+  * sequential evaluations sum the same fixed chunks as parallel ones, so
+    `with_parallel(false)` gives exactly the default's fits; the small
+    products of `joint_eval` (any dimension ≤ 5, always at d = 3) run in
+    fixed-size loops, bit-identical to nalgebra's;
+  * bootstrap procedures build the samplers of their generating fit once
+    (`EsagRegressorFit::response_samplers`).

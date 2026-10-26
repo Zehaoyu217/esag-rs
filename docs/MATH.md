@@ -309,9 +309,18 @@ evaluations per gradient.
 
 **Evaluation.** Per chunk of 64 observations, `η = B X_cᵀ` and the
 gradient `G X_c` are matrix products; the per-observation kernel is the
-reverse-mode gradient above. Chunk results are summed in chunk order, so
-the likelihood, and therefore every fit, is bit-for-bit reproducible
-whatever the number of threads.
+reverse-mode gradient above. Chunk results are summed in chunk order, with
+or without `parallel`, so the likelihood, and therefore every fit, is
+bit-for-bit the same whatever the number of threads, and the same for
+`with_parallel(false)` (which used to sum all observations as one chunk:
+on multimodal γ problems such rounding differences send L-BFGS elsewhere,
+and changed the log-likelihood of 29 of 40 hard-scenario fits at d = 4,
+n = 300, between the two settings). nalgebra
+multiplies through `matrixmultiply` only when every dimension exceeds 5,
+so at d = 3 (`η` of length 5) both products ran column by column; the
+same operations, in the same order, in fixed-size loops (`small_eta`,
+`small_grad`, bit-identical) bring the gradient at d = 3 from 0.15 to
+0.10 ms (n = 2000, 5 covariates, one core).
 
 **Starts.** By default (`Init::Auto`) `esag` uses two starts:
 
@@ -332,7 +341,33 @@ errors, `n = 2000`, 5 covariates: 6.7 → 2.8 ms (`d = 3`), 34 → 11.9 ms
 (`d = 5`), 129 → 50 ms (`d = 8`).
 
 *Gamma.* The starts end at different maxima in 2–10 of 16 datasets (by up to
-9 log-likelihood units at `d = 3`), so they are raced.
+9 log-likelihood units at `d = 3`), so they are raced. Measured against the
+race (`regression::gamma_profile`, 40 datasets per cell, n = 300, 1000,
+2000, d = 3–5), no cheaper strategy reaches the same maxima:
+
+* the moment start alone, whitened with the exact information as for
+  log-tangent fits, matches the race in 80 of 80 standard datasets at
+  d = 3 and 77 of 80 at d = 4 (n = 1000, 2000), 2–3× faster, but ends
+  lower in 12 of 40 standard datasets at d = 3, n = 300 (never higher), in
+  6–22 of 40 hard ones (d = 3, 4), and in 5–11 of 40 standard ones at
+  d = 5 (one by 23). At small n the R-style start
+  finds the maximum with large shape slopes that the moment start, plain
+  or whitened, misses. Whitening with the empirical information (outer
+  product of the scores) instead does worse at d = 5 (lower in 14 of 48,
+  by up to 45);
+* gating that single start on how close the fitted observations come to
+  the non-smooth sets of γ (the cones `G_m = 0`, the trailing pairs, the
+  frame pole) does not help: losses remain where every observation stays
+  farther than 30% of the median group norm from them;
+* stopping the race at a mean gradient of 1e−2 per observation and
+  finishing with exact Newton (L-BFGS follows exactly the race's paths up to
+  there) ends lower in 4–8 of 40 hard datasets (d = 3) and 6 of 40
+  standard ones at n = 300: at that point the log-likelihood is still
+  0.4–26 below the end, the Hessian is mostly indefinite, and even a fresh
+  L-BFGS from that point ends elsewhere than the race.
+
+These likelihoods are so multimodal that the maximum reached depends on the
+whole optimizer history.
 
 The race runs in lockstep: every start advances 25 L-BFGS iterations per
 round (in parallel), and all decisions are taken between rounds, so they do
@@ -392,12 +427,22 @@ d = 3 and 5–7× less than the central differences of the gradient that
 were used for d ≥ 4, and agrees with the dual numbers to rounding. The
 Kronecker sum is one matrix product per chunk of observations over the
 unique entries (`x_{j1}x_{j2}`, `j1 ≤ j2`, times `H_i[k1,k2]`, `k1 ≤ k2`).
-On one core (n = 2000, 5 covariates) the joint Hessian takes 0.32, 1.3 and
-6.3 ms at d = 3, 5 and 8, 2.5, 7 and 16 gradients. When standard errors are requested, L-BFGS hands
+On one core (n = 2000, 5 covariates) the joint Hessian takes 0.31, 1.3 and
+6.1 ms at d = 3, 5 and 8, 3, 7 and 16 gradients (0.55, 5.4 and 26 ms
+before). When standard errors are requested, L-BFGS hands
 over once the mean gradient per observation is below 1e−4, and up to eight
 simplified Newton steps reuse this one Hessian to polish the optimum to
 ‖∇ℓ‖ ≈ 1e-10 (if the Hessian is not negative definite there, L-BFGS
-finishes at full tolerance first). Intercept-only fits
+finishes at full tolerance first). Fits that did not converge stop next to
+kinks of γ; there `finalize` keeps the central differences of the
+gradient for d ≥ 4, whose average over a small step gives the polishing
+Newton steps a better model than the pointwise Hessian (with the exact
+Hessian, 39 of 640 fits at d = 4 and 5, all unconverged, ended lower, by
+up to 1.2, and 8 higher). Fits
+are then the same as before the exact Hessian (1071 of 1080 identical
+over d = 3–5, n = 300–2000, the rest within 2e−7), and standard errors of
+converged fits change by up to 2e−3 relative at d ≥ 4, the error of the
+differences. Intercept-only fits
 report the canonical γ of their fitted V. Yu & Huang show this can be
 unreliable near `γ = 0`, where the likelihood is non-smooth, and for `γ`
 generally because of equivalence. `inference::bootstrap_coef` gives pairs

@@ -149,6 +149,10 @@ pub struct EsagRegressor {
     /// = [`REFIT_DECREMENT`].
     #[serde(skip)]
     pub(crate) refit_decrement: Option<f64>,
+    /// Mean gradient per observation at which L-BFGS hands over when
+    /// standard errors are requested; `None` = [`NEWTON_SWITCH`].
+    #[serde(skip)]
+    pub(crate) handover: Option<f64>,
 }
 
 impl Default for EsagRegressor {
@@ -179,6 +183,7 @@ impl EsagRegressor {
             precondition: None,
             local_precondition: false,
             refit_decrement: None,
+            handover: None,
         }
     }
     /// Whether to add an intercept column.
@@ -582,6 +587,24 @@ impl EsagRegressor {
         mask: &DMatrix<bool>,
         max_iter: usize,
     ) -> RawFit {
+        let mut best: Option<RawFit> = None;
+        for r in self.race_all(data, starts, mask, max_iter) {
+            if best.as_ref().is_none_or(|b| r.beats(b)) {
+                best = Some(r);
+            }
+        }
+        best.expect("at least one start")
+    }
+
+    /// [`EsagRegressor::race`], returning the outcome of every start (in the
+    /// order of `starts`).
+    fn race_all(
+        &self,
+        data: &RegressionData,
+        starts: &[DMatrix<f64>],
+        mask: &DMatrix<bool>,
+        max_iter: usize,
+    ) -> Vec<RawFit> {
         let free = free_params(mask);
         let objs: Vec<NegLogLik> = starts
             .iter()
@@ -683,13 +706,7 @@ impl EsagRegressor {
                     .join(" ")
             );
         }
-        let mut best: Option<RawFit> = None;
-        for r in raws {
-            if best.as_ref().is_none_or(|b| r.beats(b)) {
-                best = Some(r);
-            }
-        }
-        best.expect("at least one start")
+        raws
     }
 
     fn objective<'a>(
@@ -721,7 +738,7 @@ impl EsagRegressor {
         // over once the mean gradient per observation is below
         // NEWTON_SWITCH (≈ a quarter of the iterations saved).
         let tol_grad_abs = if self.compute_hessian {
-            NEWTON_SWITCH * data.n as f64
+            self.handover.unwrap_or(NEWTON_SWITCH) * data.n as f64
         } else {
             0.0
         };
@@ -927,7 +944,17 @@ impl EsagRegressor {
             // (simplified Newton, each step checked with a gradient-only
             // evaluation). The step is ~‖g‖/λ_min ≲ 1e-4, so the Hessian
             // changes negligibly and is reported as the observed information.
-            let (mut f0, mut g0, mut h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
+            // (central differences for fits that did not converge, see
+            // `ObsHessian::Differences`)
+            let kind = |converged: bool| {
+                if converged {
+                    ObsHessian::Exact
+                } else {
+                    ObsHessian::Differences
+                }
+            };
+            let (mut f0, mut g0, mut h_full) =
+                joint_loglik_grad_hess_with(data, &coef, self.parallel, kind(best.converged));
             let mut chol = restrict(&h_full, data.p_total).cholesky();
             // (not for fits diagnosed as pinned at a singular set or with an
             // unbounded likelihood: more iterations only drift there)
@@ -952,7 +979,12 @@ impl EsagRegressor {
                         converged: raw.converged || best.converged,
                         ..raw
                     };
-                    (f0, g0, h_full) = joint_loglik_grad_hess(data, &coef, self.parallel);
+                    (f0, g0, h_full) = joint_loglik_grad_hess_with(
+                        data,
+                        &coef,
+                        self.parallel,
+                        kind(best.converged),
+                    );
                     chol = restrict(&h_full, data.p_total).cholesky();
                 }
             }
@@ -1827,10 +1859,26 @@ fn shared_shape(data: &RegressionData, base: &DMatrix<f64>, free: &[(usize, usiz
         && (d..data.b_dim).all(|k| (1..pt).all(|j| base[(k, j)] == 0.0))
 }
 
-/// One chunk of [`joint_eval`]: log-likelihood, row-major gradient,
-/// squared per-observation gradient norms (if requested) and the shared
-/// shape's accumulator (if any).
-type ChunkEval = (f64, Vec<f64>, Vec<f64>, Vec<f64>);
+/// Scratch of one chunk of [`joint_eval`] (at most [`PAR_CHUNK`]
+/// observations): `η` and `∇_η ℓ` (`bd × m`, one column per observation),
+/// the chunk's gradient (`bd × pt`) and the shared shape's accumulator.
+struct ChunkBuf {
+    eta: Vec<f64>,
+    ge: Vec<f64>,
+    gm: DMatrix<f64>,
+    wacc: Vec<f64>,
+}
+
+impl ChunkBuf {
+    fn new(bd: usize, pt: usize, acc_len: usize) -> Self {
+        Self {
+            eta: vec![0.0; bd * PAR_CHUNK],
+            ge: vec![0.0; bd * PAR_CHUNK],
+            gm: DMatrix::zeros(bd, pt),
+            wacc: vec![0.0; acc_len],
+        }
+    }
+}
 
 /// [`joint_loglik_and_grad`], plus (if `ratio` is set) the largest
 /// per-observation gradient norm `‖∇_η ℓ_i‖` over the median one (else 0).
@@ -1853,22 +1901,45 @@ fn joint_eval(
         _ => None,
     };
     let acc_len = sh.as_ref().map_or(0, |s| s.acc_len());
+    // B column-major: column j (the coefficients of design column j) is
+    // contiguous
+    let bs = b.as_slice();
     // Per chunk of observations: eta = B X_cᵀ (bd × m, one contiguous
     // column per observation) and the gradient Σ_i g_i x̃_iᵀ = G X_c, both
-    // as matrix products.
-    let body = |rows: std::ops::Range<usize>| -> ChunkEval {
+    // as matrix products into the chunk's buffers (allocating them per
+    // evaluation, for all n observations at once, cost as much as the
+    // products themselves at d = 3). Returns the chunk's log-likelihood; its
+    // gradient and accumulator are left in `buf`, its squared gradient norms
+    // are appended to `norms` (if `ratio`).
+    let body = |rows: std::ops::Range<usize>, buf: &mut ChunkBuf, norms: &mut Vec<f64>| -> f64 {
         let m = rows.len();
-        // row-major m × pt block of the design = column-major pt × m (X_cᵀ)
-        let xt = nalgebra::DMatrixView::from_slice(&data.x[rows.start * pt..rows.end * pt], pt, m);
-        let eta = b * xt;
-        let mut ge = DMatrix::<f64>::zeros(bd, m);
+        // the row-major m × pt block of the design is X_cᵀ (pt × m,
+        // column-major) and, with strides (pt, 1), X_c (m × pt)
+        let blk = &data.x[rows.start * pt..rows.end * pt];
+        let xt = nalgebra::DMatrixView::from_slice(blk, pt, m);
+        let xc = nalgebra::DMatrixView::from_slice_with_strides(blk, m, pt, pt, 1);
+        let ChunkBuf { eta, ge, gm, wacc } = buf;
+        let (eta, ge) = (&mut eta[..bd * m], &mut ge[..bd * m]);
+        // nalgebra multiplies through `matrixmultiply` only when every
+        // dimension exceeds 5, and column by column otherwise (always at
+        // d = 3, where bd = 5); `small_eta` and `small_grad` do the latter
+        // faster, with the same operations in the same order
+        let small = !(bd > 5 && pt > 5 && m > 5);
+        if small {
+            small_eta(eta, bs, blk, bd, pt);
+        } else {
+            nalgebra::DMatrixViewMut::from_slice(eta, bd, m).gemm(1.0, b, &xt, 0.0);
+        }
+        wacc.fill(0.0);
+        if sh.is_some() {
+            // the shared-shape kernel writes the mu part only
+            ge.fill(0.0);
+        }
         let mut f = 0.0;
-        let mut norms = Vec::with_capacity(if ratio { m } else { 0 });
-        let mut wacc = vec![0.0; acc_len];
         for (r, i) in rows.enumerate() {
             let yi = &data.y[i * d..(i + 1) * d];
-            let gcol = &mut ge.as_mut_slice()[r * bd..(r + 1) * bd];
-            let ei = &eta.as_slice()[r * bd..(r + 1) * bd];
+            let gcol = &mut ge[r * bd..(r + 1) * bd];
+            let ei = &eta[r * bd..(r + 1) * bd];
             f += match (&sh, &data.lt) {
                 (Some(sh), Some(fr)) => crate::logtangent::loglik_lt_grad_shared(
                     fr,
@@ -1876,7 +1947,7 @@ fn joint_eval(
                     &ei[..d],
                     yi,
                     &mut gcol[..d],
-                    &mut wacc,
+                    wacc,
                 ),
                 _ => kernel_grad(data, ei, yi, gcol),
             };
@@ -1884,50 +1955,58 @@ fn joint_eval(
                 norms.push(gcol.iter().map(|v| v * v).sum::<f64>());
             }
         }
-        // bd × pt gradient, returned row-major (k * pt + j)
-        let gm = ge * xt.transpose();
-        let mut g = vec![0.0; bd * pt];
-        for k in 0..bd {
-            for j in 0..pt {
-                g[k * pt + j] = gm[(k, j)];
-            }
+        if small {
+            small_grad(gm.as_mut_slice(), ge, blk, bd, pt);
+        } else {
+            gm.gemm(1.0, &nalgebra::DMatrixView::from_slice(ge, bd, m), &xc, 0.0);
         }
-        (f, g, norms, wacc)
+        f
     };
-    let (f, mut g, mut norms, wacc) = if parallel && data.n >= 2 * PAR_CHUNK {
-        let n_chunks = data.n.div_ceil(PAR_CHUNK);
-        // Chunk results are summed in chunk order (not with rayon's
-        // `reduce`, whose combination tree depends on thread timing), so the
-        // result is bit-for-bit reproducible.
-        let parts: Vec<ChunkEval> = (0..n_chunks)
+    // Fixed chunks summed in chunk order (not with rayon's `reduce`, whose
+    // combination tree depends on thread timing), with or without
+    // `parallel`: the result is bit-for-bit reproducible and does not
+    // depend on the number of threads.
+    let n_chunks = data.n.div_ceil(PAR_CHUNK);
+    let range = |c: usize| c * PAR_CHUNK..((c + 1) * PAR_CHUNK).min(data.n);
+    let mut f = 0.0;
+    let mut g = vec![0.0; bd * pt];
+    let mut norms = Vec::with_capacity(if ratio { data.n } else { 0 });
+    let mut wacc = vec![0.0; acc_len];
+    let mut add = |fc: f64, buf: &ChunkBuf| {
+        f += fc;
+        for (a, b) in g.iter_mut().zip(buf.gm.as_slice()) {
+            *a += b;
+        }
+        for (a, b) in wacc.iter_mut().zip(&buf.wacc) {
+            *a += b;
+        }
+    };
+    if parallel && data.n >= 2 * PAR_CHUNK {
+        let parts: Vec<(f64, ChunkBuf, Vec<f64>)> = (0..n_chunks)
             .into_par_iter()
-            .map(|c| body(c * PAR_CHUNK..((c + 1) * PAR_CHUNK).min(data.n)))
+            .map(|c| {
+                let mut buf = ChunkBuf::new(bd, pt, acc_len);
+                let mut nc = Vec::with_capacity(if ratio { PAR_CHUNK } else { 0 });
+                let fc = body(range(c), &mut buf, &mut nc);
+                (fc, buf, nc)
+            })
             .collect();
-        let mut f = 0.0;
-        let mut g = vec![0.0; bd * pt];
-        let mut norms = Vec::with_capacity(if ratio { data.n } else { 0 });
-        let mut wacc = vec![0.0; acc_len];
-        for (fc, gc, nc, wc) in parts {
-            f += fc;
-            for (a, b) in g.iter_mut().zip(&gc) {
-                *a += b;
-            }
+        for (fc, buf, nc) in parts {
+            add(fc, &buf);
             norms.extend(nc);
-            for (a, b) in wacc.iter_mut().zip(&wc) {
-                *a += b;
-            }
         }
-        (f, g, norms, wacc)
     } else {
-        body(0..data.n)
-    };
+        let mut buf = ChunkBuf::new(bd, pt, acc_len);
+        for c in 0..n_chunks {
+            let fc = body(range(c), &mut buf, &mut norms);
+            add(fc, &buf);
+        }
+    }
     if let Some(sh) = &sh {
         // the shape rows of the intercept column (all others are fixed)
         let mut gs = vec![0.0; bd - d];
         sh.shape_gradient(&wacc, &mut gs);
-        for (k, v) in gs.iter().enumerate() {
-            g[(d + k) * pt] = *v;
-        }
+        g[d..bd].copy_from_slice(&gs);
     }
     let r = if ratio && !norms.is_empty() {
         let max = norms.iter().fold(0.0f64, |m, &v| m.max(v));
@@ -1938,7 +2017,93 @@ fn joint_eval(
     } else {
         0.0
     };
-    (f, DMatrix::from_row_slice(bd, pt, &g), r)
+    (f, DMatrix::from_column_slice(bd, pt, &g), r)
+}
+
+/// `η = B X_cᵀ` for one chunk (`eta`: `bd × m` column-major, `bs`: `B`
+/// column-major, `blk`: the chunk's row-major `m × pt` design block), in the
+/// order of nalgebra's column-by-column product for small shapes:
+/// `η_kr = B_k0 x_r0`, then `η_kr = B_kj x_rj + η_kr` for `j = 1..pt`
+/// (bit-identical to it, and 2.2× faster at d = 3 with 5 covariates).
+fn small_eta(eta: &mut [f64], bs: &[f64], blk: &[f64], bd: usize, pt: usize) {
+    match bd {
+        5 => small_eta_fixed::<5>(eta, bs, blk, pt),
+        9 => small_eta_fixed::<9>(eta, bs, blk, pt),
+        14 => small_eta_fixed::<14>(eta, bs, blk, pt),
+        20 => small_eta_fixed::<20>(eta, bs, blk, pt),
+        27 => small_eta_fixed::<27>(eta, bs, blk, pt),
+        35 => small_eta_fixed::<35>(eta, bs, blk, pt),
+        _ => {
+            for (out, xr) in eta.chunks_exact_mut(bd).zip(blk.chunks_exact(pt)) {
+                for (o, &v) in out.iter_mut().zip(&bs[..bd]) {
+                    *o = v * xr[0];
+                }
+                for (j, &xj) in xr.iter().enumerate().skip(1) {
+                    for (o, &v) in out.iter_mut().zip(&bs[j * bd..(j + 1) * bd]) {
+                        *o += v * xj;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn small_eta_fixed<const BD: usize>(eta: &mut [f64], bs: &[f64], blk: &[f64], pt: usize) {
+    for (out, xr) in eta.chunks_exact_mut(BD).zip(blk.chunks_exact(pt)) {
+        let mut acc: [f64; BD] = core::array::from_fn(|k| bs[k] * xr[0]);
+        for (j, &xj) in xr.iter().enumerate().skip(1) {
+            let col = &bs[j * BD..(j + 1) * BD];
+            for k in 0..BD {
+                acc[k] += col[k] * xj;
+            }
+        }
+        out.copy_from_slice(&acc);
+    }
+}
+
+/// The chunk's gradient `G = Σ_r ∇_η ℓ_r x̃_rᵀ` (`gm`: `bd × pt`
+/// column-major, `ge`: `bd × m` column-major), in the order of nalgebra's
+/// column-by-column product for small shapes: `G_kj = ge_k0 x_0j`, then
+/// `G_kj = ge_kr x_rj + G_kj` for `r = 1..m` (bit-identical to it).
+fn small_grad(gm: &mut [f64], ge: &[f64], blk: &[f64], bd: usize, pt: usize) {
+    match bd {
+        5 => small_grad_fixed::<5>(gm, ge, blk, pt),
+        9 => small_grad_fixed::<9>(gm, ge, blk, pt),
+        14 => small_grad_fixed::<14>(gm, ge, blk, pt),
+        20 => small_grad_fixed::<20>(gm, ge, blk, pt),
+        27 => small_grad_fixed::<27>(gm, ge, blk, pt),
+        35 => small_grad_fixed::<35>(gm, ge, blk, pt),
+        _ => {
+            for j in 0..pt {
+                for (o, &g) in gm[j * bd..(j + 1) * bd].iter_mut().zip(&ge[..bd]) {
+                    *o = g * blk[j];
+                }
+            }
+            for (gr, xr) in ge.chunks_exact(bd).zip(blk.chunks_exact(pt)).skip(1) {
+                for (j, &xj) in xr.iter().enumerate() {
+                    for (o, &g) in gm[j * bd..(j + 1) * bd].iter_mut().zip(gr) {
+                        *o += g * xj;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn small_grad_fixed<const BD: usize>(gm: &mut [f64], ge: &[f64], blk: &[f64], pt: usize) {
+    for (j, out) in gm.chunks_exact_mut(BD).enumerate().take(pt) {
+        let x0 = blk[j];
+        let mut acc: [f64; BD] = core::array::from_fn(|k| ge[k] * x0);
+        for (gr, xr) in ge.chunks_exact(BD).zip(blk.chunks_exact(pt)).skip(1) {
+            let xj = xr[j];
+            for k in 0..BD {
+                acc[k] += gr[k] * xj;
+            }
+        }
+        out.copy_from_slice(&acc);
+    }
 }
 
 /// Per-observation log-density and gradient in `eta` for the data's shape
@@ -1952,19 +2117,43 @@ fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> 
     }
 }
 
-/// Per-observation value, gradient and Hessian in `eta`. For γ the exact
-/// Hessian of [`crate::adjoint_hess`]: 0.09, 0.22, 0.42 and 2.1 µs at
-/// d = 3, 4, 5 and 8, against 0.25 µs for hyper-dual numbers at d = 3 and
-/// 1.5, 2.7 and 11 µs for the central differences of the gradient used
-/// before for d ≥ 4.
+/// How [`joint_loglik_grad_hess`] computes the per-observation Hessians of
+/// γ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObsHessian {
+    /// Exact ([`crate::adjoint_hess`]): 0.09, 0.22, 0.42 and 2.1 µs per
+    /// observation at d = 3, 4, 5 and 8.
+    Exact,
+    /// Central differences of the exact gradient for `d ≥ 4` (the exact
+    /// Hessian at d = 3): 1.5, 2.7 and 11 µs at d = 4, 5 and 8. They are
+    /// what fits used before the exact Hessian existed, and `finalize` keeps
+    /// them for fits that did not converge: such fits stop next to kinks
+    /// of γ, where differences over a small step (which average over the
+    /// kink) give the polishing Newton steps a better model than the
+    /// pointwise Hessian (measured on unconverged d = 4 and 5 fits).
+    Differences,
+}
+
+/// Per-observation value, gradient and Hessian in `eta` for the data's
+/// shape parameterization.
 #[inline]
-fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
+fn obs_hessian(
+    data: &RegressionData,
+    kind: ObsHessian,
+    eta: &[f64],
+    y: &[f64],
+    g: &mut [f64],
+    h: &mut [f64],
+) -> f64 {
     if let Some(fr) = &data.lt {
         // exact (one eigen-decomposition; ~2.7× the gradient at d = 8)
         return crate::logtangent::loglik_lt_hess(fr, eta, y, g, h);
     }
     if let Some(fr) = &data.gt {
         return crate::gamma_transported::loglik_gt_hess_fd(fr, eta, y, g, h);
+    }
+    if kind == ObsHessian::Differences && data.d >= 4 {
+        return crate::hdual::loglik_eta_hess_fd(eta, y, g, h);
     }
     crate::adjoint_hess::loglik_hess_adjoint(eta, y, g, h)
 }
@@ -1976,6 +2165,16 @@ pub(crate) fn joint_loglik_grad_hess(
     data: &RegressionData,
     b: &DMatrix<f64>,
     parallel: bool,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    joint_loglik_grad_hess_with(data, b, parallel, ObsHessian::Exact)
+}
+
+/// [`joint_loglik_grad_hess`] with the per-observation Hessians of `kind`.
+pub(crate) fn joint_loglik_grad_hess_with(
+    data: &RegressionData,
+    b: &DMatrix<f64>,
+    parallel: bool,
+    kind: ObsHessian,
 ) -> (f64, Vec<f64>, Vec<f64>) {
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     let full = bd * pt;
@@ -2015,7 +2214,7 @@ pub(crate) fn joint_loglik_grad_hess(
                     .map(|(a, c)| a * c)
                     .sum();
             }
-            f += obs_hessian(data, &eta, yi, &mut ge, &mut he);
+            f += obs_hessian(data, kind, &eta, yi, &mut ge, &mut he);
             for j in 0..pt {
                 for k in 0..bd {
                     g[j * bd + k] += ge[k] * xi[j];
@@ -2395,23 +2594,31 @@ impl EsagRegressorFit {
         x: &DMatrix<f64>,
         rng: &mut R,
     ) -> Result<DMatrix<f64>> {
+        Ok(sample_with(&self.response_samplers(x)?, self.d, rng))
+    }
+
+    /// The per-observation samplers of [`EsagRegressorFit::sample_responses`]
+    /// at the rows of `x`, for procedures that draw many response sets from
+    /// one fit: [`sample_with`] then draws exactly what `sample_responses`
+    /// would, without rebuilding `n` frames per draw (0.26 ms per bootstrap
+    /// replicate at d = 3, n = 2000, 12% of a score-test replicate).
+    pub(crate) fn response_samplers(
+        &self,
+        x: &DMatrix<f64>,
+    ) -> Result<Vec<crate::distribution::Sampler>> {
         let eta = self.linear_predictor(x)?;
         let lt = self.lt_frame();
         let d = self.d;
-        let mut out = DMatrix::zeros(x.nrows(), d);
-        let mut buf = vec![0.0; d];
         let mut row = vec![0.0; eta.ncols()];
-        for i in 0..x.nrows() {
-            for (k, r) in row.iter_mut().enumerate() {
-                *r = eta[(i, k)];
-            }
-            let frame = self.frame_at(&row, lt.as_ref());
-            crate::distribution::Sampler::from_frame(&row[..d], &frame).sample_into(rng, &mut buf);
-            for k in 0..d {
-                out[(i, k)] = buf[k];
-            }
-        }
-        Ok(out)
+        Ok((0..x.nrows())
+            .map(|i| {
+                for (k, r) in row.iter_mut().enumerate() {
+                    *r = eta[(i, k)];
+                }
+                let frame = self.frame_at(&row, lt.as_ref());
+                crate::distribution::Sampler::from_frame(&row[..d], &frame)
+            })
+            .collect())
     }
 
     /// Standard errors of the coefficients (`b_dim × p_total`; `NaN` for
@@ -2662,6 +2869,24 @@ impl EsagRegressorFit {
     }
 }
 
+/// One response set (one row per sampler, `d` columns) from the samplers
+/// of [`EsagRegressorFit::response_samplers`].
+pub(crate) fn sample_with<R: Rng + ?Sized>(
+    samplers: &[crate::distribution::Sampler],
+    d: usize,
+    rng: &mut R,
+) -> DMatrix<f64> {
+    let mut out = DMatrix::zeros(samplers.len(), d);
+    let mut buf = vec![0.0; d];
+    for (i, s) in samplers.iter().enumerate() {
+        s.sample_into(rng, &mut buf);
+        for k in 0..d {
+            out[(i, k)] = buf[k];
+        }
+    }
+    out
+}
+
 /// Canonicalise the sign of the first `gamma` group.
 ///
 /// Negating `(gamma_1, gamma_2)` shifts `theta_1` by π, which negates the
@@ -2826,6 +3051,20 @@ mod kernel_timing {
 /// Where a full fit spends its time when both `μ` and `V` depend on `x`.
 #[cfg(test)]
 pub(crate) mod fit_profile;
+
+/// Median over `reps` runs of `f`, in µs (for the studies).
+#[cfg(test)]
+fn fit_profile_median_us(reps: usize, mut f: impl FnMut()) -> f64 {
+    let mut t: Vec<f64> = (0..reps)
+        .map(|_| {
+            let s = std::time::Instant::now();
+            f();
+            s.elapsed().as_secs_f64() * 1e6
+        })
+        .collect();
+    t.sort_by(f64::total_cmp);
+    t[reps / 2]
+}
 
 /// Single-core cost of γ fits.
 #[cfg(test)]

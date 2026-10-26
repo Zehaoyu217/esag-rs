@@ -94,12 +94,14 @@ pub fn bootstrap_gof(
     let mut rng = crate::stream_rng(seed, crate::streams::GOF, 0);
     let (d_obs, p_obs) = ks_stat(fit, x, y, method, &mut rng)?;
     let cfg = refit_config(fit);
+    // every replicate draws from the fit at the same x
+    let samplers = fit.response_samplers(x)?;
 
     let boot: Vec<Option<f64>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
             let mut rng = crate::stream_rng(seed, crate::streams::GOF, 1 + b as u64);
-            let yb = fit.sample_responses(x, &mut rng).ok()?;
+            let yb = crate::regression::sample_with(&samplers, fit.d, &mut rng);
             let refit = cfg.fit_warm(x, &yb, &fit.coef).ok()?;
             ks_stat(&refit, x, &yb, method, &mut rng)
                 .ok()

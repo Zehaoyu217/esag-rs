@@ -599,10 +599,12 @@ Where the speed comes from:
   converges caps the others, starts far behind the leader or crawling
   against a cliff of the γ parameterization are stopped, and the highest
   likelihood wins.
-* **Cheap standard errors.** The observed information is exact at d = 3 (and
-  for the log-tangent shape in every d) and uses differences of the exact
-  gradient for γ at d ≥ 4. It is assembled with one matrix product per chunk,
-  and with SEs requested L-BFGS hands over to Newton steps that reuse it.
+* **Cheap standard errors.** The observed information is exact in every d:
+  for γ from the adjoint's forward pass and reverse sweep plus one sweep of
+  tangents in the rotation angles (3, 7 and 16 gradients at d = 3, 5 and 8,
+  n = 2,000), for the log-tangent shape from one eigen-decomposition. It is
+  assembled with one matrix product per chunk, and with SEs requested
+  L-BFGS hands over to Newton steps that reuse it.
 * **Exact moments and preconditioned refits.** The `M` statistic's moments
   come from a 1-D integral instead of 1000 draws per observation; bootstrap
   refits run in coordinates whitened by the original fit's observed

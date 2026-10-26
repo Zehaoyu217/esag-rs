@@ -469,11 +469,13 @@ fn run_test(
         f64::NAN
     };
 
+    // every replicate draws from the restricted fit at the same x
+    let samplers = fit0.response_samplers(x)?;
     let boot: Vec<Option<Replicate>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
             let mut rng = crate::stream_rng(seed, crate::streams::TEST_BOOT, b as u64);
-            let yb = fit0.sample_responses(x, &mut rng).ok()?;
+            let yb = crate::regression::sample_with(&samplers, fit0.d, &mut rng);
             let f0 = cfg0.fit_warm(x, &yb, &fit0.coef).ok()?;
             let (r, dd, l, ok_a) = if full_refits {
                 // full-model start: the restricted refit with the extra coefficients

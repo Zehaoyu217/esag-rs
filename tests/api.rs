@@ -221,3 +221,64 @@ fn covariance_estimates_with_bootstrap_intervals() {
         assert!(s.contains("ESAG Covariance Estimate V(x)") && s.contains("lambda[2]"));
     }
 }
+
+/// Fits, their standard errors and their iteration counts are bit-for-bit
+/// the same with and without `parallel` (the evaluations sum fixed chunks of
+/// observations in order either way), at d = 3 and d = 4.
+#[test]
+fn fits_do_not_depend_on_parallel() {
+    for d in [3usize, 4] {
+        let bd = esag::dims::eta_len(d);
+        let mut rng = ChaCha8Rng::seed_from_u64(20 + d as u64);
+        let n = 700;
+        let x = DMatrix::from_fn(n, 2, |_, _| {
+            let z: f64 = StandardNormal.sample(&mut rng);
+            z
+        });
+        let b = DMatrix::from_fn(bd, 3, |k, j| {
+            let s = (k * 5 + j * 3) as f64;
+            if j == 0 {
+                if k < d {
+                    1.5 + 0.5 * s.sin()
+                } else {
+                    0.6 * s.cos()
+                }
+            } else {
+                0.3 * (s * 0.7).sin()
+            }
+        });
+        let mut y = DMatrix::zeros(n, d);
+        let mut buf = vec![0.0; d];
+        for i in 0..n {
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| b[(k, 0)] + b[(k, 1)] * x[(i, 0)] + b[(k, 2)] * x[(i, 1)])
+                .collect();
+            let dist = Esag::from_eta(&eta).unwrap();
+            dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+            for k in 0..d {
+                y[(i, k)] = buf[k];
+            }
+        }
+        let seq = EsagRegressor::new()
+            .with_parallel(false)
+            .fit(&x, &y)
+            .unwrap();
+        let par = EsagRegressor::new()
+            .with_parallel(true)
+            .fit(&x, &y)
+            .unwrap();
+        assert_eq!(
+            seq.log_likelihood.to_bits(),
+            par.log_likelihood.to_bits(),
+            "d={d}"
+        );
+        assert_eq!(seq.n_iter, par.n_iter, "d={d}");
+        let bits = |m: &DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&seq.coef), bits(&par.coef), "d={d}");
+        assert_eq!(
+            bits(&seq.std_errors().unwrap()),
+            bits(&par.std_errors().unwrap()),
+            "d={d}"
+        );
+    }
+}
