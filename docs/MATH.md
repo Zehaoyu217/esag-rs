@@ -224,6 +224,25 @@ and for odd `j ≥ 3` it needs a parallelizable sphere, so `j ∈ {3, 7}`
 Only a parameterization that does not split `V` into gaps and directions
 avoids them, which is what the log-tangent shape does.
 
+**A refined γ (`src/gamma_smooth.rs`, an experiment).** It keeps γ's
+coordinates, its eigenvalue ratios `K_j = 1 + ‖G_j‖` and the eigenvector
+each group places, which is continuous: `v_j = (1/‖G_j‖) Σ_k (−1)^k
+G_{j,k} e_{j−k}`, the image of `e_j` under the group's plane rotations. It
+replaces only the completion of the lower eigenvectors, by the minimal
+rotation from a reference `c_j`, singular at `v_j = −c_j` alone, and the
+frame `onb(μ)` by the transported frame. Its fits converge where γ's are
+trapped (8 of 8 against 0 of 8, hard scenario, `d = 5`). But:
+
+* they take 150–1600 iterations at `d = 8` and on the hard scenario,
+  because the eigenvector directions there sweep nearly the whole sphere
+  and reach `−c_j` and the zero groups;
+* it is a different regression model, and on γ's own data it recovers
+  `V(x)` no better than γ (`V̂` error 0.35 against 0.25 on the standard
+  scenario at `d = 5`, 0.32 against 0.32 on the hard one).
+
+So it is not wired into the regression; the module's documentation has
+the numbers.
+
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
 mean direction, cannot move that set away from the data. With the mean

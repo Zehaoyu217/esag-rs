@@ -1621,3 +1621,408 @@ fn gamma_exclusion_rounds() {
         t1[t1.len() / 2]
     );
 }
+
+/// The γ-smooth frame of a truth `b`: `m` = `center(d)`, and each group's
+/// reference at the intercept's own direction, so the intercept sits at
+/// `Q_j = B_j`.
+fn gs_truth_frame(b: &DMatrix<f64>, d: usize) -> crate::gamma_smooth::GsFrame {
+    let refs = (2..=d - 2)
+        .map(|gr| {
+            let off = d + gr * (gr + 1) / 2 - 1;
+            (0..=gr)
+                .map(|i| {
+                    let k = gr - i;
+                    let s = if k % 2 == 0 { 1.0 } else { -1.0 };
+                    s * b[(off + k, 0)]
+                })
+                .collect()
+        })
+        .collect();
+    crate::gamma_smooth::GsFrame::new(&center(d), refs)
+}
+
+/// `n` draws from the γ-smooth regression with coefficients `b` in frame
+/// `fr` (equicorrelated covariates, ρ = 0.5).
+fn simulate_gs(
+    b: &DMatrix<f64>,
+    n: usize,
+    seed: u64,
+    fr: &crate::gamma_smooth::GsFrame,
+) -> (DMatrix<f64>, DMatrix<f64>) {
+    let (x, _) = simulate(b, n, seed, Shape::Gamma);
+    let d = fr.dim();
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9e37);
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let eta: Vec<f64> = (0..b.nrows())
+            .map(|k| {
+                b[(k, 0)]
+                    + (0..b.ncols() - 1)
+                        .map(|j| b[(k, j + 1)] * x[(i, j)])
+                        .sum::<f64>()
+            })
+            .collect();
+        let v = fr.covariance(&eta[..d], &eta[d..]);
+        let dist = Esag::from_covariance(&eta[..d], &v).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    (x, y)
+}
+
+/// A plain γ-smooth regression fit: L-BFGS on the joint negative
+/// log-likelihood (forward-mode gradients), from the moment intercept
+/// written in frame `fr`, slopes zero. Returns (coef, converged, iters,
+/// evaluations, max|g|).
+fn fit_gs(
+    fr: &crate::gamma_smooth::GsFrame,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+) -> (DMatrix<f64>, bool, usize, usize, f64) {
+    use crate::gamma_smooth::loglik_gs_grad;
+    use crate::optim::lbfgs::{FnObjective, LbfgsConfig, minimize};
+    let (n, d, p) = (y.nrows(), y.ncols(), x.ncols());
+    let (bd, pt) = (dims::eta_len(d), p + 1);
+    let yv: Vec<f64> = (0..n)
+        .flat_map(|i| (0..d).map(move |k| (i, k)))
+        .map(|(i, k)| y[(i, k)])
+        .collect();
+    let (mu0, g0) = moment_start(&yv, n, d);
+    let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+    let gs0 = fr.gamma_from_covariance(&mu0, &v0);
+    let mut start = vec![0.0; bd * pt];
+    start[..d].copy_from_slice(&mu0);
+    start[d..d + gs0.len()].copy_from_slice(&gs0);
+    // optional whitening by the score information at the start (WHITEN=1)
+    let nk = bd * pt;
+    let lmat: Option<DMatrix<f64>> = std::env::var("WHITEN").is_ok().then(|| {
+        let mut info = DMatrix::<f64>::zeros(nk, nk);
+        let (mut eta, mut g) = (vec![0.0; bd], vec![0.0; bd]);
+        let mut s = vec![0.0; nk];
+        for i in 0..n {
+            let xr = |j: usize| if j == 0 { 1.0 } else { x[(i, j - 1)] };
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| start[j * bd + k] * xr(j)).sum();
+            }
+            loglik_gs_grad(fr, &eta, &yv[i * d..(i + 1) * d], &mut g);
+            for j in 0..pt {
+                for k in 0..bd {
+                    s[j * bd + k] = g[k] * xr(j);
+                }
+            }
+            for a in 0..nk {
+                for c in 0..nk {
+                    info[(a, c)] += s[a] * s[c];
+                }
+            }
+        }
+        // b = start + L⁻ᵀ θ with L Lᵀ = info
+        let l = info.cholesky().unwrap().l();
+        l.transpose().try_inverse().unwrap()
+    });
+    let to_b = |th: &[f64]| -> Vec<f64> {
+        match &lmat {
+            None => th.to_vec(),
+            Some(m) => {
+                let t = nalgebra::DVector::from_column_slice(th);
+                let v = m * t;
+                (0..nk).map(|a| start[a] + v[a]).collect()
+            }
+        }
+    };
+    let obj = FnObjective(|th_in: &[f64], grad_out: &mut [f64]| {
+        let th = to_b(th_in);
+        let mut grad = vec![0.0; nk];
+        let (mut eta, mut g) = (vec![0.0; bd], vec![0.0; bd]);
+        let mut f = 0.0;
+        for i in 0..n {
+            let xr = |j: usize| if j == 0 { 1.0 } else { x[(i, j - 1)] };
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| th[j * bd + k] * xr(j)).sum();
+            }
+            f -= loglik_gs_grad(fr, &eta, &yv[i * d..(i + 1) * d], &mut g);
+            for j in 0..pt {
+                let w = xr(j);
+                for k in 0..bd {
+                    grad[j * bd + k] -= g[k] * w;
+                }
+            }
+        }
+        match &lmat {
+            None => grad_out.copy_from_slice(&grad),
+            Some(m) => {
+                let gv = m.transpose() * nalgebra::DVector::from_column_slice(&grad);
+                grad_out.copy_from_slice(gv.as_slice());
+            }
+        }
+        f
+    });
+    let x0 = if lmat.is_some() {
+        vec![0.0; nk]
+    } else {
+        start.clone()
+    };
+    let cfg = LbfgsConfig {
+        memory: (bd * pt).clamp(10, 200),
+        max_iter: 2000,
+        max_fev: 40_000,
+        tol_grad: 1e-6,
+        ..LbfgsConfig::default()
+    };
+    let res = minimize(&obj, &x0, &cfg);
+    if std::env::var("TRACE").is_ok() {
+        let mut g = vec![0.0; nk];
+        let ftruth = std::env::var("TRUTH_LL")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        let _ = &mut g;
+        println!(
+            "    status {:?}  iters {}  fev {}  -ll {:.3}{}",
+            res.status,
+            res.n_iter,
+            res.n_fev,
+            res.f,
+            ftruth
+                .map(|t| format!("  truth -ll {t:.3}"))
+                .unwrap_or_default()
+        );
+    }
+    let coef = DMatrix::from_column_slice(bd, pt, &to_b(&res.x));
+    if std::env::var("TRACE").is_ok() {
+        // per-observation gradient norms and smallest group norms (j >= 2)
+        let mut rows: Vec<(f64, f64, f64)> = (0..n)
+            .map(|i| {
+                let xr = |j: usize| if j == 0 { 1.0 } else { x[(i, j - 1)] };
+                let eta: Vec<f64> = (0..bd)
+                    .map(|k| (0..pt).map(|j| coef[(k, j)] * xr(j)).sum())
+                    .collect();
+                let mut g = vec![0.0; bd];
+                loglik_gs_grad(fr, &eta, &yv[i * d..(i + 1) * d], &mut g);
+                let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let mut gmin = f64::INFINITY;
+                let mut amin = f64::INFINITY;
+                for gr in 2..=d - 2 {
+                    let off = d + gr * (gr + 1) / 2 - 1;
+                    let gv = &eta[off..off + gr + 1];
+                    let nrm = gv.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    gmin = gmin.min(nrm);
+                    // distance of v_j to the antipode -c_j: 1 + v·c
+                    let c = &fr.refs()[gr - 2];
+                    let vc: f64 = (0..=gr)
+                        .map(|ii| {
+                            let k = gr - ii;
+                            let sg = if k % 2 == 0 { 1.0 } else { -1.0 };
+                            sg * gv[k] / nrm * c[ii]
+                        })
+                        .sum();
+                    amin = amin.min(1.0 + vc);
+                }
+                (gn, gmin, amin)
+            })
+            .collect();
+        let mut gns: Vec<f64> = rows.iter().map(|r| r.0).collect();
+        gns.sort_by(f64::total_cmp);
+        let med = gns[n / 2];
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let top: Vec<String> = rows
+            .iter()
+            .take(4)
+            .map(|r| {
+                format!(
+                    "|g| {:.0}x med, min group {:.1e}, antipode {:.2}",
+                    r.0 / med,
+                    r.1,
+                    r.2
+                )
+            })
+            .collect();
+        let gmin_all = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
+        let amin_all = rows.iter().map(|r| r.2).fold(f64::INFINITY, f64::min);
+        println!(
+            "    top gradients: {}; overall min group {gmin_all:.1e}, min antipode {amin_all:.2}",
+            top.join(" | ")
+        );
+    }
+    (
+        coef,
+        res.status.is_converged(),
+        res.n_iter,
+        res.n_fev,
+        res.grad_norm_inf,
+    )
+}
+
+/// Does γ-smooth remove the traps? Hard scenario (env `D`, `N`, `R`), data
+/// from γ-smooth (in the truth's frame) or from γ (`DATA=gamma`); γ-smooth
+/// fits in the truth's frame (`FRAME=truth`) or in a frame referenced at
+/// the moment start (default), against γ fits. Convergence, iterations,
+/// time and `V̂(x)` error on 200 fresh points.
+/// `cargo test --release --lib gamma_smooth_fits -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_smooth_fits() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let gamma_data = std::env::var("DATA").as_deref() == Ok("gamma");
+    let truth_frame = std::env::var("FRAME").as_deref() == Ok("truth");
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let tf = gs_truth_frame(&b, d);
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| {
+            let e = eta(&b, i);
+            if gamma_data {
+                Esag::from_eta(&e).unwrap().covariance()
+            } else {
+                tf.covariance(&e[..d], &e[d..])
+            }
+        })
+        .collect();
+    let rows: Vec<(bool, usize, f64, f64, bool, f64, f64)> = (800..800 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = if gamma_data {
+                simulate(&b, n, seed, Shape::Gamma)
+            } else {
+                simulate_gs(&b, n, seed, &tf)
+            };
+            let fr = if truth_frame {
+                tf.clone()
+            } else {
+                let yv: Vec<f64> = (0..n)
+                    .flat_map(|i| (0..d).map(move |k| (i, k)))
+                    .map(|(i, k)| y[(i, k)])
+                    .collect();
+                let (mu0, g0) = moment_start(&yv, n, d);
+                let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+                crate::gamma_smooth::GsFrame::self_referenced(&mu0, &v0).0
+            };
+            if std::env::var("TRACE").is_ok() {
+                let tll: f64 = (0..n)
+                    .map(|i| {
+                        let e: Vec<f64> = (0..bd)
+                            .map(|k| {
+                                b[(k, 0)]
+                                    + (0..pt - 1).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>()
+                            })
+                            .collect();
+                        let yi: Vec<f64> = (0..d).map(|k| y[(i, k)]).collect();
+                        if gamma_data {
+                            crate::loglik::loglik_eta::<f64>(&e, &yi)
+                        } else {
+                            crate::gamma_smooth::loglik_gs::<f64>(&tf, &e, &yi)
+                        }
+                    })
+                    .sum();
+                println!("  seed {seed}: truth -ll {:.3}", -tll);
+            }
+            let t = Instant::now();
+            let (c, conv, it, _fev, _gmax) = fit_gs(&fr, &x, &y);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let verr = (0..200)
+                .map(|i| {
+                    let e = eta(&c, i);
+                    geodesic(&vtrue[i], &fr.covariance(&e[..d], &e[d..]))
+                })
+                .sum::<f64>()
+                / 200.0;
+            // the γ fit on the same data, for reference
+            let t = Instant::now();
+            let g = config(d, Shape::Gamma).fit(&x, &y).unwrap();
+            let gms = t.elapsed().as_secs_f64() * 1e3;
+            let gerr = (0..200)
+                .map(|i| {
+                    geodesic(
+                        &vtrue[i],
+                        &Esag::from_eta(&eta(&g.coef, i)).unwrap().covariance(),
+                    )
+                })
+                .sum::<f64>()
+                / 200.0;
+            (conv, it, ms, verr, g.converged, gms, gerr)
+        })
+        .collect();
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    println!(
+        "d={d} n={n} {} data, {} frame, {reps} datasets:",
+        if gamma_data { "gamma" } else { "gamma-smooth" },
+        if truth_frame {
+            "truth's"
+        } else {
+            "moment-referenced"
+        }
+    );
+    println!(
+        "  gamma-smooth: converged {}/{reps}, iterations {:?}, median {:.0} ms (forward-mode gradient), V error {:.3}",
+        rows.iter().filter(|r| r.0).count(),
+        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        med(rows.iter().map(|r| r.2).collect()),
+        med(rows.iter().map(|r| r.3).collect())
+    );
+    println!(
+        "  gamma:        converged {}/{reps}, median {:.0} ms, V error {:.3}",
+        rows.iter().filter(|r| r.4).count(),
+        med(rows.iter().map(|r| r.5).collect()),
+        med(rows.iter().map(|r| r.6).collect())
+    );
+}
+
+/// How close do the hard truth's γ groups come to zero (near-equal
+/// eigenvalues) over the data? Per group: smallest `‖G_j(x_i)‖`, its
+/// median, and the share of observations below 0.05 and 0.1.
+/// `cargo test --release --lib group_norm_reach -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn group_norm_reach() {
+    for d in [4usize, 5, 8] {
+        let b = hard_truth(d);
+        let (x, _) = simulate(&b, 20000, 5, Shape::Gamma);
+        for gr in 1..=d - 2 {
+            let off = d + gr * (gr + 1) / 2 - 1;
+            let mut norms: Vec<f64> = (0..x.nrows())
+                .map(|i| {
+                    (0..=gr)
+                        .map(|k| {
+                            let r = off + k;
+                            (b[(r, 0)] + (0..5).map(|j| b[(r, j + 1)] * x[(i, j)]).sum::<f64>())
+                                .powi(2)
+                        })
+                        .sum::<f64>()
+                        .sqrt()
+                })
+                .collect();
+            norms.sort_by(f64::total_cmp);
+            let below =
+                |t: f64| norms.iter().filter(|&&v| v < t).count() as f64 / norms.len() as f64;
+            println!(
+                "d={d} group {gr}: min ‖G‖ {:.3}, median {:.3}; below 0.05: {:.2}%, below 0.1: {:.2}%",
+                norms[0],
+                norms[norms.len() / 2],
+                100.0 * below(0.05),
+                100.0 * below(0.1)
+            );
+        }
+    }
+}
