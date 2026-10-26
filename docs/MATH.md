@@ -258,6 +258,34 @@ iterations, and exact Newton from the full fit crawled on bootstrap data;
 with a generic mean direction it takes 28 ms (33 iterations). The γ
 regression model is not equivariant under rotations of the response.
 
+`Shape::GammaTransported` (`src/gamma_transported.rs`) writes γ's map in
+the frame transported from a reference direction `m`, the data's mean
+direction by default, instead of `onb(μ)`. Its only singular point is
+`μ̂ = −m`. At `μ̂ = m` the two frames coincide (`E` is `onb(m)`'s tangent
+part), so without covariates the fit is γ's (same log-likelihood and
+covariance, `transported_gamma_without_covariates_is_gamma`). With
+covariates the model differs through how the frame turns as `μ̂(x)` moves.
+The kernel is γ's adjoint with the projections replaced by the log-tangent
+frame's (46 / 93 / 185 against 40 / 89 / 165 ns per observation at
+`d = 3 / 5 / 8`). Production fits on γ data from the hard scenario
+(`gamma_transported_fits`, `n = 2000`, 12 fits):
+
+| mean direction | d | γ (onb) | γ-transported |
+|---|---|---|---|
+| near the pole (√(μ̂₀² + μ̂₁²) = 0.12–0.19) | 3 | 12/12, 92 ms | 12/12, 17 ms |
+| | 4 | 5/12, 577 ms | 10/12, 121 ms |
+| | 5 | 1/12, 985 ms | 7/12, 320 ms |
+| generic (0.60–0.78) | 3 | 12/12, 23 ms | 12/12, 21 ms |
+| | 4 | 11/12, 98 ms | 10/12, 68 ms |
+| | 5 | 5/12, 574 ms | 1/12, 653 ms |
+
+(converged fits, median time). The `V̂(x)` errors are within 0.04 of each
+other; the onb model, which generated the data, is slightly better near
+the pole. So onb stays the default. γ fits whose mean direction at `x = 0`
+has `√(μ̂₀² + μ̂₁²) < 0.3` (about 17° from the pole set) get a summary note
+recommending the transported frame, and Python's `shape="auto"` picks it
+there.
+
 The log-tangent parameterization (§7) describes the same distributions
 without these sets, and its likelihood is smooth: on the same kind of data
 251 of 252 of its fits converge from `n = 200` on (§3).

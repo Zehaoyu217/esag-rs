@@ -113,6 +113,12 @@ weights from the plain penalty's selection.
 `shape="auto"` (default) fits the papers' γ parameterization when d = 3 or
 there are no covariates, and the smooth log-tangent parameterization
 otherwise, and raises an `esag.ShapeWarning` when it makes that switch.
+`shape="gamma-transported"` is the same γ map in the tangent frame
+transported from the data's mean direction instead of `onb(μ)`. It gives
+the γ fit when there are no covariates, and avoids the pole of `onb`
+(`μ_0 = μ_1 = 0`), near which γ fits are 3–5× slower and converge less
+often. `"auto"` picks it, with a warning, where it would pick γ and the
+data's mean direction lies within about 17° of that pole.
 The γ map has a singular set (from d = 4) that makes γ regressions slow and
 gives their likelihood traps: local suprema with an observation on the set,
 where fits stall even when started at the true coefficients
@@ -120,7 +126,7 @@ where fits stall even when started at the true coefficients
 the hard scenario at d = 4, γ fits converge in 16 of 36 cases and take
 0.1–0.15 s; log-tangent fits converge in 36 of 36 and take 1–6 ms. With covariates the
 two are different regression models for the shape (the mean model is the
-same); compare them by AIC/BIC. Pass `shape="gamma"` or
+same); compare them by AIC/BIC. Pass `shape="gamma"`, `"gamma-transported"` or
 `shape="log-tangent"` to choose explicitly.
 
 ### The covariance V(x)
@@ -156,7 +162,7 @@ dist.logpdf(y), dist.covariance, dist.second_moment, dist.mean_direction
 ## Tests and demo
 
 ```sh
-python -m pytest tests            # 23 tests, ~3 s
+python -m pytest tests            # 24 tests, ~3 s
 python examples/demo.py           # fit, five bootstrap tests, five penalties (d = 3)
 python examples/demo.py 5         # the same at d = 5
 ```

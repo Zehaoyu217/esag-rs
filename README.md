@@ -236,8 +236,8 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 179 tests, plus 39 slow studies,
-diagnostics and benchmarks marked `#[ignore]`. The Python package's 23
+All `cargo test --release` suites pass: 190 tests, plus 45 slow studies,
+diagnostics and benchmarks marked `#[ignore]`. The Python package's 24
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced
@@ -668,7 +668,12 @@ continuous. Consequences:
 * **The frame's pole.** `onb(μ)` is singular where `μ_0 = μ_1 = 0`. When
   the data's mean direction is near that set (for example near `e_d`), γ
   fits slow down even at d = 3 (105 vs 28 ms); the γ model is not
-  equivariant under rotations of the response.
+  equivariant under rotations of the response. `Shape::GammaTransported`
+  writes the same γ map in the frame transported from the data's mean
+  direction. Without covariates it is the γ fit; near the pole it is 3–5×
+  faster and converges more often (d = 4: 10 of 12 fits against 5 of 12;
+  `docs/MATH.md` §2). Gamma summaries recommend it there, and Python's
+  `shape="auto"` picks it.
 * **Project 3.** Exact zeros of a group `j ≥ 2` or of a trailing pair sit
   on the set, and both of the paper's simulation truths lie on it (nudging
   them by 1e−9 changes `V` by 4.6 and 0.8–1.0). The penalized module
