@@ -3743,3 +3743,78 @@ fn gamma_big_d_tests() {
         );
     }
 }
+
+/// Trimmed γ fits: when the fit is trapped, set the trapped observations
+/// aside and refit the rest warm, accumulating, until the fit converges
+/// (at most 6 rounds). Converged share, number set aside, `V̂(x)` error
+/// and time against the production fit. Env `D`, `HARD=1`, `R`.
+/// `cargo test --release --lib gamma_trimmed_fits -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_trimmed_fits() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(v);
+    let (d, reps) = (env("D", 5), env("R", 12) as u64);
+    let hard = std::env::var("HARD").is_ok();
+    let b = if hard { hard_truth(d) } else { standard_truth(d, 5) };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> =
+        (0..200).map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance()).collect();
+    let verr = |c: &DMatrix<f64>| {
+        (0..200)
+            .map(|i| geodesic(&vtrue[i], &Esag::from_eta(&eta_at(c, i)).unwrap().covariance()))
+            .sum::<f64>()
+            / 200.0
+    };
+    let rows: Vec<(bool, f64, f64, bool, usize, f64, f64)> = (940..940 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let t = Instant::now();
+            let f = cfg.fit(&x, &y).unwrap();
+            let t0 = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let mut cur = f.clone();
+            let mut out: Vec<usize> = vec![];
+            let mut keep: Vec<usize> = (0..x.nrows()).collect();
+            for _ in 0..6 {
+                if cur.converged || cur.singular_obs.is_empty() {
+                    break;
+                }
+                // singular_obs index the current subset
+                let drop: Vec<usize> = cur.singular_obs.iter().map(|&i| keep[i]).collect();
+                out.extend(drop);
+                out.sort_unstable();
+                out.dedup();
+                keep = (0..x.nrows()).filter(|i| out.binary_search(i).is_err()).collect();
+                let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
+                let ys = DMatrix::from_fn(keep.len(), y.ncols(), |a, j| y[(keep[a], j)]);
+                cur = cfg.fit_warm(&xs, &ys, &cur.coef).unwrap();
+            }
+            let t1 = t.elapsed().as_secs_f64() + t0;
+            (f.converged, verr(&f.coef), t0, cur.converged, out.len(), verr(&cur.coef), t1)
+        })
+        .collect();
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    println!(
+        "d={d} {} n = 2000, {reps} datasets:\n  production: converged {}/{reps}, V error {:.3}, median {:.2} s\n  trimmed:    converged {}/{reps}, observations set aside {:?}, V error {:.3}, median {:.2} s",
+        if hard { "hard" } else { "standard" },
+        rows.iter().filter(|r| r.0).count(),
+        med(rows.iter().map(|r| r.1).collect()),
+        med(rows.iter().map(|r| r.2).collect()),
+        rows.iter().filter(|r| r.3).count(),
+        rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+        med(rows.iter().map(|r| r.5).collect()),
+        med(rows.iter().map(|r| r.6).collect())
+    );
+}
