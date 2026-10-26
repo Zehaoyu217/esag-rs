@@ -1701,6 +1701,18 @@ fn fit_gs(
     x: &DMatrix<f64>,
     y: &DMatrix<f64>,
 ) -> (DMatrix<f64>, bool, usize, usize, f64) {
+    fit_gs_from(fr, x, y, false)
+}
+
+/// [`fit_gs`]; with `gamma_start`, the shape intercept starts at the γ
+/// moment start itself (valid for `γ`'s map in `onb(μ)`, or in the frame
+/// transported from the sample mean direction, where the two coincide).
+fn fit_gs_from(
+    fr: &crate::gamma_smooth::GsFrame,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    gamma_start: bool,
+) -> (DMatrix<f64>, bool, usize, usize, f64) {
     use crate::gamma_smooth::loglik_gs_grad;
     use crate::optim::lbfgs::{FnObjective, LbfgsConfig, minimize};
     let (n, d, p) = (y.nrows(), y.ncols(), x.ncols());
@@ -1710,8 +1722,12 @@ fn fit_gs(
         .map(|(i, k)| y[(i, k)])
         .collect();
     let (mu0, g0) = moment_start(&yv, n, d);
-    let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
-    let gs0 = fr.gamma_from_covariance(&mu0, &v0);
+    let gs0 = if gamma_start {
+        g0.clone()
+    } else {
+        let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+        fr.gamma_from_covariance(&mu0, &v0)
+    };
     let mut start = vec![0.0; bd * pt];
     start[..d].copy_from_slice(&mu0);
     start[d..d + gs0.len()].copy_from_slice(&gs0);
@@ -2077,4 +2093,113 @@ fn rescue_seed_search() {
         })
         .collect();
     println!("n = {n}: rescued seeds {hits:?}");
+}
+
+/// γ's map in `onb(μ)` against the frame transported from the sample mean
+/// direction, with the same optimizer (whitened L-BFGS, forward-mode
+/// gradients), on γ data whose mean direction is generic or near the pole
+/// of `onb` (`POLE=1`); `STD=1` for the standard truth. Env `D`, `N`, `R`.
+/// `cargo test --release --lib gamma_frame_pole -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_frame_pole() {
+    use crate::gamma_smooth::GsFrame;
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 3), env("N", 2000), env("R", 8) as u64);
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+        .collect();
+    let rows: Vec<[(bool, usize, f64, f64); 3]> = (820..820 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let yv: Vec<f64> = (0..n)
+                .flat_map(|i| (0..d).map(move |k| (i, k)))
+                .map(|(i, k)| y[(i, k)])
+                .collect();
+            let (mu0, _) = moment_start(&yv, n, d);
+            let frames = [GsFrame::gamma(d), GsFrame::gamma_transported(&mu0)];
+            let mut out = [(false, 0usize, 0.0, 0.0); 3];
+            for (f, fr) in frames.iter().enumerate() {
+                let t = Instant::now();
+                let (c, conv, it, _, _) = fit_gs_from(fr, &x, &y, true);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let ve = (0..200)
+                    .map(|i| {
+                        let e = eta(&c, i);
+                        geodesic(&vtrue[i], &fr.covariance(&e[..d], &e[d..]))
+                    })
+                    .sum::<f64>()
+                    / 200.0;
+                out[f] = (conv, it, ms, ve);
+            }
+            let t = Instant::now();
+            let g = config(d, Shape::Gamma).fit(&x, &y).unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let ve = (0..200)
+                .map(|i| {
+                    geodesic(
+                        &vtrue[i],
+                        &Esag::from_eta(&eta(&g.coef, i)).unwrap().covariance(),
+                    )
+                })
+                .sum::<f64>()
+                / 200.0;
+            out[2] = (g.converged, g.n_iter, ms, ve);
+            out
+        })
+        .collect();
+    println!(
+        "d={d} n={n} {} truth, mean direction {}:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        },
+        if std::env::var("POLE").is_ok() {
+            "near the onb pole"
+        } else {
+            "generic"
+        }
+    );
+    for (f, name) in [
+        "gamma, onb frame (prototype)",
+        "gamma, transported frame",
+        "gamma, production fit",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut it: Vec<usize> = rows.iter().map(|r| r[f].1).collect();
+        let mut ms: Vec<f64> = rows.iter().map(|r| r[f].2).collect();
+        let mut ve: Vec<f64> = rows.iter().map(|r| r[f].3).collect();
+        it.sort_unstable();
+        ms.sort_by(f64::total_cmp);
+        ve.sort_by(f64::total_cmp);
+        println!(
+            "  {name:<30} converged {}/{reps}, median iterations {}, median {:.0} ms, V error {:.3}",
+            rows.iter().filter(|r| r[f].0).count(),
+            it[it.len() / 2],
+            ms[ms.len() / 2],
+            ve[ve.len() / 2]
+        );
+    }
 }

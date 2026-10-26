@@ -96,6 +96,14 @@ pub struct GsFrame {
     /// `c_j = e_j`, where `B_j = I`).
     bvec: Vec<Vec<f64>>,
     bscale: Vec<f64>,
+    /// Use `onb(μ)` instead of the transported frame (with
+    /// `gamma_completion`, this is exactly `γ`).
+    #[serde(default)]
+    onb_frame: bool,
+    /// Complete groups `j ≥ 2` by `γ`'s own plane rotations instead of the
+    /// reflections (with the transported frame: `γ` in a transported frame).
+    #[serde(default)]
+    gamma_completion: bool,
 }
 
 impl GsFrame {
@@ -137,7 +145,36 @@ impl GsFrame {
             refs: out_refs,
             bvec,
             bscale,
+            onb_frame: false,
+            gamma_completion: false,
         }
+    }
+
+    /// `γ` itself, `ESAG(μ, γ)` with `onb(μ)` and `γ`'s rotations (`m` is
+    /// unused): a reference for the variants.
+    pub fn gamma(d: usize) -> Self {
+        let mut f = Self::standard(d);
+        f.onb_frame = true;
+        f.gamma_completion = true;
+        f
+    }
+
+    /// `γ`'s map in the frame transported from `m` instead of `onb(μ)`. At
+    /// `μ̂ = m` the two frames coincide, so `γ` coordinates fitted there
+    /// carry over.
+    pub fn gamma_transported(m: &[f64]) -> Self {
+        let mut f = Self::new(
+            m,
+            (2..=m.len().saturating_sub(2))
+                .map(|j| {
+                    let mut c = vec![0.0; j + 1];
+                    c[j] = 1.0;
+                    c
+                })
+                .collect(),
+        );
+        f.gamma_completion = true;
+        f
     }
 
     /// `m = e_d` and `c_j = e_j` for every group.
@@ -479,7 +516,11 @@ fn transform<S: Scalar>(
 ) -> (S, S, S) {
     let d = mu.len();
     // k doubles as the projection's scratch; it is filled with the K_j below
-    let out = project(&fr.lt, mu, y, z, k);
+    let out = if fr.onb_frame {
+        project_onb(mu, y, z)
+    } else {
+        project(&fr.lt, mu, y, z, k)
+    };
     for gr in (1..=d - 2).rev() {
         let off = gr * (gr + 1) / 2 - 1;
         let g = &gamma[off..off + gr + 1];
@@ -497,11 +538,83 @@ fn transform<S: Scalar>(
                 z[0] = c * x0 + s * x1;
                 z[1] = c * x1 - s * x0;
             }
+        } else if fr.gamma_completion {
+            gamma_rotations(gr, g, z);
         } else {
             complete_t(fr, gr, g, z);
         }
     }
     out
+}
+
+/// `z ← U_{1..d−1}ᵀ y` for `U = onb(μ)`, as in
+/// [`crate::loglik::quad_form_parts`].
+#[inline(always)]
+fn project_onb<S: Scalar>(mu: &[S], y: &[f64], z: &mut [S]) -> (S, S, S) {
+    let d = mu.len();
+    let n2 = mu[0] * mu[0] + mu[1] * mu[1];
+    z[0] = if n2.re() == 0.0 {
+        S::from_f64(y[0])
+    } else {
+        (mu[0] * y[1] - mu[1] * y[0]) / n2.sqrt()
+    };
+    let mut s = n2;
+    let mut dot = mu[0] * y[0] + mu[1] * y[1];
+    for i0 in 2..d {
+        let mi = mu[i0];
+        z[i0 - 1] = if s.re() == 0.0 {
+            S::from_f64(y[i0 - 1])
+        } else {
+            (mi * dot - s * y[i0]) / (s * (mi * mi + s)).sqrt()
+        };
+        s += mi * mi;
+        dot += mi * y[i0];
+    }
+    let t = if s.re() == 0.0 {
+        S::from_f64(y[d - 1])
+    } else {
+        dot / s.sqrt()
+    };
+    (t, dot, s)
+}
+
+/// `γ`'s plane rotations of group `gr ≥ 2`, as in
+/// [`crate::loglik::quad_form_parts`].
+#[inline(always)]
+fn gamma_rotations<S: Scalar>(gr: usize, g: &[S], z: &mut [S]) {
+    let n = gr + 1;
+    assert!(
+        n <= 16,
+        "gamma rotations implemented for groups up to 16 entries"
+    );
+    let mut rt = [S::zero(); 16];
+    let mut acc = S::zero();
+    for j in (0..n).rev() {
+        acc += g[j] * g[j];
+        rt[j] = acc.sqrt();
+    }
+    let rot = |z: &mut [S], a: usize, c: S, s: S| {
+        let (x, y) = (z[a], z[a + 1]);
+        z[a] = c * x + s * y;
+        z[a + 1] = c * y - s * x;
+    };
+    let (c, s) = if rt[n - 2].re() == 0.0 {
+        (S::one(), S::zero())
+    } else {
+        let inv = S::one() / rt[n - 2];
+        (g[n - 2] * inv, g[n - 1] * inv)
+    };
+    rot(z, 0, c, s);
+    for j in 1..gr {
+        let jj = gr - j - 1;
+        let (c, s) = if rt[jj].re() == 0.0 {
+            (S::one(), S::zero())
+        } else {
+            let inv = S::one() / rt[jj];
+            (g[jj] * inv, rt[jj + 1] * inv)
+        };
+        rot(z, j, c, s);
+    }
 }
 
 #[inline(always)]
@@ -675,6 +788,26 @@ mod tests {
             let a = fr.covariance(&mu, &g);
             let b = Esag::new(&mu, &g).unwrap().covariance();
             assert!(max_abs(&(&a - &b)) < 1e-12);
+        }
+    }
+
+    #[test]
+    fn gamma_variant_is_gamma() {
+        for d in 3..=8 {
+            let fr = GsFrame::gamma(d);
+            let mut eta = pseudo(d, 21, 1.2);
+            eta.extend(pseudo(dims::gamma_len(d), 22, 0.8));
+            let y = {
+                let y = pseudo(d, 23, 1.0);
+                let n = y.iter().map(|x| x * x).sum::<f64>().sqrt();
+                y.iter().map(|x| x / n).collect::<Vec<_>>()
+            };
+            let a: f64 = loglik_gs(&fr, &eta, &y);
+            let b: f64 = crate::loglik::loglik_eta(&eta, &y);
+            assert!(
+                (a - b).abs() < 1e-12 * b.abs().max(1.0),
+                "d = {d}: {a} vs {b}"
+            );
         }
     }
 
