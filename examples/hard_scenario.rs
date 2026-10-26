@@ -217,7 +217,11 @@ fn fit_study() {
                         }
                         (
                             fit.converged,
-                            fit.singular_obs.len(),
+                            if fit.non_regular {
+                                usize::MAX
+                            } else {
+                                fit.singular_obs.len()
+                            },
                             fit.degenerate_obs.len(),
                             ms,
                             gv / 200.0,
@@ -226,14 +230,16 @@ fn fit_study() {
                     })
                     .collect();
                 let conv = rows.iter().filter(|r| r.0).count();
-                let pinned = rows.iter().filter(|r| r.1 > 0).count();
+                // converged at a maximum on gamma's singular set
+                let non_regular = rows.iter().filter(|r| r.0 && r.1 == usize::MAX).count();
+                let pinned = rows.iter().filter(|r| !r.0 && r.1 > 0).count();
                 let unbounded = rows.iter().filter(|r| r.2 > 0).count();
                 let mut ms: Vec<f64> = rows.iter().map(|r| r.3).collect();
                 let mut gv: Vec<f64> = rows.iter().map(|r| r.4).collect();
                 let mut ang: Vec<f64> = rows.iter().map(|r| r.5).collect();
                 let max_ms = ms.iter().fold(0.0f64, |a, &b| a.max(b));
                 println!(
-                    "d={d} {:<10} n={n:>4} K={:>3}: converged {conv:>2}/{reps} (singular set {pinned}, unbounded {unbounded}); time median {:7.1} ms, max {:7.1} ms; V error {:.3} (V(x) moves {spread:.2} from V(0)), angle {:.2}°",
+                    "d={d} {:<10} n={n:>4} K={:>3}: converged {conv:>2}/{reps} (non-regular {non_regular}; unconverged: trapped {pinned}, unbounded {unbounded}); time median {:7.1} ms, max {:7.1} ms; V error {:.3} (V(x) moves {spread:.2} from V(0)), angle {:.2}°",
                     if data_shape == shape {
                         format!("{shape:?}")
                     } else {

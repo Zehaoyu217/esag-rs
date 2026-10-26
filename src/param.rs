@@ -279,6 +279,41 @@ pub fn gamma_from_covariance(mu: &[f64], v: &[f64]) -> Vec<f64> {
     angles_to_gamma(&lam, &rm)
 }
 
+/// The exact symmetry `S_j` of the parameterization (`1 ≤ j ≤ d − 2`):
+/// negate group `j` and the last entry of every lower group. For generic
+/// `γ` (off the angle conventions of the singular set) `V` is unchanged,
+/// whatever `μ`: negating group `j` turns its angles into `θ_j + π` and
+/// `π − φ_{j,·}`, which right-multiplies its rotation block by the
+/// reflection of its coordinates 0 and `j`. Coordinate `j` is the group's
+/// own eigenvector, whose sign does not matter; the reflection of
+/// coordinate 0, carried through the later rotations, reverses those in the
+/// plane `(0, 1)`: the `θ` of every lower group, which is what negating its
+/// last entry does. So a `γ`-linear regression has `2^{d−2}` coefficient
+/// matrices for each fitted `V(x)`.
+pub fn gamma_symmetry(gamma: &mut [f64], j: usize) {
+    let off = j * (j + 1) / 2 - 1;
+    for v in &mut gamma[off..off + j + 1] {
+        *v = -*v;
+    }
+    for lower in 1..j {
+        gamma[lower * (lower + 1) / 2 - 1 + lower] *= -1.0;
+    }
+}
+
+/// `gamma` moved by the symmetries [`gamma_symmetry`], top group first, so
+/// that each group has a non-negative inner product with `reference`'s: of
+/// the `γ` describing the same `V`, one near `reference`.
+pub fn gamma_align(gamma: &mut [f64], reference: &[f64]) {
+    let d = dims::dim_from_gamma_len(gamma.len()).expect("a gamma vector");
+    for j in (1..=d - 2).rev() {
+        let off = j * (j + 1) / 2 - 1;
+        let ip: f64 = (off..off + j + 1).map(|k| gamma[k] * reference[k]).sum();
+        if ip < 0.0 {
+            gamma_symmetry(gamma, j);
+        }
+    }
+}
+
 #[cfg(test)]
 mod inverse_tests {
     use super::*;
@@ -291,6 +326,38 @@ mod inverse_tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             ((s >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
+        }
+    }
+
+    #[test]
+    fn gamma_symmetries_keep_the_covariance() {
+        let mut next = rng(7);
+        for d in 3..=10 {
+            for _ in 0..10 {
+                let mu: Vec<f64> = (0..d).map(|_| next()).collect();
+                let g: Vec<f64> = (0..dims::gamma_len(d)).map(|_| next()).collect();
+                let v = crate::frame::Frame::new(&mu, &g).cov_pow(1.0);
+                for j in 1..=d - 2 {
+                    let mut h = g.clone();
+                    gamma_symmetry(&mut h, j);
+                    let w = crate::frame::Frame::new(&mu, &h).cov_pow(1.0);
+                    let err = v
+                        .iter()
+                        .zip(&w)
+                        .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+                    assert!(err < 1e-11, "d = {d}, S_{j}: {err:e}");
+                }
+                // aligning to a symmetric image recovers it
+                let mut h = g.clone();
+                gamma_symmetry(&mut h, d - 2);
+                gamma_symmetry(&mut h, 1);
+                gamma_align(&mut h, &g);
+                let err = h
+                    .iter()
+                    .zip(&g)
+                    .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+                assert!(err < 1e-15, "d = {d}: alignment {err:e}");
+            }
         }
     }
 

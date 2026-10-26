@@ -153,6 +153,13 @@ pub struct EsagRegressor {
     /// standard errors are requested; `None` = [`NEWTON_SWITCH`].
     #[serde(skip)]
     pub(crate) handover: Option<f64>,
+    /// Opt-in (default `false`): a gamma fit that stays trapped returns the
+    /// converged fit of the observations not on gamma's singular set, with
+    /// the others listed in [`EsagRegressorFit::set_aside_obs`]. That is the
+    /// maximum-likelihood fit of the remaining `n − k` observations, not of
+    /// the data, and the summary says so.
+    #[serde(default)]
+    pub set_aside: bool,
 }
 
 impl Default for EsagRegressor {
@@ -184,7 +191,15 @@ impl EsagRegressor {
             local_precondition: false,
             refit_decrement: None,
             handover: None,
+            set_aside: false,
         }
+    }
+
+    /// Whether a trapped gamma fit may set observations on its singular set
+    /// aside ([`EsagRegressor::set_aside`]).
+    pub fn with_set_aside(mut self, v: bool) -> Self {
+        self.set_aside = v;
+        self
     }
     /// Whether to add an intercept column.
     pub fn with_fit_intercept(mut self, v: bool) -> Self {
@@ -300,6 +315,20 @@ impl EsagRegressor {
             }
             starts.push(b0);
         }
+        // Gamma with covariates: race a start from the log-tangent fit too
+        // (`lt_informed_start`). The moment start reads the shape from the
+        // pooled responses and ignores the covariates; at d = 10 its race
+        // ends 330–520 below the best maximum known in 3 of 12 datasets
+        // (one of them converged there) and trapped in 10.
+        let lt_start = (data.lt.is_none()
+            && data.gt.is_none()
+            && data.p > 0
+            && matches!(self.init, Init::Auto))
+        .then(|| self.lt_informed_start(x, y, &data, &mask))
+        .flatten();
+        if let Some(s) = &lt_start {
+            starts.push(s.clone());
+        }
         if self.n_restarts > 0 {
             let centers = starts.clone();
             starts.extend(perturbed_starts(
@@ -372,43 +401,20 @@ impl EsagRegressor {
         } else {
             self.race(&data, &starts, &mask, self.max_iter)
         };
-        // Gamma with covariates whose race failed: the moment start's
-        // intercept assumes concentrated data and is far off when V is
-        // strongly anisotropic, so the race can be trapped far from the
-        // maximum (d = 10: 253–435 below the truth's log-likelihood). The
-        // log-tangent fit is never trapped and has the same mean model; its
-        // mu(x) and V̂(x = 0), with zero shape slopes, start gamma near the
-        // maximum (`gamma_lt_start` in `fit_profile.rs`: at d = 10, 6 of 8
-        // fits at the regular root's level against 1 of 8, V̂(x) error 0.60
-        // against 1.24). It replaces the race's result only if it is better.
-        if !best.converged
-            && data.lt.is_none()
-            && data.gt.is_none()
-            && data.p > 0
-            && data.d >= LT_START_MIN_D
-            && self.fit_intercept
-            && matches!(self.init, Init::Auto)
-            && self.n_restarts == 0
-            && let Some(s) = self.lt_informed_start(x, y, &data, &mask)
-        {
-            let alt = self.race(&data, &[s], &mask, self.max_iter);
-            if alt.beats(&best) {
-                best = alt;
-            }
-        }
         // Safety net: if no start passed the convergence check (typically an
         // observation pinned at a singular point of the gamma
         // parameterization, see `docs/MATH.md`), race waves of perturbed
         // starts around the default starts and the best point so far, until
         // one converges.
-        // Where gamma's likelihood has cliffs and the winner sits with
-        // observations on the singular set, the fit is in a trap, a
-        // non-regular local supremum (`docs/MATH.md` §2). Perturbed starts
-        // fall into other traps (they rescued 0 of 51 such fits), even
-        // starts at the true coefficients do. Skip them.
-        let pinned = !best.converged
-            && data.gamma_cliffs()
-            && !singular_observations(&data, &best.coef).is_empty();
+        // Where the winner sits with observations on gamma's singular set,
+        // the fit is in a trap, a non-regular local supremum (`docs/MATH.md`
+        // §2). Perturbed starts fall into other traps (they rescued 0 of 51
+        // such fits at d ≥ 5), even starts at the true coefficients do; the
+        // weight homotopy below handles trapped fits instead.
+        let trapped = |b: &DMatrix<f64>| {
+            data.lt.is_none() && data.p > 0 && !near_singular_observations(&data, b).is_empty()
+        };
+        let pinned = !best.converged && trapped(&best.coef);
         // Nor where the likelihood is unbounded (a fitted V(x_i) heading for
         // a singular matrix): more starts only diverge further.
         let unbounded = !best.converged && !degenerate_observations(&data, &best.coef).is_empty();
@@ -437,17 +443,81 @@ impl EsagRegressor {
                 }
             }
         }
-        if pinned && data.d <= EXCLUSION_MAX_D && matches!(self.init, Init::Auto) {
-            best = self.exclusion_rounds(x, y, &data, best, &mask);
+        // still trapped: follow the regular root instead of searching for it
+        if !best.converged && matches!(self.init, Init::Auto) && trapped(&best.coef) {
+            let alt = lt_start.as_ref();
+            if !collapsed_groups(&data, &best.coef).is_empty() {
+                best = self.un_collapse(&data, best, &free_params(&mask), alt);
+            }
+            let outcome = if best.converged {
+                Homotopy::Failed
+            } else {
+                self.homotopy_rounds(&data, &best, &mask, alt)
+            };
+            match outcome {
+                Homotopy::Regular(r) => best = r,
+                Homotopy::SetAside(rest, sset) if self.set_aside => {
+                    // the MLE of the other n − k observations, reported as such
+                    let mut wd = data.clone();
+                    let mut w = vec![1.0; data.n];
+                    for &i in &sset {
+                        w[i] = 0.0;
+                    }
+                    wd.w = Some(w);
+                    let mut fit = self.finalize(&wd, rest, mask)?;
+                    fit.n_obs = data.n - sset.len();
+                    fit.set_aside_obs = sset;
+                    return Ok(fit);
+                }
+                _ => {
+                    // No regular maximum continues from the fit without the
+                    // trapped observations: the likelihood's maximum sits on
+                    // the singular set. Converge to it there.
+                    if let Some((at, held)) = self.stratum_maximum(&data, &best, &mask)
+                        && at.neg_ll <= best.neg_ll + STRATUM_SLACK
+                    {
+                        if held.is_empty() {
+                            // every trapped observation released: regular
+                            return self.finalize(&data, at, mask);
+                        }
+                        let mut wd = data.clone();
+                        let mut w = vec![1.0; data.n];
+                        for &i in &held {
+                            w[i] = 0.0;
+                        }
+                        wd.w = Some(w);
+                        let (ll, gn) = (-at.neg_ll, at.grad_norm_inf);
+                        let mut fit = self.finalize_with(&wd, at, mask, false)?;
+                        fit.log_likelihood = ll;
+                        fit.grad_norm = gn;
+                        fit.singular_obs = held;
+                        fit.non_regular = true;
+                        return Ok(fit);
+                    }
+                }
+            }
         }
         self.finalize(&data, best, mask)
     }
 
-    /// A gamma start from the log-tangent fit of the same data: its mean
-    /// coefficients (the mean model is the same), the gamma of its fitted
-    /// `V` at `x = 0` as the shape intercept (any member of gamma's
-    /// equivalence class serves: `gamma_branch_start`), zero shape slopes.
-    /// `None` if the log-tangent fit fails.
+    /// A gamma start from the log-tangent fit of the same data, whose
+    /// likelihood has no traps: its mean coefficients (the mean model is the
+    /// same), and for the shape the least-squares regression on the design
+    /// of the gamma of every observation's fitted `V̂(x_i)`
+    /// ([`crate::param::gamma_from_covariance`]). Each observation's gamma is
+    /// first moved by the exact symmetries of the parameterization
+    /// ([`crate::param::gamma_align`]) to the image nearest the gamma at the
+    /// mean design row, then, for a second regression, to the image nearest
+    /// its fitted value: `γ ↦ V` is `2^{d−2}`-to-one, and a regression of
+    /// unaligned images averages unrelated coefficients. Shape rows are
+    /// regressed on their free columns only. `None` if the log-tangent fit
+    /// fails.
+    ///
+    /// Against the gamma of `V̂(0)` with zero shape slopes, its race reaches
+    /// the best maximum known in 12 of 12 datasets at d = 10 (n = 2000,
+    /// standard truth), against 3 of 12: the slopes matter, and so does
+    /// averaging the shape over the data instead of reading it at `x = 0`
+    /// (`gamma_intercept_estimators` in `fit_profile.rs`).
     fn lt_informed_start(
         &self,
         x: &DMatrix<f64>,
@@ -455,24 +525,32 @@ impl EsagRegressor {
         data: &RegressionData,
         mask: &DMatrix<bool>,
     ) -> Option<DMatrix<f64>> {
-        let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+        let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
+        let g = bd - d;
         let mut cfg = self.clone();
         cfg.shape = Shape::LogTangent;
         cfg.compute_hessian = false;
         cfg.lt_reference = None;
         let lt = cfg.fit(x, y).ok()?;
-        let eta0: Vec<f64> = (0..bd).map(|k| lt.coef[(k, 0)]).collect();
-        let v0 = lt
-            .distribution_at(&eta0, lt.lt_frame().as_ref())
-            .ok()?
-            .covariance();
-        let vr: Vec<f64> = (0..d)
-            .flat_map(|r| (0..d).map(move |c| (r, c)))
-            .map(|(r, c)| v0[(r, c)])
+        let fr = lt.lt_frame();
+        let gamma_at = |xi: &[f64]| -> Option<Vec<f64>> {
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| (0..pt).map(|c| lt.coef[(k, c)] * xi[c]).sum())
+                .collect();
+            let v = lt.distribution_at(&eta, fr.as_ref()).ok()?.covariance();
+            let vr: Vec<f64> = (0..d * d).map(|a| v[(a / d, a % d)]).collect();
+            let gi = crate::param::gamma_from_covariance(&eta[..d], &vr);
+            gi.iter().all(|v| v.is_finite()).then_some(gi)
+        };
+        let xbar: Vec<f64> = (0..pt)
+            .map(|c| (0..n).map(|i| data.x[i * pt + c]).sum::<f64>() / n as f64)
             .collect();
-        let g0 = crate::param::gamma_from_covariance(&eta0[..d], &vr);
-        if !g0.iter().all(|v| v.is_finite()) {
-            return None;
+        let reference = gamma_at(&xbar)?;
+        let mut gs: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut gi = gamma_at(&data.x[i * pt..(i + 1) * pt])?;
+            crate::param::gamma_align(&mut gi, &reference);
+            gs.push(gi);
         }
         let mut s = DMatrix::zeros(bd, pt);
         for j in 0..pt {
@@ -480,59 +558,640 @@ impl EsagRegressor {
                 s[(r, j)] = lt.coef[(r, j)];
             }
         }
-        for (r, &v) in g0.iter().enumerate() {
-            s[(d + r, 0)] = v;
+        for round in 0..2 {
+            if round > 0 {
+                for (i, gi) in gs.iter_mut().enumerate() {
+                    let fitted: Vec<f64> = (0..g)
+                        .map(|k| (0..pt).map(|c| s[(d + k, c)] * data.x[i * pt + c]).sum())
+                        .collect();
+                    crate::param::gamma_align(gi, &fitted);
+                }
+            }
+            // shape rows grouped by their free columns
+            let mut done = vec![false; g];
+            for k0 in 0..g {
+                if done[k0] {
+                    continue;
+                }
+                let cols: Vec<usize> = (0..pt).filter(|&c| mask[(d + k0, c)]).collect();
+                let rows: Vec<usize> = (k0..g)
+                    .filter(|&k| !done[k] && (0..pt).all(|c| mask[(d + k, c)] == mask[(d + k0, c)]))
+                    .collect();
+                for &k in &rows {
+                    done[k] = true;
+                }
+                if cols.is_empty() {
+                    continue;
+                }
+                let xs = DMatrix::from_fn(n, cols.len(), |i, a| data.x[i * pt + cols[a]]);
+                let rhs = DMatrix::from_fn(n, rows.len(), |i, a| gs[i][rows[a]]);
+                let sol = (xs.transpose() * &xs)
+                    .cholesky()?
+                    .solve(&(xs.transpose() * rhs));
+                for (a, &k) in rows.iter().enumerate() {
+                    for (b, &c) in cols.iter().enumerate() {
+                        s[(d + k, c)] = sol[(b, a)];
+                    }
+                }
+            }
         }
         zero_fixed(&mut s, mask);
-        Some(s)
+        s.iter().all(|v| v.is_finite()).then_some(s)
     }
 
-    /// Rescue of a trapped gamma fit. A trap is not a root of the score
-    /// equations, and the regular root next to it is reached by fitting
-    /// without the trapped observations, warm, then with them again. This
-    /// is repeated, excluding every observation trapped so far, while each
-    /// round improves the likelihood (at most [`EXCLUSION_ROUNDS`]). On the
-    /// hard scenario (`gamma_exclusion_rounds` in `fit_profile.rs`) this
-    /// reaches a regular root, always with a higher likelihood than the
-    /// trap, in 3 of 12 trapped fits at `d = 5` and 2 of 12 at `d = 6`; it
-    /// never did at `d = 7` or 8, hence [`EXCLUSION_MAX_D`].
-    fn exclusion_rounds(
+    /// The maximum of a trapped gamma fit's likelihood, in coordinates
+    /// blown up around the singular sets its suspects are near
+    /// ([`BlownUp`]): there the likelihood is smooth, and L-BFGS converges by
+    /// the rule of a regular fit whether each suspect's maximum is on the set
+    /// (a trap, `ρ = 0`, the observation's density at its best angle) or
+    /// next to it (`ρ > 0`, a regular root with curvature `O(1/r²)` in the
+    /// original coordinates, out of reach of L-BFGS there). Observations
+    /// newly trapped at the result join, for up to [`STRATUM_ROUNDS`]
+    /// rounds; a suspect left at `ρ = 0` although the likelihood rises off
+    /// the set (a saddle in `ρ`) is pushed off it and the fit repeated.
+    /// The observations on the set at the result are polished there with
+    /// Newton steps ([`EsagRegressor::stratum_polish`]). Returns the
+    /// converged fit and the observations on the set (empty: a regular
+    /// root), or `None` (log-tangent or transported shapes, a singular set
+    /// that is not a pair, dependent constraints, no convergence).
+    fn stratum_maximum(
         &self,
-        x: &DMatrix<f64>,
-        y: &DMatrix<f64>,
         data: &RegressionData,
-        mut best: RawFit,
+        best: &RawFit,
         mask: &DMatrix<bool>,
-    ) -> RawFit {
+    ) -> Option<(RawFit, Vec<usize>)> {
+        if data.lt.is_some() || data.gt.is_some() {
+            return None;
+        }
+        let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
         let free = free_params(mask);
-        let mut out: Vec<usize> = vec![];
-        for _ in 0..EXCLUSION_ROUNDS {
-            let trapped = singular_observations(data, &best.coef);
-            if trapped.is_empty() {
-                break;
+        let nf = free.len();
+        let limit = HOMOTOPY_MAX_SET_ASIDE.max(n / 100);
+        let dbg = std::env::var("ESAG_DEBUG_STRATUM").is_ok();
+        let mut blown = near_singular_observations(data, &best.coef);
+        let mut coef = best.coef.clone();
+        let mut push: Vec<usize> = vec![];
+        let (mut it, mut fev) = (best.n_iter, best.n_fev);
+        for _ in 0..STRATUM_ROUNDS {
+            if blown.is_empty() || blown.len() > limit {
+                if dbg {
+                    eprintln!(
+                        "stratum: gave up with {} suspects (limit {limit})",
+                        blown.len()
+                    );
+                }
+                return None;
             }
-            out.extend(trapped);
-            out.sort_unstable();
-            out.dedup();
-            let keep: Vec<usize> = (0..data.n)
-                .filter(|i| out.binary_search(i).is_err())
+            let k = blown.len();
+            let (mut cm, mut fixed) = (DMatrix::zeros(2 * k, nf), DVector::zeros(2 * k));
+            let (mut eps, mut scales) = (vec![0.0; k], vec![0.0; k]);
+            for (a, &i) in blown.iter().enumerate() {
+                let xi = &data.x[i * pt..(i + 1) * pt];
+                let eta: Vec<f64> = (0..bd)
+                    .map(|r| (0..pt).map(|c| coef[(r, c)] * xi[c]).sum())
+                    .collect();
+                let set = nearest_singular(data, &eta);
+                let (rows, scale) = set.1.rows(d, &eta)?;
+                if rows.len() != 2 || !(scale > 0.0 && scale.is_finite()) {
+                    if dbg {
+                        eprintln!("stratum: suspect #{i} near {set:?}: not a pair");
+                    }
+                    return None;
+                }
+                (eps[a], scales[a]) = (STRATUM_RADIUS * scale, scale);
+                for (q, &r) in rows.iter().enumerate() {
+                    fixed[2 * a + q] = (0..pt)
+                        .filter(|&c| !mask[(r, c)])
+                        .map(|c| coef[(r, c)] * xi[c])
+                        .sum();
+                    for (b, &(kk, c)) in free.iter().enumerate() {
+                        if kk == r {
+                            cm[(2 * a + q, b)] = xi[c];
+                        }
+                    }
+                }
+            }
+            let cplus = (&cm * cm.transpose()).cholesky()?.solve(&cm).transpose();
+            let obj = NegLogLik {
+                data,
+                base: coef.clone(),
+                free: &free,
+                parallel: self.parallel,
+                trap_streak: None,
+                shared: false,
+            };
+            let bu = BlownUp {
+                inner: &obj,
+                nf,
+                cplus,
+                c: cm,
+                fixed,
+                eps,
+            };
+            let x0 = DVector::from_iterator(nf, free.iter().map(|&(r, c)| coef[(r, c)]));
+            let mut y0 = bu.y(&x0);
+            for (a, i) in blown.iter().enumerate() {
+                if push.contains(i) {
+                    y0[nf + a] = (STRATUM_PUSH * scales[a]).sqrt();
+                }
+            }
+            let cfg = LbfgsConfig {
+                tol_grad_abs: 0.0,
+                ..self.lbfgs_config(data, nf + 2 * k, self.max_iter)
+            };
+            let res = minimize(&bu, &y0, &cfg);
+            (it, fev) = (it + res.n_iter, fev + res.n_fev);
+            let x = bu.x(&res.x);
+            coef = obj.assemble(x.as_slice());
+            let converged = res.status.is_converged()
+                && res.f.is_finite()
+                && res.grad_norm_inf <= MAX_MEAN_GRADIENT * n as f64;
+            let radial = bu.radial(&res.x);
+            // suspects at the result that are not blown up yet: trapped, or
+            // (if the run stalled) near the set
+            let new: Vec<usize> = if converged {
+                singular_observations(data, &coef)
+            } else {
+                near_singular_observations(data, &coef)
+            }
+            .into_iter()
+            .filter(|i| !blown.contains(i))
+            .collect();
+            // on the set, and a saddle there (the likelihood rises off it)
+            let on: Vec<usize> = (0..k)
+                .filter(|&a| radial[a].0 < SINGULAR_ON * scales[a])
                 .collect();
-            let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
-            let ys = DMatrix::from_fn(keep.len(), y.ncols(), |a, j| y[(keep[a], j)]);
-            let Ok(sub) = self.data(&xs, &ys) else { break };
-            let rest = self.optimize(&sub, &best.coef, &free, self.max_iter);
-            let mut next = self.optimize(data, &rest.coef, &free, self.max_iter);
-            next.n_iter += best.n_iter + rest.n_iter;
-            next.n_fev += best.n_fev + rest.n_fev;
-            if !next.beats(&best) {
-                break;
+            let saddle: Vec<usize> = on
+                .iter()
+                .filter(|&&a| radial[a].1 < 0.0)
+                .map(|&a| blown[a])
+                .filter(|i| !push.contains(i))
+                .collect();
+            if dbg {
+                eprintln!(
+                    "stratum: blown up {blown:?}: {:?} it {} ll {:.2} (trapped fit {:.2}) |g| {:.1e}; ρ² {:?}; on the set {:?}, saddles {saddle:?}, new {new:?}",
+                    res.status,
+                    res.n_iter,
+                    -res.f,
+                    -best.neg_ll,
+                    res.grad_norm_inf,
+                    radial
+                        .iter()
+                        .zip(&scales)
+                        .map(|(r, s)| format!("{:.1e}", r.0 / s))
+                        .collect::<Vec<_>>(),
+                    on.iter().map(|&a| blown[a]).collect::<Vec<_>>()
+                );
             }
-            best = next;
-            if best.converged {
-                break;
+            if converged && new.is_empty() && saddle.is_empty() {
+                let held: Vec<usize> = on.iter().map(|&a| blown[a]).collect();
+                let raw = RawFit {
+                    coef: coef.clone(),
+                    x: x.as_slice().to_vec(),
+                    neg_ll: res.f,
+                    grad: vec![0.0; nf],
+                    grad_norm_inf: res.grad_norm_inf,
+                    n_iter: it,
+                    n_fev: fev,
+                    status: res.status,
+                    converged,
+                };
+                if held.is_empty() {
+                    return Some((raw, held));
+                }
+                // tighten on the set
+                return match self.stratum_polish(data, &coef, &held, &free, mask) {
+                    Some(mut p) if p.converged && p.neg_ll <= raw.neg_ll + STRATUM_SLACK => {
+                        p.n_iter += it;
+                        p.n_fev += fev;
+                        Some((p, held))
+                    }
+                    _ => Some((raw, held)),
+                };
+            }
+            if !converged && new.is_empty() && saddle.is_empty() {
+                // stalled with nothing to add: finish on the set with Newton
+                let held: Vec<usize> = on.iter().map(|&a| blown[a]).collect();
+                if let Some(mut p) = self.stratum_polish(data, &coef, &held, &free, mask)
+                    && p.converged
+                    && p.neg_ll <= res.f + STRATUM_SLACK
+                    && singular_observations(data, &p.coef)
+                        .iter()
+                        .all(|i| held.contains(i))
+                {
+                    p.n_iter += it;
+                    p.n_fev += fev;
+                    return Some((p, held));
+                }
+            }
+            push.extend(saddle);
+            blown.extend(new);
+        }
+        None
+    }
+
+    /// One L-BFGS run of [`EsagRegressor::stratum_maximum`]: from `coef`,
+    /// with the vanishing coordinates of the observations `held` placed at
+    /// [`STRATUM_RADIUS`] of their scale along their best direction and held
+    /// there. `None` for dependent constraints or a singular set that is a
+    /// point.
+    fn stratum_polish(
+        &self,
+        data: &RegressionData,
+        coef: &DMatrix<f64>,
+        held: &[usize],
+        free: &[(usize, usize)],
+        mask: &DMatrix<bool>,
+    ) -> Option<RawFit> {
+        let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
+        // (observation, row of η, target)
+        let mut cons: Vec<(usize, usize, f64)> = vec![];
+        for &i in held {
+            let xi = &data.x[i * pt..(i + 1) * pt];
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| (0..pt).map(|c| coef[(k, c)] * xi[c]).sum())
+                .collect();
+            let (rows, scale) = nearest_singular(data, &eta).1.rows(d, &eta)?;
+            if !(scale > 0.0 && scale.is_finite()) {
+                return None;
+            }
+            let r = STRATUM_RADIUS * scale;
+            let cur: Vec<f64> = rows.iter().map(|&k| eta[k]).collect();
+            let cn = cur.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let mut dir: Vec<f64> = if cn > 0.0 {
+                cur.iter().map(|v| v / cn).collect()
+            } else {
+                (0..rows.len())
+                    .map(|a| f64::from(u8::from(a == 0)))
+                    .collect()
+            };
+            if rows.len() == 2 {
+                // the angle maximising the observation's own density there
+                let y = &data.y[i * d..(i + 1) * d];
+                let mut e = eta.clone();
+                let mut dens = |th: f64| {
+                    e[rows[0]] = r * th.cos();
+                    e[rows[1]] = r * th.sin();
+                    loglik::loglik_eta(&e, y)
+                };
+                let th0 = dir[1].atan2(dir[0]);
+                let h = std::f64::consts::TAU / STRATUM_ANGLES as f64;
+                let (mut bt, mut bv) = (th0, dens(th0));
+                for a in 1..STRATUM_ANGLES {
+                    let th = th0 + a as f64 * h;
+                    let v = dens(th);
+                    if v > bv {
+                        (bt, bv) = (th, v);
+                    }
+                }
+                // golden section on [bt − h, bt + h]
+                let gr = 0.5 * (5f64.sqrt() - 1.0);
+                let (mut lo, mut hi) = (bt - h, bt + h);
+                for _ in 0..40 {
+                    let (a, b) = (hi - gr * (hi - lo), lo + gr * (hi - lo));
+                    if dens(a) >= dens(b) {
+                        hi = b;
+                    } else {
+                        lo = a;
+                    }
+                }
+                let th = 0.5 * (lo + hi);
+                if dens(th) > bv {
+                    bt = th;
+                }
+                dir = vec![bt.cos(), bt.sin()];
+            }
+            for (a, &k) in rows.iter().enumerate() {
+                cons.push((i, k, r * dir[a]));
             }
         }
-        best
+        // C over the free coefficients; fixed ones move to the target
+        let (nf, nc) = (free.len(), cons.len());
+        let mut cm = DMatrix::zeros(nc, nf);
+        let mut rhs = DVector::zeros(nc);
+        for (a, &(i, k, t)) in cons.iter().enumerate() {
+            let xi = &data.x[i * pt..(i + 1) * pt];
+            let fixed: f64 = (0..pt)
+                .filter(|&c| !mask[(k, c)])
+                .map(|c| coef[(k, c)] * xi[c])
+                .sum();
+            rhs[a] = t - fixed;
+            for (b, &(kk, c)) in free.iter().enumerate() {
+                if kk == k {
+                    cm[(a, b)] = xi[c];
+                }
+            }
+        }
+        let x0 = DVector::from_iterator(nf, free.iter().map(|&(k, c)| coef[(k, c)]));
+        let (x1, pinv) = if nc == 0 {
+            (x0, DMatrix::zeros(0, nf))
+        } else {
+            let chol = (&cm * cm.transpose()).cholesky()?;
+            let x1 = &x0 + cm.transpose() * chol.solve(&(&rhs - &cm * &x0));
+            (x1, chol.solve(&cm))
+        };
+        let obj = NegLogLik {
+            data,
+            base: coef.clone(),
+            free,
+            parallel: self.parallel,
+            trap_streak: None,
+            shared: false,
+        };
+        let proj = Projected {
+            inner: &obj,
+            ct: cm.transpose(),
+            pinv,
+        };
+        let cfg = LbfgsConfig {
+            tol_grad_abs: 0.0,
+            ..self.lbfgs_config(data, nf, self.max_iter)
+        };
+        let res = minimize(&proj, x1.as_slice(), &cfg);
+        // Projected Newton steps with the exact Hessian: next to the
+        // singular set the curvature is too large and uneven for L-BFGS.
+        // The held observations' Hessians lose their vanishing rows (which
+        // the projection removes anyway), so the 1/r² curvature there never
+        // enters the arithmetic.
+        let full = bd * pt;
+        let proj_m = DMatrix::<f64>::identity(nf, nf) - cm.transpose() * &proj.pinv;
+        let mut wd = data.clone();
+        let mut w = vec![1.0; n];
+        for &i in held {
+            w[i] = 0.0;
+        }
+        wd.w = Some(w);
+        let (mut x, mut f) = (DVector::from_column_slice(&res.x), res.f);
+        let mut steps = 0;
+        for _ in 0..STRATUM_NEWTON {
+            let b = obj.assemble(x.as_slice());
+            let (_, mut g, mut h) =
+                joint_loglik_grad_hess_with(&wd, &b, self.parallel, ObsHessian::Exact);
+            let (mut ge, mut he) = (vec![0.0; bd], vec![0.0; bd * bd]);
+            for &i in held {
+                let xi = &data.x[i * pt..(i + 1) * pt];
+                let eta: Vec<f64> = (0..bd)
+                    .map(|k| (0..pt).map(|c| b[(k, c)] * xi[c]).sum())
+                    .collect();
+                obs_hessian(
+                    data,
+                    ObsHessian::Exact,
+                    &eta,
+                    &data.y[i * d..(i + 1) * d],
+                    &mut ge,
+                    &mut he,
+                );
+                let (rows, _) = nearest_singular(data, &eta).1.rows(d, &eta)?;
+                for &k in &rows {
+                    ge[k] = 0.0;
+                    for m in 0..bd {
+                        he[k * bd + m] = 0.0;
+                        he[m * bd + k] = 0.0;
+                    }
+                }
+                for j1 in 0..pt {
+                    for k1 in 0..bd {
+                        g[j1 * bd + k1] += ge[k1] * xi[j1];
+                        for j2 in 0..pt {
+                            for k2 in 0..bd {
+                                h[(j1 * bd + k1) * full + j2 * bd + k2] +=
+                                    he[k1 * bd + k2] * xi[j1] * xi[j2];
+                            }
+                        }
+                    }
+                }
+            }
+            let gf = &proj_m * DVector::from_iterator(nf, free.iter().map(|&(k, j)| g[j * bd + k]));
+            if gf.amax() <= 1e-10 * f.abs().max(1.0) {
+                break;
+            }
+            let hf = DMatrix::from_fn(nf, nf, |a, c| {
+                let ((ka, ja), (kc, jc)) = (free[a], free[c]);
+                -h[(ja * bd + ka) * full + jc * bd + kc]
+            });
+            let scale = hf.diagonal().iter().map(|v| v.abs()).sum::<f64>() / nf as f64;
+            let m = &proj_m * hf * &proj_m + cm.transpose() * &cm * scale;
+            // saddle-free: |eigenvalues| (floored), so a direction of
+            // positive curvature, such as an observation's angle on the
+            // wrong side of its best one, is climbed instead of descended
+            let eig = nalgebra::SymmetricEigen::new((&m + m.transpose()) * 0.5);
+            let lmax = eig.eigenvalues.amax();
+            let gq = eig.eigenvectors.transpose() * &gf;
+            let sq = DVector::from_iterator(
+                nf,
+                (0..nf).map(|a| gq[a] / eig.eigenvalues[a].abs().max(1e-10 * lmax)),
+            );
+            let step = proj_m.clone() * (&eig.eigenvectors * sq); // ascent for ℓ
+            let mut alpha = 1.0;
+            let mut moved = false;
+            for _ in 0..30 {
+                let xc = &x + &step * alpha;
+                let fc = obj.value(xc.as_slice());
+                if fc.is_finite() && fc <= f {
+                    (x, f, moved) = (xc, fc, true);
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if !moved {
+                break;
+            }
+            steps += 1;
+        }
+        let mut grad = vec![0.0; nf];
+        let f = proj.value_and_gradient(x.as_slice(), &mut grad);
+        let grad_norm_inf = grad.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let converged = f.is_finite()
+            && grad_norm_inf <= MAX_MEAN_GRADIENT * n as f64
+            && (res.status.is_converged() || steps > 0);
+        Some(RawFit {
+            coef: obj.assemble(x.as_slice()),
+            x: x.as_slice().to_vec(),
+            neg_ll: f,
+            grad,
+            grad_norm_inf,
+            n_iter: res.n_iter + steps,
+            n_fev: res.n_fev + steps,
+            status: res.status,
+            converged,
+        })
+    }
+
+    /// A fit `r` (on `data`) with collapsed gamma groups, reseeded from
+    /// `reference` group by group in both signs and refitted; the best
+    /// refit without a collapse, if any beats `r`, else `r`.
+    fn un_collapse(
+        &self,
+        data: &RegressionData,
+        mut r: RawFit,
+        free: &[(usize, usize)],
+        reference: Option<&DMatrix<f64>>,
+    ) -> RawFit {
+        let Some(reference) = reference else { return r };
+        for _ in 0..data.d {
+            let groups = collapsed_groups(data, &r.coef);
+            let Some(&gr) = groups.first() else { break };
+            let mut found: Option<RawFit> = None;
+            for start in reseeded_group(&r.coef, reference, data.d, gr) {
+                let alt = self.optimize(data, &start, free, self.max_iter);
+                if !collapsed_groups(data, &alt.coef).contains(&gr)
+                    && found.as_ref().is_none_or(|f| alt.beats(f))
+                {
+                    found = Some(alt);
+                }
+            }
+            match found {
+                Some(f) => r = f,
+                None => break,
+            }
+        }
+        r
+    }
+
+    /// Weight homotopy from a trapped gamma fit to the regular root of the
+    /// likelihood. The trapped observations `S` are set aside (weight 0,
+    /// accumulating newly trapped ones) until the rest converges, from the
+    /// trapped fit and from `alt` (the log-tangent-informed start); then
+    /// their weight is raised to 1 in steps, each fit warm from the last, a
+    /// step accepted only where the fit converges with no observation
+    /// trapped (else it is shortened). A trap is a local feature that
+    /// captures large steps; along small weight increments the fit follows
+    /// the regular root. Many observations trapped at once (a group
+    /// collapsing for all of them) end the attempt from that start.
+    fn homotopy_rounds(
+        &self,
+        data: &RegressionData,
+        best: &RawFit,
+        mask: &DMatrix<bool>,
+        alt: Option<&DMatrix<f64>>,
+    ) -> Homotopy {
+        let free = free_params(mask);
+        let limit = HOMOTOPY_MAX_SET_ASIDE.max(data.n / 100);
+        let iters = self.max_iter.min(HOMOTOPY_STEP_ITER);
+        let weights = |sset: &[usize], t: f64| -> Vec<f64> {
+            let mut w = vec![1.0; data.n];
+            for &i in sset {
+                w[i] = t;
+            }
+            w
+        };
+        let s0 = near_singular_observations(data, &best.coef);
+        // the rest's fit from a start: (fit, S, members of S on the set)
+        let dbg = std::env::var("ESAG_DEBUG_HOMOTOPY").is_ok();
+        let rest_from = |b0: &DMatrix<f64>| -> Option<(RawFit, Vec<usize>, usize)> {
+            let mut wd = data.clone();
+            let mut sset = s0.clone();
+            let mut cur = b0.clone();
+            for _ in 0..HOMOTOPY_SET_ASIDE_ROUNDS {
+                sset.sort_unstable();
+                sset.dedup();
+                if sset.len() > limit {
+                    if dbg {
+                        eprintln!("homotopy: rest gave up, {} set aside", sset.len());
+                    }
+                    return None;
+                }
+                wd.w = Some(weights(&sset, 0.0));
+                let r = self.optimize(&wd, &cur, &free, iters);
+                let r = if collapsed_groups(&wd, &r.coef).is_empty() {
+                    r
+                } else {
+                    self.un_collapse(&wd, r, &free, alt)
+                };
+                let flagged = singular_observations(&wd, &r.coef);
+                // a rest fit that did not converge sets aside its suspects
+                let suspects = if r.converged {
+                    flagged.clone()
+                } else {
+                    near_singular_observations(&wd, &r.coef)
+                };
+                let trapped: Vec<usize> = suspects
+                    .iter()
+                    .copied()
+                    .filter(|i| sset.binary_search(i).is_err())
+                    .collect();
+                if trapped.len() > limit {
+                    if dbg {
+                        eprintln!(
+                            "homotopy: rest collapsed ({} newly trapped, status {:?}, |g| {:.1e})",
+                            trapped.len(),
+                            r.status,
+                            r.grad_norm_inf
+                        );
+                    }
+                    return None;
+                }
+                if r.converged && trapped.is_empty() {
+                    let on_set = flagged.len();
+                    return Some((r, sset, on_set));
+                }
+                cur = r.coef;
+                sset.extend(trapped);
+            }
+            None
+        };
+        let mut rests: Vec<(RawFit, Vec<usize>, usize)> =
+            rest_from(&best.coef).into_iter().collect();
+        if let Some(a) = alt
+            && let Some(r) = rest_from(a)
+            // the same set aside as the first start's: the same branch, as a
+            // rule (both fold at the same weight)
+            && rests.iter().all(|q| q.1 != r.1)
+        {
+            rests.push(r);
+        }
+        if std::env::var("ESAG_DEBUG_HOMOTOPY").is_ok() {
+            eprintln!(
+                "homotopy: start trapped {}; rests {:?}",
+                s0.len(),
+                rests.iter().map(|r| (r.1.len(), r.2)).collect::<Vec<_>>()
+            );
+        }
+        // fewest set-aside observations still on the set, then highest likelihood
+        rests.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.neg_ll.total_cmp(&b.0.neg_ll)));
+        let mut fallback: Option<(RawFit, Vec<usize>)> = None;
+        for (rest, sset, _) in rests {
+            let mut wd = data.clone();
+            let mut cur = rest.coef.clone();
+            // the whole step first (the observations put straight back), then
+            // small ones
+            let (mut t, mut step, mut fails) = (0.0f64, 1.0, 0);
+            while t < 1.0 && fails < HOMOTOPY_MAX_FAILS {
+                let tn = (t + step).min(1.0);
+                wd.w = Some(weights(&sset, tn));
+                let r = self.optimize(&wd, &cur, &free, iters);
+                if r.converged && singular_observations(&wd, &r.coef).is_empty() {
+                    cur = r.coef;
+                    t = tn;
+                    step = (step * 1.5).min(0.3);
+                } else {
+                    step = if step == 1.0 {
+                        HOMOTOPY_FIRST_STEP
+                    } else {
+                        step * 0.4
+                    };
+                    fails += 1;
+                }
+            }
+            if dbg {
+                eprintln!("homotopy: S of {} reached weight {t:.3}", sset.len());
+            }
+            if t >= 1.0 {
+                let mut fin = self.optimize(data, &cur, &free, self.max_iter);
+                if fin.converged && singular_observations(data, &fin.coef).is_empty() {
+                    fin.n_iter += best.n_iter;
+                    fin.n_fev += best.n_fev;
+                    return Homotopy::Regular(fin);
+                }
+            }
+            if fallback.is_none() {
+                fallback = Some((rest, sset));
+            }
+        }
+        match fallback {
+            Some((rest, sset)) => Homotopy::SetAside(rest, sset),
+            None => Homotopy::Failed,
+        }
     }
 
     /// Fit starting from an explicit coefficient matrix (warm start). Used by
@@ -934,8 +1593,21 @@ impl EsagRegressor {
     fn finalize(
         &self,
         data: &RegressionData,
+        best: RawFit,
+        mask: DMatrix<bool>,
+    ) -> Result<EsagRegressorFit> {
+        self.finalize_with(data, best, mask, true)
+    }
+
+    /// [`EsagRegressor::finalize`]; `polish = false` keeps the coefficients
+    /// (no Newton steps or L-BFGS finish), for a maximum on the singular
+    /// set whose information is computed on the other observations.
+    fn finalize_with(
+        &self,
+        data: &RegressionData,
         mut best: RawFit,
         mask: DMatrix<bool>,
+        polish: bool,
     ) -> Result<EsagRegressorFit> {
         if !best.neg_ll.is_finite() {
             return Err(EsagError::Convergence(
@@ -1032,6 +1704,7 @@ impl EsagRegressor {
                         || !degenerate_observations(data, &coef).is_empty())
             };
             if chol.is_none()
+                && polish
                 && self.compute_hessian
                 && best.status != Status::Aborted
                 && !hopeless()
@@ -1058,7 +1731,7 @@ impl EsagRegressor {
             }
             let mut f_ll = f0;
             let mut g_full = g0.as_slice().to_vec();
-            if let Some(ch) = chol {
+            if let Some(ch) = chol.filter(|_| polish) {
                 for _ in 0..NEWTON_STEPS {
                     let g: DVector<f64> = DVector::from_iterator(
                         nf,
@@ -1120,6 +1793,8 @@ impl EsagRegressor {
             n_obs: data.n,
             singular_obs,
             degenerate_obs,
+            set_aside_obs: vec![],
+            non_regular: false,
             coef,
             mask,
             free,
@@ -1263,6 +1938,16 @@ pub(crate) fn moment_start(y: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>
     (m.iter().map(|v| v * norm).collect(), gamma)
 }
 
+/// Outcome of [`EsagRegressor::homotopy_rounds`].
+enum Homotopy {
+    /// A converged fit of the full likelihood with no observation trapped.
+    Regular(RawFit),
+    /// The full likelihood was not reached, but the fit with these
+    /// observations set aside (weight 0) converged.
+    SetAside(RawFit, Vec<usize>),
+    Failed,
+}
+
 /// The outcome of one optimiser run, before canonicalisation and standard
 /// errors.
 struct RawFit {
@@ -1389,14 +2074,43 @@ fn perturbed_starts(
 const SINGULAR_GRADIENT: f64 = 20.0;
 /// ... and it lies within this relative distance of a singular set.
 const SINGULAR_DISTANCE: f64 = 1e-2;
-/// Most rounds of [`EsagRegressor::exclusion_rounds`]; rescues came within
-/// two rounds (eight changed nothing).
-const EXCLUSION_ROUNDS: usize = 3;
-/// Largest `d` at which trapped gamma fits get exclusion rounds.
-const EXCLUSION_MAX_D: usize = 6;
-/// Smallest `d` at which a failed gamma race also tries the
-/// log-tangent-informed start.
-const LT_START_MIN_D: usize = 5;
+/// Within this relative distance an observation is on the singular set,
+/// whatever its gradient: a trapped observation at its best angle has a
+/// small angular gradient (measured at d = 10: pair ratio 6e−8 at 9× the
+/// median gradient, a vanishing group at 6e−10 of the lower ones).
+const SINGULAR_ON: f64 = 1e-4;
+/// Weight homotopy ([`EsagRegressor::homotopy_rounds`]): rounds of setting
+/// newly trapped observations aside (also stopped once a round traps as
+/// many new ones as the last: the traps are spreading), the most
+/// observations set aside (or 0.5% of `n`), the first small weight step,
+/// and the failed steps allowed. Rescues at d = 10 set aside 1–5
+/// observations in 1–3 rounds; on the hard scenario at d = 8, where they
+/// fail, unbounded rounds cost 20 times the fit.
+const HOMOTOPY_SET_ASIDE_ROUNDS: usize = 8;
+const HOMOTOPY_MAX_SET_ASIDE: usize = 25;
+const HOMOTOPY_FIRST_STEP: f64 = 0.05;
+const HOMOTOPY_MAX_FAILS: usize = 8;
+/// [`EsagRegressor::stratum_maximum`]: the radius, relative to their
+/// scale, at which the vanishing coordinates of a trapped observation are
+/// held (the limit of its density is reached to that order), the angles
+/// searched for its best direction, and the rounds of joining newly
+/// trapped observations.
+const STRATUM_RADIUS: f64 = 1e-8;
+const STRATUM_ANGLES: usize = 360;
+const STRATUM_ROUNDS: usize = 8;
+/// A suspect left at a saddle on the set restarts at this relative radius.
+const STRATUM_PUSH: f64 = 1e-3;
+/// Projected Newton steps after the L-BFGS run of a stratum polish.
+const STRATUM_NEWTON: usize = 12;
+/// A maximum on the singular set is kept if its log-likelihood is at most
+/// this much below the trapped fit's (an observation held there that was
+/// not drawn to it costs likelihood).
+const STRATUM_SLACK: f64 = 1e-6;
+
+/// Iterations of each warm-started fit within the homotopy: steps that
+/// succeed need far fewer, and ones that do not would otherwise run to
+/// `max_iter`.
+const HOMOTOPY_STEP_ITER: usize = 600;
 /// A mean direction with `√(μ̂_0² + μ̂_1²)` below this (about 17° from the
 /// pole set of `onb(μ)`) gets a summary note recommending
 /// [`Shape::GammaTransported`]. The slow cases measured sat at 0.12–0.19
@@ -1406,65 +2120,207 @@ const POLE_NEAR: f64 = 0.3;
 
 /// Observations of a gamma fit at `b` that sit at a singular set of the
 /// parameterization, where `V(γ)` is discontinuous: a group `j ≥ 2` whose
-/// trailing pair nearly vanishes (relative to the group norm), or a mean
-/// direction near the pole `μ̂₀ = μ̂₁ = 0` of the frame `onb(μ)`, in either
-/// case with a gradient over [`SINGULAR_GRADIENT`] times the median. Near
+/// trailing pair nearly vanishes (relative to the group norm), a group
+/// `j ≥ 2` that nearly vanishes (relative to the largest lower group), or a
+/// mean direction near the pole `μ̂₀ = μ̂₁ = 0` of the frame `onb(μ)` (the
+/// antipode of the reference for `Shape::GammaTransported`). Flagged when
+/// within [`SINGULAR_ON`] of such a set, or within [`SINGULAR_DISTANCE`]
+/// with a gradient over [`SINGULAR_GRADIENT`] times the median. Near
 /// such a set the observation's density changes by `O(1)` as the
 /// coefficients turn around it, so the observation on the set at its best
 /// angle is a trap: a non-regular local supremum of the likelihood, where
 /// optimisers stall (`docs/MATH.md` §2). Empty for the log-tangent shape.
 pub(crate) fn singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
+    let rows = singular_rows(data, b);
+    if rows.is_empty() {
+        return vec![];
+    }
+    let mut norms: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    let mid = norms.len() / 2;
+    let (_, med, _) = norms.select_nth_unstable_by(mid, f64::total_cmp);
+    let cut = SINGULAR_GRADIENT * *med;
+    // on the set (at its best angle the gradient need not be large), or
+    // near it with a large gradient
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.1 < SINGULAR_ON || (r.0 > cut && r.1 < SINGULAR_DISTANCE))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Observations of a gamma fit at `b` within [`SINGULAR_DISTANCE`] of a
+/// singular set, whatever their gradient: the suspects of a fit that did
+/// not converge (an optimiser creeping towards a trap is stopped by the
+/// race before the observation reaches the set or its gradient the
+/// threshold of [`singular_observations`]). A superset of those.
+pub(crate) fn near_singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
+    singular_rows(data, b)
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.1 < SINGULAR_DISTANCE)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A singular set of the gamma parameterization (see
+/// [`singular_observations`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingularSet {
+    /// The pole `μ̂₀ = μ̂₁ = 0` of the frame `onb(μ)`.
+    Pole,
+    /// The antipode of the reference of [`Shape::GammaTransported`].
+    Antipode,
+    /// The trailing pair of group `j ≥ 2`.
+    Pair(usize),
+    /// Group `j ≥ 2`, above a nonzero lower group.
+    Zero(usize),
+}
+
+impl SingularSet {
+    /// The rows of an observation's `η` that vanish on the set, and the
+    /// norm they are measured against (`None` for the antipode, a point).
+    fn rows(self, d: usize, eta: &[f64]) -> Option<(Vec<usize>, f64)> {
+        let nrm = |r: std::ops::Range<usize>| eta[r].iter().map(|v| v * v).sum::<f64>().sqrt();
+        let group = |j: usize| d + j * (j + 1) / 2 - 1..d + j * (j + 1) / 2 + j;
+        match self {
+            Self::Pole => Some((vec![0, 1], nrm(0..d))),
+            Self::Antipode => None,
+            Self::Pair(j) => {
+                let g = group(j);
+                Some((vec![g.end - 2, g.end - 1], nrm(g)))
+            }
+            Self::Zero(j) => {
+                let lower = (1..j).map(|l| nrm(group(l))).fold(0.0, f64::max);
+                Some((group(j).collect(), lower))
+            }
+        }
+    }
+}
+
+/// The relative distance of an observation's `η` to the nearest singular
+/// set of the gamma parameterization, and that set.
+fn nearest_singular(data: &RegressionData, eta: &[f64]) -> (f64, SingularSet) {
+    let d = data.d;
+    let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
+    let mut best = match (&data.gt, mm > 0.0) {
+        // transported frame: ‖μ̂ + m‖/2, zero at the antipode
+        (Some(fr), true) => {
+            let inv = 1.0 / mm.sqrt();
+            let m = fr.reference();
+            let r = (0..d)
+                .map(|k| (eta[k] * inv + m[k]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                * 0.5;
+            (r, SingularSet::Antipode)
+        }
+        // onb(μ): its pole μ̂_0 = μ̂_1 = 0
+        (None, true) => (
+            ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt(),
+            SingularSet::Pole,
+        ),
+        (_, false) => (1.0, SingularSet::Pole),
+    };
+    // the largest norm of the groups below the current one: a group j ≥ 2
+    // vanishing above a nonzero lower group is singular too
+    let mut lower = (eta[d] * eta[d] + eta[d + 1] * eta[d + 1]).sqrt();
+    for gr in 2..=d - 2 {
+        let off = d + gr * (gr + 1) / 2 - 1;
+        let grp = &eta[off..off + gr + 1];
+        let all = grp.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if all > 0.0 {
+            let pair = (grp[gr - 1].powi(2) + grp[gr].powi(2)).sqrt();
+            if pair / all < best.0 {
+                best = (pair / all, SingularSet::Pair(gr));
+            }
+        }
+        if lower > 0.0 && all / lower < best.0 {
+            best = (all / lower, SingularSet::Zero(gr));
+        }
+        lower = lower.max(all);
+    }
+    best
+}
+
+/// Per observation of a gamma fit at `b`: the norm of its gradient in `η`
+/// and its relative distance to the nearest singular set (see
+/// [`singular_observations`]). Empty for the log-tangent shape.
+fn singular_rows(data: &RegressionData, b: &DMatrix<f64>) -> Vec<(f64, f64)> {
     if data.lt.is_some() {
         return vec![];
     }
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     let mut eta = vec![0.0; bd];
     let mut g = vec![0.0; bd];
-    let rows: Vec<(f64, f64)> = (0..data.n)
+    (0..data.n)
         .map(|i| {
             for (k, e) in eta.iter_mut().enumerate() {
                 *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
             }
             kernel_grad(data, &eta, &data.y[i * d..(i + 1) * d], &mut g);
             let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
-            // relative distance to the nearest singular set
-            let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
-            let mut dist = match (&data.gt, mm > 0.0) {
-                // transported frame: ‖μ̂ + m‖/2, zero at the antipode
-                (Some(fr), true) => {
-                    let inv = 1.0 / mm.sqrt();
-                    let m = fr.reference();
-                    (0..d)
-                        .map(|k| (eta[k] * inv + m[k]).powi(2))
-                        .sum::<f64>()
-                        .sqrt()
-                        * 0.5
-                }
-                // onb(μ): its pole μ̂_0 = μ̂_1 = 0
-                (None, true) => ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt(),
-                (_, false) => 1.0,
-            };
-            for gr in 2..=d - 2 {
-                let off = d + gr * (gr + 1) / 2 - 1;
-                let grp = &eta[off..off + gr + 1];
-                let all = grp.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if all > 0.0 {
-                    let pair = (grp[gr - 1].powi(2) + grp[gr].powi(2)).sqrt();
-                    dist = dist.min(pair / all);
-                }
-            }
-            (gn, dist)
+            (gn, nearest_singular(data, &eta).0)
         })
-        .collect();
-    let mut norms: Vec<f64> = rows.iter().map(|r| r.0).collect();
-    let mid = norms.len() / 2;
-    let (_, med, _) = norms.select_nth_unstable_by(mid, f64::total_cmp);
-    let cut = SINGULAR_GRADIENT * *med;
-    rows.iter()
-        .enumerate()
-        .filter(|(_, r)| r.0 > cut && r.1 < SINGULAR_DISTANCE)
-        .map(|(i, _)| i)
         .collect()
+}
+
+/// Gamma groups `j ≥ 2` that have collapsed at `b`: the group (relative to
+/// the largest lower group) or its trailing pair (relative to the group)
+/// nearly zero for most observations (median ratio below [`SINGULAR_ON`]).
+/// Such a fit sits on the singular set for every observation at once; it
+/// comes from a path that reversed the group's direction through zero.
+pub(crate) fn collapsed_groups(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
+    if data.lt.is_some() || data.d < 4 {
+        return vec![];
+    }
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let mut eta = vec![0.0; bd];
+    let mut ratios = vec![vec![0.0; data.n]; d - 3];
+    for i in 0..data.n {
+        for (k, e) in eta.iter_mut().enumerate() {
+            *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
+        }
+        let mut lower = (eta[d] * eta[d] + eta[d + 1] * eta[d + 1]).sqrt();
+        for gr in 2..=d - 2 {
+            let off = d + gr * (gr + 1) / 2 - 1;
+            let grp = &eta[off..off + gr + 1];
+            let all = grp.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let pair = (grp[gr - 1].powi(2) + grp[gr].powi(2)).sqrt();
+            let zero = if lower > 0.0 { all / lower } else { 1.0 };
+            let pole = if all > 0.0 { pair / all } else { 1.0 };
+            ratios[gr - 2][i] = zero.min(pole);
+            lower = lower.max(all);
+        }
+    }
+    ratios
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(k, r)| {
+            let mid = r.len() / 2;
+            let (_, med, _) = r.select_nth_unstable_by(mid, f64::total_cmp);
+            (*med < SINGULAR_ON).then_some(k + 2)
+        })
+        .collect()
+}
+
+/// `b` with the coefficients of gamma group `gr` replaced by ± its
+/// intercept in `reference` (zero slopes): the two ways out of a collapse.
+fn reseeded_group(
+    b: &DMatrix<f64>,
+    reference: &DMatrix<f64>,
+    d: usize,
+    gr: usize,
+) -> [DMatrix<f64>; 2] {
+    let off = d + gr * (gr + 1) / 2 - 1;
+    let mut out = [b.clone(), b.clone()];
+    for (s, c) in [1.0, -1.0].into_iter().zip(out.iter_mut()) {
+        for k in off..off + gr + 1 {
+            for j in 0..c.ncols() {
+                c[(k, j)] = if j == 0 { s * reference[(k, 0)] } else { 0.0 };
+            }
+        }
+    }
+    out
 }
 
 /// An observation whose log-density exceeds the median observation's by
@@ -1508,6 +2364,7 @@ pub(crate) fn degenerate_observations(data: &RegressionData, b: &DMatrix<f64>) -
 const MAX_MEAN_GRADIENT: f64 = 1e-3;
 
 /// Validated, flattened training data.
+#[derive(Clone)]
 pub(crate) struct RegressionData {
     pub n: usize,
     pub d: usize,
@@ -1526,6 +2383,9 @@ pub(crate) struct RegressionData {
     /// The transported frame of [`Shape::GammaTransported`] (`None`: gamma
     /// in `onb(mu)`, or log-tangent).
     pub gt: Option<LtFrame>,
+    /// Observation weights of the log-likelihood (`None`: all 1), for the
+    /// weight homotopy of [`EsagRegressor::homotopy_rounds`].
+    pub w: Option<Vec<f64>>,
 }
 
 impl RegressionData {
@@ -1602,6 +2462,7 @@ impl RegressionData {
             y: yf,
             lt: None,
             gt: None,
+            w: None,
         })
     }
 }
@@ -1654,6 +2515,126 @@ impl Objective for Whitened<'_> {
 
     fn should_stop(&self) -> bool {
         self.inner.should_stop()
+    }
+}
+
+/// [`NegLogLik`] on the affine subspace `C x = c` of the free coefficients,
+/// for [`EsagRegressor::stratum_maximum`]: the gradient projected on the
+/// null space of `C`. From a feasible start L-BFGS then stays feasible (its
+/// steps combine projected gradients and earlier steps).
+struct Projected<'a> {
+    inner: &'a NegLogLik<'a>,
+    /// `Cᵀ` (free coefficients × constraints)
+    ct: DMatrix<f64>,
+    /// `(C Cᵀ)⁻¹ C`
+    pinv: DMatrix<f64>,
+}
+
+impl Objective for Projected<'_> {
+    fn value_and_gradient(&self, x: &[f64], grad: &mut [f64]) -> f64 {
+        let f = self.inner.value_and_gradient(x, grad);
+        let along = &self.ct * (&self.pinv * DVector::from_column_slice(grad));
+        for (g, a) in grad.iter_mut().zip(along.iter()) {
+            *g -= a;
+        }
+        f
+    }
+}
+
+/// [`NegLogLik`] in blown-up coordinates around the singular sets of `k`
+/// observations ([`EsagRegressor::stratum_maximum`]). Their vanishing pairs
+/// `p_i = C_i x + f_i` (the trailing pair of a gamma group, or `μ₀, μ₁` at
+/// the pole of `onb(μ)`) become `(ρ_i² + ε_i)(cos θ_i, sin θ_i)`, the rest
+/// of `x` its part `x_⊥` in the null space of `C`:
+/// `x = x_⊥ + C⁺ (p(ρ, θ) − f)`. In `(x_⊥, ρ, θ)` the likelihood is smooth
+/// up to the singular set: an observation's density there depends on the
+/// angle only, and `ρ = 0` is an ordinary critical point, a maximum where
+/// the observation is drawn to the set (a trap), a minimum where its
+/// maximum is at `ρ > 0` (a regular root next to the set). The angular
+/// curvature, `O(1/r²)` in `x`, is `O(1)` in `θ`.
+struct BlownUp<'a> {
+    inner: &'a NegLogLik<'a>,
+    nf: usize,
+    /// `C⁺ = Cᵀ (C Cᵀ)⁻¹` (free coefficients × 2k)
+    cplus: DMatrix<f64>,
+    /// `C`
+    c: DMatrix<f64>,
+    /// the fixed coefficients' part `f` of each pair coordinate
+    fixed: DVector<f64>,
+    /// the radius `ε_i` at `ρ_i = 0`, so that the angle is defined there
+    eps: Vec<f64>,
+}
+
+impl BlownUp<'_> {
+    /// The pairs at `(ρ, θ)`.
+    fn pairs(&self, y: &[f64]) -> DVector<f64> {
+        let (nf, k) = (self.nf, self.eps.len());
+        let mut p = DVector::zeros(2 * k);
+        for i in 0..k {
+            let (rho, th) = (y[nf + i], y[nf + k + i]);
+            let r = rho * rho + self.eps[i];
+            p[2 * i] = r * th.cos();
+            p[2 * i + 1] = r * th.sin();
+        }
+        p
+    }
+
+    /// The free coefficients at `y = (x_⊥, ρ, θ)`.
+    fn x(&self, y: &[f64]) -> DVector<f64> {
+        DVector::from_column_slice(&y[..self.nf]) + &self.cplus * (self.pairs(y) - &self.fixed)
+    }
+
+    /// The blown-up coordinates of the free coefficients `x`.
+    fn y(&self, x: &DVector<f64>) -> Vec<f64> {
+        let k = self.eps.len();
+        let p = &self.c * x + &self.fixed;
+        let perp = x - &self.cplus * (&self.c * x);
+        let mut y: Vec<f64> = perp.as_slice().to_vec();
+        y.extend((0..k).map(|i| {
+            let r = (p[2 * i].powi(2) + p[2 * i + 1].powi(2)).sqrt();
+            (r - self.eps[i]).max(0.0).sqrt()
+        }));
+        y.extend((0..k).map(|i| p[2 * i + 1].atan2(p[2 * i])));
+        y
+    }
+
+    /// The radius `r_i − ε_i = ρ_i²` and the radial derivative `∂f/∂r_i`
+    /// of the objective at `y`, per observation.
+    fn radial(&self, y: &[f64]) -> Vec<(f64, f64)> {
+        let (nf, k) = (self.nf, self.eps.len());
+        let x = self.x(y);
+        let mut gx = vec![0.0; nf];
+        self.inner.value_and_gradient(x.as_slice(), &mut gx);
+        let gp = self.cplus.transpose() * DVector::from_column_slice(&gx);
+        (0..k)
+            .map(|i| {
+                let (rho, th) = (y[nf + i], y[nf + k + i]);
+                (rho * rho, gp[2 * i] * th.cos() + gp[2 * i + 1] * th.sin())
+            })
+            .collect()
+    }
+}
+
+impl Objective for BlownUp<'_> {
+    fn value_and_gradient(&self, y: &[f64], grad: &mut [f64]) -> f64 {
+        let (nf, k) = (self.nf, self.eps.len());
+        let x = self.x(y);
+        let mut gx = vec![0.0; nf];
+        let f = self.inner.value_and_gradient(x.as_slice(), &mut gx);
+        let gx = DVector::from_column_slice(&gx);
+        // ∂f/∂p = C⁺ᵀ ∇f; ∂f/∂x_⊥ = (I − C⁺C)ᵀ ∇f = ∇f − Cᵀ C⁺ᵀ ∇f
+        let gp = self.cplus.transpose() * &gx;
+        let perp = &gx - self.c.transpose() * &gp;
+        grad[..nf].copy_from_slice(perp.as_slice());
+        for i in 0..k {
+            let (rho, th) = (y[nf + i], y[nf + k + i]);
+            let r = rho * rho + self.eps[i];
+            let (c, s) = (th.cos(), th.sin());
+            // p_i = r (c, s): ∂p/∂ρ = 2ρ (c, s), ∂p/∂θ = r (−s, c)
+            grad[nf + i] = 2.0 * rho * (gp[2 * i] * c + gp[2 * i + 1] * s);
+            grad[nf + k + i] = r * (gp[2 * i + 1] * c - gp[2 * i] * s);
+        }
+        f
     }
 }
 
@@ -1965,7 +2946,7 @@ fn joint_eval(
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     // one eigen-decomposition of the common shape (the intercept column)
     let sh = match &data.lt {
-        Some(_) if shared => {
+        Some(_) if shared && data.w.is_none() => {
             let s: Vec<f64> = (d..bd).map(|k| b[(k, 0)]).collect();
             Some(crate::logtangent::SharedShape::new(&s, d - 1))
         }
@@ -2011,7 +2992,7 @@ fn joint_eval(
             let yi = &data.y[i * d..(i + 1) * d];
             let gcol = &mut ge[r * bd..(r + 1) * bd];
             let ei = &eta[r * bd..(r + 1) * bd];
-            f += match (&sh, &data.lt) {
+            let fi = match (&sh, &data.lt) {
                 (Some(sh), Some(fr)) => crate::logtangent::loglik_lt_grad_shared(
                     fr,
                     sh,
@@ -2021,6 +3002,18 @@ fn joint_eval(
                     wacc,
                 ),
                 _ => kernel_grad(data, ei, yi, gcol),
+            };
+            f += match &data.w {
+                // weights are used without the shared-shape path only
+                Some(w) if w[i] == 0.0 => {
+                    gcol.fill(0.0);
+                    0.0
+                }
+                Some(w) => {
+                    gcol.iter_mut().for_each(|v| *v *= w[i]);
+                    w[i] * fi
+                }
+                None => fi,
             };
             if ratio {
                 norms.push(gcol.iter().map(|v| v * v).sum::<f64>());
@@ -2285,10 +3278,18 @@ pub(crate) fn joint_loglik_grad_hess_with(
                     .map(|(a, c)| a * c)
                     .sum();
             }
-            f += obs_hessian(data, kind, &eta, yi, &mut ge, &mut he);
+            let wi = data.w.as_ref().map_or(1.0, |w| w[i]);
+            if wi == 0.0 {
+                // set aside (an observation on a singular set may have huge
+                // derivatives; 0·∞ would poison the sums)
+                ge.fill(0.0);
+                he.fill(0.0);
+            } else {
+                f += wi * obs_hessian(data, kind, &eta, yi, &mut ge, &mut he);
+            }
             for j in 0..pt {
                 for k in 0..bd {
-                    g[j * bd + k] += ge[k] * xi[j];
+                    g[j * bd + k] += wi * ge[k] * xi[j];
                 }
             }
             // the upper triangle of H_i, row by row (the order of `hpairs`)
@@ -2301,7 +3302,7 @@ pub(crate) fn joint_loglik_grad_hess_with(
             }
             let col = &mut w.as_mut_slice()[r * xpairs.len()..(r + 1) * xpairs.len()];
             for (v, &(j1, j2)) in col.iter_mut().zip(&xpairs) {
-                *v = xi[j1] * xi[j2];
+                *v = wi * xi[j1] * xi[j2];
             }
         }
         (f, g, hs * w.transpose())
@@ -2415,6 +3416,20 @@ pub struct EsagRegressorFit {
     /// unbounded (see [`degenerate_observations`]). Empty otherwise.
     #[serde(default)]
     pub degenerate_obs: Vec<usize>,
+    /// Observations (row indices) set aside: a gamma fit that stayed
+    /// trapped with them returned the converged fit of the others (their
+    /// number is [`EsagRegressorFit::n_obs`]); the log-likelihood, standard
+    /// errors and criteria refer to those. Empty otherwise.
+    #[serde(default)]
+    pub set_aside_obs: Vec<usize>,
+    /// The fit converged to a maximum of the likelihood that is not
+    /// regular: the observations in [`EsagRegressorFit::singular_obs`] sit
+    /// on a singular set of the gamma parameterization at their best
+    /// direction, and no regular maximum continued from the fit without
+    /// them (see [`EsagRegressor::stratum_maximum`] and `docs/MATH.md`). Its
+    /// standard errors use the information of the other observations.
+    #[serde(default)]
+    pub non_regular: bool,
     /// Observed information (Hessian of the negative log-likelihood) over the
     /// free parameters, if computed.
     pub hessian: Option<DMatrix<f64>>,

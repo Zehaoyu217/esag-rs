@@ -839,43 +839,75 @@ fn safety_net_value() {
     }
 }
 
-/// A gamma fit with observations pinned at the singular set is flagged and
-/// explained; the log-tangent fit of the same data converges.
-#[test]
-fn pinned_gamma_fit_is_reported() {
-    let d = 5;
-    let (x, y) = simulate(&hard_truth(d), 500, 901, Shape::Gamma);
-    let fit = EsagRegressor::new()
-        .with_parallel(false)
-        .fit(&x, &y)
-        .unwrap();
-    assert!(!fit.converged);
-    assert!(
-        !fit.singular_obs.is_empty(),
-        "no singular observations found"
-    );
-    assert!(fit.summary().contains("singular set of the gamma"));
-    let lt = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
-    assert!(lt.converged && lt.singular_obs.is_empty());
-}
-
-/// A trapped γ fit (d = 5, hard scenario, n = 500, seed 950) is rescued by
-/// exclusion rounds: they reach a regular root (converged, no trapped
-/// observation) with a higher likelihood than the trap.
-#[test]
-fn trapped_gamma_fit_is_rescued() {
+/// The trapped state of a gamma fit (d = 5, hard scenario, n = 500, seed
+/// 950): the optimizer from the moment start ends with an observation on the
+/// singular set. Precondition of the two tests below.
+fn trapped_gamma_raw() -> (DMatrix<f64>, DMatrix<f64>, EsagRegressor, RawFit) {
     let (x, y) = simulate(&hard_truth(5), 500, 950, Shape::Gamma);
     let cfg = config(5, Shape::Gamma);
     let data = cfg.data(&x, &y).unwrap();
     let mask = cfg.resolve_mask(&data).unwrap();
     let b0 = cfg.initial_coef(&data).unwrap();
     let raw = cfg.optimize(&data, &b0, &free_params(&mask), cfg.max_iter);
-    assert!(!raw.converged && !singular_observations(&data, &raw.coef).is_empty());
+    assert!(
+        !raw.converged && !singular_observations(&data, &raw.coef).is_empty(),
+        "precondition: the moment-start fit of this dataset is trapped"
+    );
+    (x, y, cfg, raw)
+}
+
+/// A trapped gamma fit is flagged and explained (whatever the rescue in
+/// `fit` then achieves on the same data); the log-tangent fit of the same
+/// data converges.
+#[test]
+fn pinned_gamma_fit_is_reported() {
+    let (x, y, cfg, raw) = trapped_gamma_raw();
+    let data = cfg.data(&x, &y).unwrap();
+    let mask = cfg.resolve_mask(&data).unwrap();
+    let fit = cfg.finalize(&data, raw, mask).unwrap();
+    assert!(!fit.converged);
+    assert!(
+        !fit.singular_obs.is_empty(),
+        "no singular observations found"
+    );
+    assert!(fit.summary().contains("singular set of the gamma"));
+    assert!(fit.set_aside_obs.is_empty());
+    let lt = config(5, Shape::LogTangent).fit(&x, &y).unwrap();
+    assert!(lt.converged && lt.singular_obs.is_empty());
+}
+
+/// That trapped fit is resolved by `fit`: either the weight homotopy reaches
+/// a regular root of the full likelihood (converged, no observation on the
+/// singular set, above the trap) or the blown-up coordinates certify a
+/// non-regular maximum (converged, `non_regular`, not below the trap). In
+/// both cases the fit is converged with a log-likelihood at least the
+/// trap's, and nothing is silently set aside.
+#[test]
+fn trapped_gamma_fit_is_rescued() {
+    let (x, y, cfg, raw) = trapped_gamma_raw();
+    let data = cfg.data(&x, &y).unwrap();
+    let mask = cfg.resolve_mask(&data).unwrap();
     let trap = raw.neg_ll;
-    let res = cfg.exclusion_rounds(&x, &y, &data, raw, &mask);
-    assert!(res.converged, "not rescued");
-    assert!(singular_observations(&data, &res.coef).is_empty());
-    assert!(res.neg_ll < trap - 1.0, "{} vs trap {trap}", res.neg_ll);
+    if let Homotopy::Regular(r) = cfg.homotopy_rounds(&data, &raw, &mask, None) {
+        assert!(r.converged && singular_observations(&data, &r.coef).is_empty());
+        assert!(r.neg_ll < trap - 1.0, "{} vs trap {trap}", r.neg_ll);
+    }
+    let fit = cfg.fit(&x, &y).unwrap();
+    assert!(fit.set_aside_obs.is_empty());
+    assert!(
+        fit.converged,
+        "the trapped fit was neither rescued nor certified: {}",
+        fit.summary()
+    );
+    assert!(
+        fit.log_likelihood >= -trap - 1e-6,
+        "fit {} below the trap {}",
+        fit.log_likelihood,
+        -trap
+    );
+    if !fit.non_regular {
+        assert!(fit.singular_obs.is_empty());
+    }
 }
 
 /// Without covariates `Shape::GammaTransported` is `Shape::Gamma`: the same
@@ -2157,8 +2189,10 @@ fn rescue_seed_search() {
                 return None;
             }
             let before = raw.neg_ll;
-            let res = cfg.exclusion_rounds(&x, &y, &data, raw, &mask);
-            (res.converged && res.neg_ll < before).then_some((seed, before - res.neg_ll))
+            match cfg.homotopy_rounds(&data, &raw, &mask, None) {
+                Homotopy::Regular(r) if r.neg_ll < before => Some((seed, before - r.neg_ll)),
+                _ => None,
+            }
         })
         .collect();
     println!("n = {n}: rescued seeds {hits:?}");
@@ -3018,11 +3052,13 @@ fn gamma_big_d() {
         let vtrue: Vec<DMatrix<f64>> = (0..200)
             .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
             .collect();
-        let rows: Vec<[(bool, usize, f64, f64); 2]> = (900..900 + reps)
+        // per shape: converged, iterations, seconds, V error, set aside
+        type Row = [(bool, usize, f64, f64, usize); 2];
+        let rows: Vec<Row> = (900..900 + reps)
             .into_par_iter()
             .map(|seed| {
                 let (x, y) = simulate(&b, n, seed, Shape::Gamma);
-                let mut out = [(false, 0, 0.0, 0.0); 2];
+                let mut out = [(false, 0, 0.0, 0.0, 0); 2];
                 for (k, shape) in [Shape::Gamma, Shape::LogTangent].into_iter().enumerate() {
                     let t = Instant::now();
                     let f = EsagRegressor::new()
@@ -3043,7 +3079,7 @@ fn gamma_big_d() {
                         })
                         .sum::<f64>()
                         / 200.0;
-                    out[k] = (f.converged, f.n_iter, s, ve);
+                    out[k] = (f.converged, f.n_iter, s, ve, f.set_aside_obs.len());
                 }
                 out
             })
@@ -3056,7 +3092,7 @@ fn gamma_big_d() {
             ve.sort_by(f64::total_cmp);
             it.sort_unstable();
             println!(
-                "d={d:>2} K={:>3} {} {name:<12} converged {}/{reps}, median {:>4} iterations, {:.2} s, V error {:.3}",
+                "d={d:>2} K={:>3} {} {name:<12} converged {}/{reps} (set-aside fits {}, sizes {:?}), median {:>4} iterations, {:.2} s, V error {:.3}",
                 bd * pt,
                 if std::env::var("HARD").is_ok() {
                     "hard    "
@@ -3064,6 +3100,11 @@ fn gamma_big_d() {
                     "standard"
                 },
                 rows.iter().filter(|r| r[k].0).count(),
+                rows.iter().filter(|r| r[k].4 > 0).count(),
+                rows.iter()
+                    .filter(|r| r[k].4 > 0)
+                    .map(|r| r[k].4)
+                    .collect::<Vec<_>>(),
                 it[it.len() / 2],
                 t[t.len() / 2],
                 ve[ve.len() / 2]
@@ -3083,11 +3124,22 @@ fn gamma_d10_diagnosis() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     let b = standard_truth(d, 5);
-    for seed in [900u64, 901, 902] {
+    let seeds: Vec<u64> = std::env::var("SEEDS")
+        .unwrap_or_else(|_| "900,901,902".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for seed in seeds {
         let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
         let cfg = EsagRegressor::new().with_parallel(false);
         let data = cfg.data(&x, &y).unwrap();
         let f = cfg.fit(&x, &y).unwrap();
+        let pr = pair_ratios(&data, &f.coef);
+        let (imin, rmin) = pr
+            .iter()
+            .enumerate()
+            .fold((0, 1.0f64), |a, (i, &r)| if r < a.1 { (i, r) } else { a });
+        println!("seed {seed}: smallest pair ratio {rmin:.1e} (#{imin})");
         let tll = joint_loglik_and_grad(&data, &b, false).0;
         let lams: Vec<f64> = {
             let eta: Vec<f64> = (0..b.nrows()).map(|k| b[(k, 0)]).collect();
@@ -3753,10 +3805,19 @@ fn gamma_big_d_tests() {
 #[ignore]
 fn gamma_trimmed_fits() {
     use rayon::prelude::*;
-    let env = |k: &str, v: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(v);
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
     let (d, reps) = (env("D", 5), env("R", 12) as u64);
     let hard = std::env::var("HARD").is_ok();
-    let b = if hard { hard_truth(d) } else { standard_truth(d, 5) };
+    let b = if hard {
+        hard_truth(d)
+    } else {
+        standard_truth(d, 5)
+    };
     let (bd, pt) = (b.nrows(), b.ncols());
     let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
     let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
@@ -3764,11 +3825,17 @@ fn gamma_trimmed_fits() {
             .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
             .collect()
     };
-    let vtrue: Vec<DMatrix<f64>> =
-        (0..200).map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance()).collect();
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
+        .collect();
     let verr = |c: &DMatrix<f64>| {
         (0..200)
-            .map(|i| geodesic(&vtrue[i], &Esag::from_eta(&eta_at(c, i)).unwrap().covariance()))
+            .map(|i| {
+                geodesic(
+                    &vtrue[i],
+                    &Esag::from_eta(&eta_at(c, i)).unwrap().covariance(),
+                )
+            })
             .sum::<f64>()
             / 200.0
     };
@@ -3793,13 +3860,23 @@ fn gamma_trimmed_fits() {
                 out.extend(drop);
                 out.sort_unstable();
                 out.dedup();
-                keep = (0..x.nrows()).filter(|i| out.binary_search(i).is_err()).collect();
+                keep = (0..x.nrows())
+                    .filter(|i| out.binary_search(i).is_err())
+                    .collect();
                 let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
                 let ys = DMatrix::from_fn(keep.len(), y.ncols(), |a, j| y[(keep[a], j)]);
                 cur = cfg.fit_warm(&xs, &ys, &cur.coef).unwrap();
             }
             let t1 = t.elapsed().as_secs_f64() + t0;
-            (f.converged, verr(&f.coef), t0, cur.converged, out.len(), verr(&cur.coef), t1)
+            (
+                f.converged,
+                verr(&f.coef),
+                t0,
+                cur.converged,
+                out.len(),
+                verr(&cur.coef),
+                t1,
+            )
         })
         .collect();
     let med = |mut v: Vec<f64>| {
@@ -3816,5 +3893,1255 @@ fn gamma_trimmed_fits() {
         rows.iter().map(|r| r.4).collect::<Vec<_>>(),
         med(rows.iter().map(|r| r.5).collect()),
         med(rows.iter().map(|r| r.6).collect())
+    );
+}
+
+/// Maximise `L_rest + w·L_S` (observations in `S` weighted by `w`) by
+/// L-BFGS whitened with the exact information at the start (of the rest
+/// alone if the sum is not definite). Returns (coef, converged, max|g| of
+/// the weighted objective).
+fn weighted_fit(
+    rest: &RegressionData,
+    sset: &RegressionData,
+    w: f64,
+    b0: &DMatrix<f64>,
+) -> (DMatrix<f64>, bool, f64) {
+    use crate::optim::lbfgs::{FnObjective, LbfgsConfig, minimize};
+    let (bd, pt) = (rest.b_dim, rest.p_total);
+    let k = bd * pt;
+    let info = |b: &DMatrix<f64>, with_s: bool| -> DMatrix<f64> {
+        let (_, _, h) = joint_loglik_grad_hess(rest, b, false);
+        let mut m = -DMatrix::from_column_slice(k, k, &h);
+        if with_s && w > 0.0 {
+            let (_, _, hs) = joint_loglik_grad_hess(sset, b, false);
+            m -= DMatrix::from_column_slice(k, k, &hs) * w;
+        }
+        (&m + m.transpose()) * 0.5
+    };
+    let chol = info(b0, true)
+        .cholesky()
+        .or_else(|| info(b0, false).cholesky());
+    let Some(ch) = chol else {
+        return (b0.clone(), false, f64::INFINITY);
+    };
+    let linv_t = ch.l().transpose().try_inverse().unwrap();
+    let start: Vec<f64> = b0.as_slice().to_vec();
+    let to_b = |th: &[f64]| -> DMatrix<f64> {
+        let v = &linv_t * DVector::from_column_slice(th);
+        DMatrix::from_column_slice(bd, pt, &(0..k).map(|a| start[a] + v[a]).collect::<Vec<_>>())
+    };
+    let eval = |b: &DMatrix<f64>| -> (f64, Vec<f64>) {
+        let (f1, g1) = joint_loglik_and_grad(rest, b, false);
+        let (mut f, mut g) = (f1, g1.as_slice().to_vec());
+        if w > 0.0 {
+            let (f2, g2) = joint_loglik_and_grad(sset, b, false);
+            f += w * f2;
+            for (a, v) in g.iter_mut().zip(g2.as_slice()) {
+                *a += w * v;
+            }
+        }
+        (f, g)
+    };
+    let obj = FnObjective(|th: &[f64], out: &mut [f64]| {
+        let b = to_b(th);
+        // g in the column-major order of B's entries, as the start and h
+        let (f, g) = eval(&b);
+        let gz = linv_t.transpose() * DVector::from_column_slice(&g);
+        for (o, v) in out.iter_mut().zip(gz.iter()) {
+            *o = -v;
+        }
+        -f
+    });
+    let cfg = LbfgsConfig {
+        memory: k.clamp(10, 200),
+        max_iter: 600,
+        max_fev: 6000,
+        tol_grad: 1e-7,
+        ..LbfgsConfig::default()
+    };
+    let res = minimize(&obj, &vec![0.0; k], &cfg);
+    let b = to_b(&res.x);
+    let (_, g) = eval(&b);
+    let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    (b, res.status.is_converged(), gmax)
+}
+
+/// Weight homotopy to γ's regular root at large d: set the trapped
+/// observations S aside (accumulating until the rest converges), then
+/// raise their weight from 0 to 1 in small steps, each fit warm from the
+/// last. Env `D` (default 10), `R`, `HARD=1`.
+/// `cargo test --release --lib gamma_weight_homotopy -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_weight_homotopy() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps) = (env("D", 10), env("R", 8) as u64);
+    let hard = std::env::var("HARD").is_ok();
+    let b = if hard {
+        hard_truth(d)
+    } else {
+        standard_truth(d, 5)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let rows: Vec<String> = (940..940 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let n = x.nrows();
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let tll = joint_loglik_and_grad(&data, &b, false).0;
+            let t = Instant::now();
+            let prod = cfg.fit(&x, &y).unwrap();
+            if prod.converged {
+                return format!("seed {seed}: production converged, ll-truth {:+.1}", prod.log_likelihood - tll);
+            }
+            let sub = |idx: &[usize]| -> RegressionData {
+                let xs = DMatrix::from_fn(idx.len(), x.ncols(), |a, j| x[(idx[a], j)]);
+                let ys = DMatrix::from_fn(idx.len(), y.ncols(), |a, j| y[(idx[a], j)]);
+                cfg.data(&xs, &ys).unwrap()
+            };
+            // set aside until the rest converges
+            let mut sset: Vec<usize> = singular_observations(&data, &prod.coef);
+            let mut cur = prod.coef.clone();
+            let mut rest_ok = false;
+            for _ in 0..8 {
+                sset.sort_unstable();
+                sset.dedup();
+                let keep: Vec<usize> = (0..n).filter(|i| sset.binary_search(i).is_err()).collect();
+                let rd = sub(&keep);
+                let (c, conv, _) = weighted_fit(&rd, &rd, 0.0, &cur);
+                cur = c;
+                let trapped = singular_observations(&rd, &cur);
+                if conv && trapped.is_empty() {
+                    rest_ok = true;
+                    break;
+                }
+                sset.extend(trapped.iter().map(|&i| keep[i]));
+            }
+            if !rest_ok {
+                return format!("seed {seed}: rest did not converge after setting aside {}", sset.len());
+            }
+            let keep: Vec<usize> = (0..n).filter(|i| sset.binary_search(i).is_err()).collect();
+            let (rd, sd) = (sub(&keep), sub(&sset));
+            // homotopy in the weight of S
+            let mut w: f64 = 0.0;
+            let mut step: f64 = 0.05;
+            let mut fails = 0;
+            while w < 1.0 && fails < 6 {
+                let wn = (w + step).min(1.0);
+                let (c, conv, _) = weighted_fit(&rd, &sd, wn, &cur);
+                let trapped = !singular_observations(&sd, &c).is_empty() || !singular_observations(&rd, &c).is_empty();
+                if conv && !trapped {
+                    cur = c;
+                    w = wn;
+                    step = (step * 1.5).min(0.3);
+                } else {
+                    step *= 0.4;
+                    fails += 1;
+                }
+            }
+            let (fl, g) = joint_loglik_and_grad(&data, &cur, false);
+            let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            let trapped = !singular_observations(&data, &cur).is_empty();
+            format!(
+                "seed {seed}: production stuck (ll-truth {:+.1}); set aside {}; reached w = {w:.2}; full ll-truth {:+.1}, max|g| {gmax:.1e}, trapped {} ({:.1} s)",
+                prod.log_likelihood - tll,
+                sset.len(),
+                fl - tll,
+                trapped as u8,
+                t.elapsed().as_secs_f64()
+            )
+        })
+        .collect();
+    println!(
+        "d={d} {} (regular root ≈ +{} above the truth):",
+        if hard { "hard" } else { "standard" },
+        bd * pt / 2
+    );
+    for r in rows {
+        println!("  {r}");
+    }
+}
+
+/// At γ fits that end with huge gradients but no flagged observation (d =
+/// 10, standard truth): for the observations with the largest gradients,
+/// the gradient over the median, the smallest trailing-pair ratio, the
+/// smallest group norm (j ≥ 2) relative to the largest, and the onb pole
+/// distance.
+/// `cargo test --release --lib gamma_hidden_traps -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_hidden_traps() {
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let b = standard_truth(d, 5);
+    for seed in [900u64, 901, 902, 903] {
+        let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+        let cfg = EsagRegressor::new().with_parallel(false);
+        let data = cfg.data(&x, &y).unwrap();
+        let f = cfg.fit(&x, &y).unwrap();
+        let (bd, pt) = (data.b_dim, data.p_total);
+        let mut eta = vec![0.0; bd];
+        let mut g = vec![0.0; bd];
+        let mut rows: Vec<(f64, f64, f64, f64, usize)> = (0..data.n)
+            .map(|i| {
+                for (k, e) in eta.iter_mut().enumerate() {
+                    *e = (0..pt).map(|j| f.coef[(k, j)] * data.x[i * pt + j]).sum();
+                }
+                kernel_grad(&data, &eta, &data.y[i * d..(i + 1) * d], &mut g);
+                let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let pr = min_pair_ratio(&eta[d..], d).0;
+                let norms: Vec<f64> = (2..=d - 2)
+                    .map(|gr| {
+                        let off = d + gr * (gr + 1) / 2 - 1;
+                        eta[off..off + gr + 1]
+                            .iter()
+                            .map(|v| v * v)
+                            .sum::<f64>()
+                            .sqrt()
+                    })
+                    .collect();
+                let gmax = norms.iter().fold(0.0f64, |a, &v| a.max(v));
+                let (gmin, gi) =
+                    norms
+                        .iter()
+                        .enumerate()
+                        .fold(
+                            (f64::INFINITY, 0),
+                            |(m, mi), (k, &v)| if v < m { (v, k + 2) } else { (m, mi) },
+                        );
+                let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
+                let pole = ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt();
+                (gn, pr, gmin / gmax, pole, gi)
+            })
+            .collect();
+        let mut gs: Vec<f64> = rows.iter().map(|r| r.0).collect();
+        gs.sort_by(f64::total_cmp);
+        let med = gs[gs.len() / 2];
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!(
+            "seed {seed}: converged {}, flagged {}",
+            f.converged,
+            f.singular_obs.len()
+        );
+        for r in rows.iter().take(4) {
+            println!(
+                "    |g| {:.1e}x median, min pair ratio {:.1e}, smallest group (j={}) / largest {:.1e}, onb pole {:.2}",
+                r.0 / med,
+                r.1,
+                r.4,
+                r.2,
+                r.3
+            );
+        }
+    }
+}
+
+/// Group norms of the standard and hard truths' shape intercepts (the
+/// eigenvalue ratios K_j − 1) at d = 8..10, and their range over 2000
+/// covariate draws.
+/// `cargo test --release --lib truth_group_norms -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn truth_group_norms() {
+    for d in [8usize, 9, 10] {
+        let b = standard_truth(d, 5);
+        let (x, _) = simulate(&b, 2000, 3, Shape::Gamma);
+        let norms_at = |eta: &[f64]| -> Vec<f64> {
+            (1..=d - 2)
+                .map(|gr| {
+                    let off = d + gr * (gr + 1) / 2 - 1;
+                    eta[off..off + gr + 1]
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt()
+                })
+                .collect()
+        };
+        let e0: Vec<f64> = (0..b.nrows()).map(|k| b[(k, 0)]).collect();
+        let n0 = norms_at(&e0);
+        let mut mins = vec![f64::INFINITY; d - 2];
+        for i in 0..2000 {
+            let e: Vec<f64> = (0..b.nrows())
+                .map(|k| b[(k, 0)] + (0..5).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+                .collect();
+            for (m, v) in mins.iter_mut().zip(norms_at(&e)) {
+                *m = m.min(v);
+            }
+        }
+        println!(
+            "d={d} standard: group norms at x = 0 {:?}; smallest over the data {:?}",
+            n0.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>(),
+            mins.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The trapped γ fits at large d, one dataset at a time (standard truth):
+/// the default fit; how near the truth itself puts observations to the
+/// singular set (smallest trailing-pair ratio over groups `j ≥ 2`, and how
+/// many observations are under 1e−2 and 3e−2); for a trapped fit, the
+/// trapped observations' ratios at the truth; and whether trust-region
+/// Newton from the truth reaches a regular root, with its log-likelihood
+/// against the trap's. Env `D` (default 10), `R`, `S0` (first seed, 900).
+/// `cargo test --release --lib gamma_trap_anatomy -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_trap_anatomy() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps, s0) = (env("D", 10), env("R", 12) as u64, env("S0", 900) as u64);
+    let b = standard_truth(d, 5);
+    let rows: Vec<String> = (s0..s0 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let truth_r = pair_ratios(&data, &b);
+            let near = |c: f64| truth_r.iter().filter(|&&r| r < c).count();
+            let rmin = truth_r.iter().fold(1.0f64, |a, &v| a.min(v));
+            let t = Instant::now();
+            let f = cfg.fit(&x, &y).unwrap();
+            let secs = t.elapsed().as_secs_f64();
+            let se_med = f.std_errors().map(|m| {
+                let mut v: Vec<f64> = m.iter().copied().filter(|v| v.is_finite()).collect();
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            });
+            let mut line = format!(
+                "seed {seed}: {} ({secs:.1} s), ll {:.1}, |g| {:.1e}, median SE {:.4}; truth: min pair ratio {rmin:.1e}, {} obs < 1e-2, {} < 3e-2",
+                match (f.converged, f.non_regular) {
+                    (true, false) => "regular    ".to_string(),
+                    (true, true) => format!("non-regular (held {:?})", f.singular_obs),
+                    _ => "trapped    ".to_string(),
+                },
+                f.log_likelihood,
+                f.grad_norm,
+                se_med.unwrap_or(f64::NAN),
+                near(1e-2),
+                near(3e-2)
+            );
+            if !f.converged && std::env::var("TRUTH").is_ok() {
+                let fit_r = pair_ratios(&data, &f.coef);
+                let at: Vec<String> = f
+                    .singular_obs
+                    .iter()
+                    .map(|&i| format!("#{i} truth {:.1e} fit {:.1e}", truth_r[i], fit_r[i]))
+                    .collect();
+                let (c, reg, its, _) = newton_tr(&data, &b, 80);
+                let nll = joint_loglik_and_grad(&data, &c, false).0;
+                let warm = cfg.fit_warm(&x, &y, &b).unwrap();
+                line += &format!(
+                    "\n    trapped {}: [{}]\n    Newton from truth: regular {} after {its} its, ll {:.1} ({:+.1} vs trap); warm fit from truth: {} ll {:.1}",
+                    f.singular_obs.len(),
+                    at.join(", "),
+                    reg,
+                    nll,
+                    nll - f.log_likelihood,
+                    if warm.converged { "regular" } else { "trapped" },
+                    warm.log_likelihood
+                );
+            }
+            line
+        })
+        .collect();
+    println!("d={d} standard truth, n = 2000:");
+    for r in rows {
+        println!("  {r}");
+    }
+}
+
+/// Saddle-free trust-region Newton with the singular-set guard
+/// ([`newton_tr`]) as the γ optimizer at large d, from the moment start and
+/// from the log-tangent-informed start, against the default fit (standard
+/// truth). Env `D` (default 10), `R`, `S0`, `IT` (Newton iterations, 150).
+/// `cargo test --release --lib gamma_newton_from_starts -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_newton_from_starts() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps, s0, iters) = (
+        env("D", 10),
+        env("R", 12) as u64,
+        env("S0", 900) as u64,
+        env("IT", 150),
+    );
+    let b = if std::env::var("HARD").is_ok() {
+        hard_truth(d)
+    } else {
+        standard_truth(d, 5)
+    };
+    let rows: Vec<String> = (s0..s0 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let mask = cfg.resolve_mask(&data).unwrap();
+            let t = Instant::now();
+            let def = cfg.fit(&x, &y).unwrap();
+            let t0 = t.elapsed().as_secs_f64();
+            let mut b0 = cfg.initial_coef(&data).unwrap();
+            zero_fixed(&mut b0, &mask);
+            let t = Instant::now();
+            let (ca, ra, ia, _) = newton_tr(&data, &b0, iters);
+            let t1 = t.elapsed().as_secs_f64();
+            let la = joint_loglik_and_grad(&data, &ca, false).0;
+            let t = Instant::now();
+            let lt = cfg.lt_informed_start(&x, &y, &data, &mask).unwrap();
+            let (cb, rb, ib, _) = newton_tr(&data, &lt, iters);
+            let t2 = t.elapsed().as_secs_f64();
+            let lb = joint_loglik_and_grad(&data, &cb, false).0;
+            format!(
+                "seed {seed}: default {} ll {:.1} ({t0:.1} s) | Newton from moments {} ll {la:.1} ({ia} its, {t1:.1} s) | Newton from LT {} ll {lb:.1} ({ib} its, {t2:.1} s)",
+                if def.converged { "regular" } else { "trapped" },
+                def.log_likelihood,
+                if ra { "regular" } else { "stopped" },
+                if rb { "regular" } else { "stopped" },
+            )
+        })
+        .collect();
+    println!("d={d}, n = 2000:");
+    for r in rows {
+        println!("  {r}");
+    }
+}
+
+/// How a trapped γ fit at large d differs from the fit reached from the
+/// truth, group by group (standard truth): per γ group, the norm of its
+/// intercept and of its slopes in both fits and the cosine between their
+/// intercepts (and between their full coefficient blocks); for μ, the angle
+/// between the intercepts. Env `D` (default 10), `SEEDS` (907,908).
+/// `cargo test --release --lib gamma_bad_basin -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_bad_basin() {
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let seeds: Vec<u64> = std::env::var("SEEDS")
+        .unwrap_or_else(|_| "907,908".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let b = standard_truth(d, 5);
+    let pt = b.ncols();
+    for seed in seeds {
+        let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+        let cfg = EsagRegressor::new().with_parallel(false);
+        let data = cfg.data(&x, &y).unwrap();
+        let def = cfg.fit(&x, &y).unwrap();
+        let (good, reg, _, _) = newton_tr(&data, &b, 80);
+        let gll = joint_loglik_and_grad(&data, &good, false).0;
+        println!(
+            "seed {seed}: default ll {:.1}, from truth ll {gll:.1} (regular {reg})",
+            def.log_likelihood
+        );
+        let block = |c: &DMatrix<f64>,
+                     rows: std::ops::Range<usize>,
+                     cols: std::ops::Range<usize>|
+         -> Vec<f64> {
+            cols.flat_map(|j| rows.clone().map(move |k| (k, j)))
+                .map(|(k, j)| c[(k, j)])
+                .collect()
+        };
+        let nrm = |v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt();
+        let cos = |a: &[f64], b: &[f64]| {
+            a.iter().zip(b).map(|(p, q)| p * q).sum::<f64>() / (nrm(a) * nrm(b))
+        };
+        let (m1, m2) = (block(&def.coef, 0..d, 0..1), block(&good, 0..d, 0..1));
+        println!(
+            "  mu intercept: cos {:.3}, norms {:.2} / {:.2}",
+            cos(&m1, &m2),
+            nrm(&m1),
+            nrm(&m2)
+        );
+        // align the default fit to the good one modulo the exact symmetries
+        // S_j (group j negated, and the last entry of every lower group)
+        let mut al = def.coef.clone();
+        for j in (1..=d - 2).rev() {
+            let off = d + j * (j + 1) / 2 - 1;
+            let rows = off..off + j + 1;
+            if cos(
+                &block(&al, rows.clone(), 0..pt),
+                &block(&good, rows.clone(), 0..pt),
+            ) < 0.0
+            {
+                for c in 0..pt {
+                    for k in rows.clone() {
+                        al[(k, c)] = -al[(k, c)];
+                    }
+                    for jl in 1..j {
+                        let last = d + jl * (jl + 1) / 2 - 1 + jl;
+                        al[(last, c)] = -al[(last, c)];
+                    }
+                }
+            }
+        }
+        let all = joint_loglik_and_grad(&data, &al, false).0;
+        println!(
+            "  aligned default: ll {all:.1} (the symmetry keeps it: {:.1})",
+            def.log_likelihood
+        );
+        for j in 1..=d - 2 {
+            let off = d + j * (j + 1) / 2 - 1;
+            let ent: Vec<String> = (off..off + j + 1)
+                .map(|k| {
+                    let (u, v) = (block(&al, k..k + 1, 0..pt), block(&good, k..k + 1, 0..pt));
+                    format!("{:+.2}", cos(&u, &v))
+                })
+                .collect();
+            let rows = off..off + j + 1;
+            println!(
+                "  aligned group {j}: block cos {:+.3}; per entry {}",
+                cos(&block(&al, rows.clone(), 0..pt), &block(&good, rows, 0..pt)),
+                ent.join(" ")
+            );
+        }
+        for j in 1..=d - 2 {
+            let off = d + j * (j + 1) / 2 - 1;
+            let rows = off..off + j + 1;
+            let (a0, b0) = (
+                block(&def.coef, rows.clone(), 0..1),
+                block(&good, rows.clone(), 0..1),
+            );
+            let (a1, b1) = (
+                block(&def.coef, rows.clone(), 1..pt),
+                block(&good, rows.clone(), 1..pt),
+            );
+            let (aa, bb) = (
+                block(&def.coef, rows.clone(), 0..pt),
+                block(&good, rows.clone(), 0..pt),
+            );
+            let t0 = block(&b, rows.clone(), 0..1);
+            println!(
+                "  group {j}: intercept norm {:.2} / {:.2} (truth {:.2}), cos {:+.3}; slopes norm {:.2} / {:.2}; whole block cos {:+.3}",
+                nrm(&a0),
+                nrm(&b0),
+                nrm(&t0),
+                cos(&a0, &b0),
+                nrm(&a1),
+                nrm(&b1),
+                cos(&aa, &bb)
+            );
+        }
+    }
+}
+
+/// The likelihood around a trap (standard truth, large d): for the first
+/// trapped observation `i` of the default fit, its trailing pair (of the
+/// group nearest the singular set) is placed at `r·(cos θ, sin θ)` by the
+/// smallest change of the two pair rows of `B`, and the full
+/// log-likelihood is printed against the trap's — around circles of radius
+/// `r = 1e−2` and `1e−1` of the group norm, and along the ray at the best
+/// angle. Env `D` (default 10), `SEEDS` (906,911).
+/// `cargo test --release --lib gamma_trap_landscape -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_trap_landscape() {
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let seeds: Vec<u64> = std::env::var("SEEDS")
+        .unwrap_or_else(|_| "906,911".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let b = standard_truth(d, 5);
+    let pt = b.ncols();
+    for seed in seeds {
+        let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+        let cfg = EsagRegressor::new().with_parallel(false);
+        let data = cfg.data(&x, &y).unwrap();
+        let fit = cfg.fit(&x, &y).unwrap();
+        let Some(&i) = fit.singular_obs.first() else {
+            println!("seed {seed}: not trapped");
+            continue;
+        };
+        let bt = fit.coef.clone();
+        let xi: Vec<f64> = (0..pt).map(|c| data.x[i * pt + c]).collect();
+        let x2: f64 = xi.iter().map(|v| v * v).sum();
+        let eta: Vec<f64> = (0..data.b_dim)
+            .map(|k| (0..pt).map(|c| bt[(k, c)] * xi[c]).sum())
+            .collect();
+        let (ratio, j) = min_pair_ratio(&eta[d..], d);
+        let off = d + j * (j + 1) / 2 - 1;
+        let (ka, kb) = (off + j - 1, off + j);
+        let gn = eta[off..off + j + 1]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let p0 = (eta[ka], eta[kb]);
+        let at = |r: f64, th: f64| -> f64 {
+            let mut c = bt.clone();
+            let (da, db) = (r * gn * th.cos() - p0.0, r * gn * th.sin() - p0.1);
+            for col in 0..pt {
+                c[(ka, col)] += da * xi[col] / x2;
+                c[(kb, col)] += db * xi[col] / x2;
+            }
+            joint_loglik_and_grad(&data, &c, false).0
+        };
+        let l0 = joint_loglik_and_grad(&data, &bt, false).0;
+        let th0 = p0.1.atan2(p0.0);
+        println!(
+            "seed {seed}: observation #{i}, group {j}, pair ratio {ratio:.1e} at angle {:.0}°, trap ll {l0:.2}",
+            th0.to_degrees()
+        );
+        let mut best = (f64::NEG_INFINITY, 0.0);
+        for r in [1e-2, 1e-1] {
+            let row: Vec<String> = (0..24)
+                .map(|s| {
+                    let th = th0 + (s as f64) * std::f64::consts::PI / 12.0;
+                    let l = at(r, th);
+                    if r == 1e-2 && l > best.0 {
+                        best = (l, th);
+                    }
+                    format!("{:+.1}", l - l0)
+                })
+                .collect();
+            println!("  r = {r:.0e}, θ − θ_trap = 0°, 15°, …: {}", row.join(" "));
+        }
+        let ray: Vec<String> = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1]
+            .iter()
+            .map(|&r| format!("{r:.0e}: {:+.2}", at(r, best.1) - l0))
+            .collect();
+        println!(
+            "  ray at the best angle ({:.0}° from the trap's): {}",
+            (best.1 - th0).to_degrees(),
+            ray.join(", ")
+        );
+        let ray0: Vec<String> = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1]
+            .iter()
+            .map(|&r| format!("{r:.0e}: {:+.2}", at(r, th0) - l0))
+            .collect();
+        println!("  ray at the trap's angle: {}", ray0.join(", "));
+    }
+}
+
+/// Is a bad basin of γ at large d (standard truth) caused by the start's
+/// shape intercept or by the path of the shape slopes? The default L-BFGS
+/// pipeline (race) from the log-tangent-informed start with its shape
+/// intercept replaced by the truth's (slopes zero), and by the truth's
+/// with its shape slopes too, against the log-tangent-informed start.
+/// Env `D` (default 10), `SEEDS` (906,907,908,911).
+/// `cargo test --release --lib gamma_basin_cause -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_basin_cause() {
+    use rayon::prelude::*;
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let seeds: Vec<u64> = std::env::var("SEEDS")
+        .unwrap_or_else(|_| "906,907,908,911".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let b = standard_truth(d, 5);
+    let pt = b.ncols();
+    let rows: Vec<String> = seeds
+        .par_iter()
+        .map(|&seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let mask = cfg.resolve_mask(&data).unwrap();
+            let lt = cfg.lt_informed_start(&x, &y, &data, &mask).unwrap();
+            let mut s1 = lt.clone();
+            for k in d..data.b_dim {
+                s1[(k, 0)] = b[(k, 0)];
+            }
+            let mut s2 = s1.clone();
+            for k in d..data.b_dim {
+                for c in 1..pt {
+                    s2[(k, c)] = b[(k, c)];
+                }
+            }
+            let run = |s: &DMatrix<f64>| {
+                let r = cfg.race(&data, std::slice::from_ref(s), &mask, cfg.max_iter);
+                format!(
+                    "{} ll {:.1}",
+                    if r.converged && singular_observations(&data, &r.coef).is_empty() {
+                        "regular"
+                    } else {
+                        "trapped"
+                    },
+                    -r.neg_ll
+                )
+            };
+            format!(
+                "seed {seed}: LT start {} | with the truth's shape intercept {} | and its shape slopes {}",
+                run(&lt),
+                run(&s1),
+                run(&s2)
+            )
+        })
+        .collect();
+    for r in rows {
+        println!("{r}");
+    }
+}
+
+/// Apply the exact symmetry `S_j` of the γ parameterization to a γ vector:
+/// negate group `j` and the last entry of every lower group (the same
+/// `V` for every `μ`).
+fn gamma_symmetry(g: &mut [f64], j: usize) {
+    let off = j * (j + 1) / 2 - 1;
+    for v in &mut g[off..off + j + 1] {
+        *v = -*v;
+    }
+    for jl in 1..j {
+        g[jl * (jl + 1) / 2 - 1 + jl] *= -1.0;
+    }
+}
+
+/// `g` moved by the symmetries `S_j` (top group first) so that each group
+/// has a non-negative inner product with `reference`'s.
+fn gamma_align(g: &mut [f64], reference: &[f64], d: usize) {
+    for j in (1..=d - 2).rev() {
+        let off = j * (j + 1) / 2 - 1;
+        let ip: f64 = (off..off + j + 1).map(|k| g[k] * reference[k]).sum();
+        if ip < 0.0 {
+            gamma_symmetry(g, j);
+        }
+    }
+}
+
+/// Estimators of γ's shape intercept at large d (standard truth), against
+/// the truth's: the log-tangent fit's `V̂(0)` (the current start), the
+/// constant-shape γ fit, and the least-squares fit to the per-observation
+/// γ of the log-tangent `V̂(x_i)` aligned by the symmetries (with its
+/// slopes too). Per estimator, the cosine with the truth per group (after
+/// alignment) and the race from it (μ of the log-tangent fit, shape slopes
+/// zero, or the least-squares slopes). Env `D` (default 10), `R`, `S0`.
+/// `cargo test --release --lib gamma_intercept_estimators -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_intercept_estimators() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps, s0) = (env("D", 10), env("R", 12) as u64, env("S0", 900) as u64);
+    let b = standard_truth(d, 5);
+    let (bd, pt, g) = (b.nrows(), b.ncols(), dims::gamma_len(d));
+    let truth0: Vec<f64> = (0..g).map(|k| b[(d + k, 0)]).collect();
+    let rows: Vec<String> = (s0..s0 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let mask = cfg.resolve_mask(&data).unwrap();
+            let lt_start = cfg.lt_informed_start(&x, &y, &data, &mask).unwrap();
+            // the log-tangent fit itself, for V̂(x_i)
+            let mut lcfg = cfg.clone();
+            lcfg.shape = Shape::LogTangent;
+            lcfg.compute_hessian = false;
+            let ltf = lcfg.fit(&x, &y).unwrap();
+            let fr = ltf.lt_frame();
+            let gam_at = |i: usize| -> Vec<f64> {
+                let eta: Vec<f64> = (0..bd)
+                    .map(|k| (0..pt).map(|c| ltf.coef[(k, c)] * data.x[i * pt + c]).sum())
+                    .collect();
+                let v = ltf.distribution_at(&eta, fr.as_ref()).unwrap().covariance();
+                let vr: Vec<f64> = (0..d * d).map(|a| v[(a / d, a % d)]).collect();
+                crate::param::gamma_from_covariance(&eta[..d], &vr)
+            };
+            let ref0: Vec<f64> = (0..g).map(|k| lt_start[(d + k, 0)]).collect();
+            // least squares of the aligned per-observation γ on x̃
+            let mut gs = DMatrix::zeros(data.n, g);
+            for i in 0..data.n {
+                let mut gi = gam_at(i);
+                gamma_align(&mut gi, &ref0, d);
+                for k in 0..g {
+                    gs[(i, k)] = gi[k];
+                }
+            }
+            let xm = DMatrix::from_fn(data.n, pt, |i, c| data.x[i * pt + c]);
+            let coef_ls = (xm.transpose() * &xm)
+                .cholesky()
+                .unwrap()
+                .solve(&(xm.transpose() * &gs));
+            let ls0: Vec<f64> = (0..g).map(|k| coef_ls[(0, k)]).collect();
+            // constant-shape γ fit from the log-tangent start
+            let cmask = DMatrix::from_fn(bd, pt, |k, c| mask[(k, c)] && (k < d || c == 0));
+            let cst = cfg.race(&data, std::slice::from_ref(&lt_start), &cmask, cfg.max_iter);
+            let cs0: Vec<f64> = (0..g).map(|k| cst.coef[(d + k, 0)]).collect();
+            let report = |name: &str, est: &[f64], start: &DMatrix<f64>| -> String {
+                let mut e = est.to_vec();
+                gamma_align(&mut e, &truth0, d);
+                let cs: Vec<String> = (1..=d - 2)
+                    .map(|j| {
+                        let off = j * (j + 1) / 2 - 1;
+                        let (u, v) = (&e[off..off + j + 1], &truth0[off..off + j + 1]);
+                        let ip: f64 = u.iter().zip(v).map(|(p, q)| p * q).sum();
+                        let nu = u.iter().map(|a| a * a).sum::<f64>().sqrt();
+                        let nv = v.iter().map(|a| a * a).sum::<f64>().sqrt();
+                        format!("{:.2}", ip / (nu * nv))
+                    })
+                    .collect();
+                let r = cfg.race(&data, std::slice::from_ref(start), &mask, cfg.max_iter);
+                let reg = r.converged && singular_observations(&data, &r.coef).is_empty();
+                format!(
+                    "{name}: cos [{}] → {} ll {:.1}",
+                    cs.join(" "),
+                    if reg { "regular" } else { "trapped" },
+                    -r.neg_ll
+                )
+            };
+            let with0 = |g0: &[f64]| {
+                let mut s = lt_start.clone();
+                for k in 0..g {
+                    s[(d + k, 0)] = g0[k];
+                }
+                s
+            };
+            let mut ls_full = lt_start.clone();
+            for k in 0..g {
+                for c in 0..pt {
+                    ls_full[(d + k, c)] = coef_ls[(c, k)];
+                }
+            }
+            format!(
+                "seed {seed}:\n    {}\n    {}\n    {}\n    {}",
+                report("LT V(0)     ", &ref0, &lt_start),
+                report("const shape ", &cs0, &with0(&cs0)),
+                report("LS intercept", &ls0, &with0(&ls0)),
+                report("LS + slopes ", &ls0, &ls_full)
+            )
+        })
+        .collect();
+    for r in rows {
+        println!("{r}");
+    }
+}
+
+/// `n` draws from the γ-rot regression (`src/gamma_rot.rs`) with
+/// coefficients `b` read in frame `fr` (equicorrelated covariates, ρ = 0.5).
+fn simulate_rot(
+    b: &DMatrix<f64>,
+    n: usize,
+    seed: u64,
+    fr: &crate::gamma_rot::GrFrame,
+) -> (DMatrix<f64>, DMatrix<f64>) {
+    let (x, _) = simulate(b, n, seed, Shape::Gamma);
+    let d = fr.dim();
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x9e37);
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let eta: Vec<f64> = (0..b.nrows())
+            .map(|k| {
+                b[(k, 0)]
+                    + (0..b.ncols() - 1)
+                        .map(|j| b[(k, j + 1)] * x[(i, j)])
+                        .sum::<f64>()
+            })
+            .collect();
+        let v = fr.covariance(&eta[..d], &eta[d..]);
+        let dist = Esag::from_covariance(&eta[..d], &v).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    (x, y)
+}
+
+/// A plain γ-rot regression fit: L-BFGS on the joint negative
+/// log-likelihood (forward-mode gradients) from `start`, or from the moment
+/// intercept written in frame `fr` with zero slopes. Returns (coef,
+/// converged, iterations, evaluations, max|g|).
+fn fit_rot(
+    fr: &crate::gamma_rot::GrFrame,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    start: Option<&DMatrix<f64>>,
+) -> (DMatrix<f64>, bool, usize, usize, f64) {
+    use crate::gamma_rot::loglik_gr_grad;
+    use crate::optim::lbfgs::{FnObjective, LbfgsConfig, minimize};
+    let (n, d, p) = (y.nrows(), y.ncols(), x.ncols());
+    let (bd, pt) = (dims::eta_len(d), p + 1);
+    let yv: Vec<f64> = (0..n)
+        .flat_map(|i| (0..d).map(move |k| (i, k)))
+        .map(|(i, k)| y[(i, k)])
+        .collect();
+    let x0: Vec<f64> = match start {
+        Some(s) => s.as_slice().to_vec(),
+        None => {
+            let (mu0, g0) = moment_start(&yv, n, d);
+            let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+            let gs0 = fr.coords_from_covariance(&mu0, &v0);
+            let mut s = vec![0.0; bd * pt];
+            s[..d].copy_from_slice(&mu0);
+            s[d..d + gs0.len()].copy_from_slice(&gs0);
+            s
+        }
+    };
+    let nk = bd * pt;
+    let obj = FnObjective(|th: &[f64], grad_out: &mut [f64]| {
+        grad_out.iter_mut().for_each(|g| *g = 0.0);
+        let (mut eta, mut g) = (vec![0.0; bd], vec![0.0; bd]);
+        let mut f = 0.0;
+        for i in 0..n {
+            let xr = |j: usize| if j == 0 { 1.0 } else { x[(i, j - 1)] };
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| th[j * bd + k] * xr(j)).sum();
+            }
+            f -= loglik_gr_grad(fr, &eta, &yv[i * d..(i + 1) * d], &mut g);
+            for j in 0..pt {
+                let w = xr(j);
+                for k in 0..bd {
+                    grad_out[j * bd + k] -= g[k] * w;
+                }
+            }
+        }
+        f
+    });
+    let cfg = LbfgsConfig {
+        memory: nk.clamp(10, 200),
+        max_iter: 2000,
+        max_fev: 40_000,
+        tol_grad: 1e-6,
+        ..LbfgsConfig::default()
+    };
+    let res = minimize(&obj, &x0, &cfg);
+    if std::env::var("TRACE").is_ok() {
+        println!(
+            "    status {:?}  iters {}  fev {}  -ll {:.3}",
+            res.status, res.n_iter, res.n_fev, res.f
+        );
+    }
+    (
+        DMatrix::from_column_slice(bd, pt, &res.x),
+        res.status.is_converged(),
+        res.n_iter,
+        res.n_fev,
+        res.grad_norm_inf,
+    )
+}
+
+/// Does the γ-rot chart (`src/gamma_rot.rs`) remove γ's traps, and at what
+/// cost? Env: `D`, `N`, `R` (datasets), `SEED0` (first seed, default 1200),
+/// `STD=1` for the standard truth (hard otherwise), `DATA=rot` for data from
+/// the γ-rot model with the same coefficient matrix read in its chart
+/// (default: data from γ), `SCALE` multiplying the shape slopes of that
+/// truth, `LINK=exp` for the exponential link (default stereographic).
+/// γ-rot fits (forward-mode L-BFGS from the moment start) against the
+/// production γ and log-tangent fits on the same data: convergence,
+/// iterations, time and the `V̂(x)` error on 200 fresh points.
+/// `cargo test --release --lib gamma_rot_fits -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_rot_fits() {
+    use crate::gamma_rot::{GrFrame, RotLink};
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let seed0 = env("SEED0", 1200) as u64;
+    let rot_data = std::env::var("DATA").as_deref() == Ok("rot");
+    let link = if std::env::var("LINK").as_deref() == Ok("exp") {
+        RotLink::Exp
+    } else {
+        RotLink::Stereo
+    };
+    let scale: f64 = std::env::var("SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let mut b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    if rot_data && scale != 1.0 {
+        for k in d..b.nrows() {
+            for j in 1..b.ncols() {
+                b[(k, j)] *= scale;
+            }
+        }
+    }
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let tf = GrFrame::new(&center(d), link);
+    let lt = LtFrame::new(&center(d));
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| {
+            let e = eta(&b, i);
+            if rot_data {
+                tf.covariance(&e[..d], &e[d..])
+            } else {
+                Esag::from_eta(&e).unwrap().covariance()
+            }
+        })
+        .collect();
+    if rot_data {
+        // how far the truth's axes turn over the data, per group
+        let (xs, _) = simulate(&b, 4000, 7, Shape::Gamma);
+        for gr in 2..=d - 2 {
+            let off = d + gr * (gr + 1) / 2 - 1;
+            let mut ang: Vec<f64> = (0..4000)
+                .map(|i| {
+                    let e: Vec<f64> = (0..bd)
+                        .map(|k| {
+                            b[(k, 0)] + (0..pt - 1).map(|j| b[(k, j + 1)] * xs[(i, j)]).sum::<f64>()
+                        })
+                        .collect();
+                    let a = tf.axis(&e[d..], gr);
+                    a[gr].clamp(-1.0, 1.0).acos().to_degrees()
+                })
+                .collect();
+            ang.sort_by(f64::total_cmp);
+            let kap: Vec<f64> = (0..4000)
+                .map(|i| {
+                    b[(off, 0)]
+                        + (0..pt - 1)
+                            .map(|j| b[(off, j + 1)] * xs[(i, j)])
+                            .sum::<f64>()
+                })
+                .collect();
+            let neg = kap.iter().filter(|k| **k < 0.0).count();
+            println!(
+                "  truth group {gr}: axis angle from the pole 5%/50%/95% = {:.0}/{:.0}/{:.0} deg, κ<0 (crossed) in {:.1}% of x",
+                ang[200],
+                ang[2000],
+                ang[3800],
+                100.0 * neg as f64 / 4000.0
+            );
+        }
+    }
+    // START=truth (γ-rot data only): an oracle start at the true coefficients,
+    // to tell local maxima from estimation variance.
+    let oracle = rot_data && std::env::var("START").as_deref() == Ok("truth");
+    let joint_ll = |fr: &GrFrame, c: &DMatrix<f64>, x: &DMatrix<f64>, y: &DMatrix<f64>| -> f64 {
+        (0..x.nrows())
+            .map(|i| {
+                let e: Vec<f64> = (0..bd)
+                    .map(|k| {
+                        c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * x[(i, j)]).sum::<f64>()
+                    })
+                    .collect();
+                let yi: Vec<f64> = (0..d).map(|k| y[(i, k)]).collect();
+                crate::gamma_rot::loglik_gr::<f64>(fr, &e, &yi)
+            })
+            .sum()
+    };
+    type Row = (bool, usize, f64, f64, f64, bool, f64, f64, bool, f64, f64);
+    let rows: Vec<(Row, [f64; 5])> = (seed0..seed0 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = if rot_data {
+                simulate_rot(&b, n, seed, &tf)
+            } else {
+                simulate(&b, n, seed, Shape::Gamma)
+            };
+            let fr = GrFrame::new(&center(d), link);
+            // START=lt: the log-tangent fit's μ rows and its V̂ at the mean
+            // design row as the shape intercept, zero shape slopes
+            let lt_start: Option<DMatrix<f64>> = (std::env::var("START").as_deref() == Ok("lt")).then(|| {
+                let l = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
+                let xbar: Vec<f64> = (0..pt - 1).map(|j| x.column(j).sum() / n as f64).collect();
+                let e: Vec<f64> = (0..bd)
+                    .map(|k| l.coef[(k, 0)] + (0..pt - 1).map(|j| l.coef[(k, j + 1)] * xbar[j]).sum::<f64>())
+                    .collect();
+                let vbar = crate::logtangent::covariance(&lt, &e[..d], &e[d..]);
+                let g0 = fr.coords_from_covariance(&e[..d], &vbar);
+                let mut s = DMatrix::zeros(bd, pt);
+                for k in 0..d {
+                    for j in 0..pt {
+                        s[(k, j)] = l.coef[(k, j)];
+                    }
+                }
+                for (k, g) in g0.iter().enumerate() {
+                    s[(d + k, 0)] = *g;
+                }
+                s
+            });
+            let t = Instant::now();
+            let (c, conv, it, _fev, gmax) = fit_rot(
+                &fr,
+                &x,
+                &y,
+                if oracle { Some(&b) } else { lt_start.as_ref() },
+            );
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            // log-likelihood gain of the fit over the truth (γ-rot data only)
+            let gain = if rot_data {
+                joint_ll(&fr, &c, &x, &y) - joint_ll(&fr, &b, &x, &y)
+            } else {
+                f64::NAN
+            };
+            let verr = (0..200)
+                .map(|i| {
+                    let e = eta(&c, i);
+                    geodesic(&vtrue[i], &fr.covariance(&e[..d], &e[d..]))
+                })
+                .sum::<f64>()
+                / 200.0;
+            // degeneracy diagnostics: largest per-observation log-density
+            // excess over the median, and largest |log λ| over the data
+            let diag = |c: &DMatrix<f64>| -> (f64, f64) {
+                let mut lls = Vec::with_capacity(n);
+                let mut maxlog = 0.0f64;
+                for i in 0..n {
+                    let e: Vec<f64> = (0..bd)
+                        .map(|k| {
+                            c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * x[(i, j)]).sum::<f64>()
+                        })
+                        .collect();
+                    let yi: Vec<f64> = (0..d).map(|k| y[(i, k)]).collect();
+                    lls.push(crate::gamma_rot::loglik_gr::<f64>(&fr, &e, &yi));
+                    for l in fr.eigenvalues(&e[d..]) {
+                        maxlog = maxlog.max(l.ln().abs());
+                    }
+                }
+                lls.sort_by(f64::total_cmp);
+                (lls[n - 1] - lls[n / 2], maxlog)
+            };
+            let (exc_fit, ml_fit) = diag(&c);
+            let (exc_tru, ml_tru) = if rot_data { diag(&b) } else { (f64::NAN, f64::NAN) };
+            let (gconv, gms, gerr) = if std::env::var("SKIP_GAMMA").is_ok() {
+                (false, f64::NAN, f64::NAN)
+            } else {
+                let t = Instant::now();
+                let g = config(d, Shape::Gamma).fit(&x, &y).unwrap();
+                let gms = t.elapsed().as_secs_f64() * 1e3;
+                let gerr = (0..200)
+                    .map(|i| {
+                        geodesic(
+                            &vtrue[i],
+                            &Esag::from_eta(&eta(&g.coef, i)).unwrap().covariance(),
+                        )
+                    })
+                    .sum::<f64>()
+                    / 200.0;
+                (g.converged, gms, gerr)
+            };
+            let t = Instant::now();
+            let l = config(d, Shape::LogTangent).fit(&x, &y).unwrap();
+            let lms = t.elapsed().as_secs_f64() * 1e3;
+            let lerr = (0..200)
+                .map(|i| {
+                    let e = eta(&l.coef, i);
+                    geodesic(&vtrue[i], &crate::logtangent::covariance(&lt, &e[..d], &e[d..]))
+                })
+                .sum::<f64>()
+                / 200.0;
+            if std::env::var("TRACE").is_ok() {
+                println!(
+                    "  seed {seed}: rot {} it {it} |g| {gmax:.1e} V {verr:.3} ll gain {gain:.1} excess {exc_fit:.1} (truth {exc_tru:.1}) max|log λ| {ml_fit:.2} (truth {ml_tru:.2}) | gamma {} V {gerr:.3} | lt {} V {lerr:.3}",
+                    conv, gconv, l.converged
+                );
+            }
+            (
+                (conv, it, ms, verr, gmax, gconv, gms, gerr, l.converged, lms, lerr),
+                [gain, exc_fit, ml_fit, exc_tru, ml_tru],
+            )
+        })
+        .collect();
+    let extra: Vec<[f64; 5]> = rows.iter().map(|r| r.1).collect();
+    let rows: Vec<Row> = rows.into_iter().map(|r| r.0).collect();
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    if rot_data {
+        let k = (bd * pt) as f64;
+        println!(
+            "  {} start: log-likelihood of the fit minus the truth per dataset {:?} (a regular maximum gains about K/2 = {:.0})",
+            if oracle { "oracle (truth)" } else { "moment" },
+            extra
+                .iter()
+                .map(|g| (g[0] * 10.0).round() / 10.0)
+                .collect::<Vec<_>>(),
+            k / 2.0
+        );
+        println!(
+            "  degeneracy (medians over datasets): largest log-density excess over the median obs {:.1} at the fit vs {:.1} at the truth; max |log λ| {:.2} vs {:.2}",
+            med(extra.iter().map(|g| g[1]).collect()),
+            med(extra.iter().map(|g| g[3]).collect()),
+            med(extra.iter().map(|g| g[2]).collect()),
+            med(extra.iter().map(|g| g[4]).collect())
+        );
+    } else {
+        println!(
+            "  degeneracy (medians over datasets): largest log-density excess over the median obs {:.1} at the γ-rot fit; max |log λ| {:.2}",
+            med(extra.iter().map(|g| g[1]).collect()),
+            med(extra.iter().map(|g| g[2]).collect())
+        );
+    }
+    println!(
+        "d={d} n={n} {} truth, {} data, link {:?}, seeds {seed0}..{}:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        },
+        if rot_data {
+            format!("gamma-rot (shape slopes x{scale})")
+        } else {
+            "gamma".to_string()
+        },
+        link,
+        seed0 + reps
+    );
+    println!(
+        "  gamma-rot:   converged {}/{reps}, iterations {:?}, median {:.0} ms (forward-mode gradient), V error {:.3}",
+        rows.iter().filter(|r| r.0).count(),
+        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+        med(rows.iter().map(|r| r.2).collect()),
+        med(rows.iter().map(|r| r.3).collect())
+    );
+    println!(
+        "  gamma:       converged {}/{reps}, median {:.0} ms, V error {:.3}",
+        rows.iter().filter(|r| r.5).count(),
+        med(rows.iter().map(|r| r.6).collect()),
+        med(rows.iter().map(|r| r.7).collect())
+    );
+    println!(
+        "  log-tangent: converged {}/{reps}, median {:.0} ms, V error {:.3}",
+        rows.iter().filter(|r| r.8).count(),
+        med(rows.iter().map(|r| r.9).collect()),
+        med(rows.iter().map(|r| r.10).collect())
     );
 }

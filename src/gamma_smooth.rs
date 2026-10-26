@@ -357,7 +357,10 @@ fn write_group1(a: &[f64], r: f64, out: &mut [f64]) {
 
 /// Tangent eigenvalues of `v` in the frame `xi` (ascending, scaled to
 /// product 1) and their eigenvectors (columns, in tangent coordinates).
-fn sorted_tangent_eigen(xi: &DMatrix<f64>, v: &DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>) {
+pub(crate) fn sorted_tangent_eigen(
+    xi: &DMatrix<f64>,
+    v: &DMatrix<f64>,
+) -> (Vec<f64>, DMatrix<f64>) {
     let p = xi.ncols();
     let a = xi.transpose() * v * xi;
     let eig = nalgebra::SymmetricEigen::new((&a + a.transpose()) * 0.5);
@@ -391,7 +394,13 @@ fn eigenvalues(k: &[f64], d: usize) -> Vec<f64> {
 /// and at `μ̂ = −m` exactly `v = E_0` (the conventions of the log-tangent
 /// kernel).
 #[inline(always)]
-fn project<S: Scalar>(lt: &LtFrame, mu: &[S], y: &[f64], z: &mut [S], u: &mut [S]) -> (S, S, S) {
+pub(crate) fn project<S: Scalar>(
+    lt: &LtFrame,
+    mu: &[S],
+    y: &[f64],
+    z: &mut [S],
+    u: &mut [S],
+) -> (S, S, S) {
     let d = mu.len();
     let m = lt.reference();
     let e = lt.tangent_basis();
