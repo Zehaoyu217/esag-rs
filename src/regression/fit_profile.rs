@@ -844,7 +844,7 @@ fn safety_net_value() {
 #[test]
 fn pinned_gamma_fit_is_reported() {
     let d = 5;
-    let (x, y) = simulate(&hard_truth(d), 500, 900, Shape::Gamma);
+    let (x, y) = simulate(&hard_truth(d), 500, 901, Shape::Gamma);
     let fit = EsagRegressor::new()
         .with_parallel(false)
         .fit(&x, &y)
