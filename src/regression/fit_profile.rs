@@ -2361,3 +2361,436 @@ fn gamma_transported_fits() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Spectral shape (experiment): V's tangent block R0 e^A diag(e^ℓ) e^{−A} R0ᵀ,
+// eigenvalues as their own (log) parameters and the eigenvectors as one
+// rotation, in the frame transported from m. R0 holds the moment start's
+// principal axes. Coordinates: p − 1 Helmert coefficients of the sum-zero
+// ℓ, then the upper triangle of the skew-symmetric A, row by row.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct SpFrame {
+    lt: crate::logtangent::LtFrame,
+    /// p × p row-major: column j is the reference axis j in E coordinates
+    r0: Vec<f64>,
+}
+
+/// `e^{M}` for a `p × p` row-major matrix, by scaling and squaring with a
+/// degree-12 Taylor polynomial (generic, for dual numbers).
+fn expm_generic<S: crate::scalar::Scalar>(m: &[S], p: usize) -> Vec<S> {
+    let nrm = (0..p)
+        .map(|i| (0..p).map(|j| m[i * p + j].re().abs()).sum::<f64>())
+        .fold(0.0f64, f64::max);
+    let mut sq = 0;
+    while nrm / (1u64 << sq) as f64 > 0.5 {
+        sq += 1;
+    }
+    let scale = 1.0 / (1u64 << sq) as f64;
+    let b: Vec<S> = m.iter().map(|&v| v * scale).collect();
+    let mul = |x: &[S], y: &[S]| -> Vec<S> {
+        let mut o = vec![S::zero(); p * p];
+        for i in 0..p {
+            for k in 0..p {
+                let xik = x[i * p + k];
+                for j in 0..p {
+                    o[i * p + j] += xik * y[k * p + j];
+                }
+            }
+        }
+        o
+    };
+    // Horner: E = I + B(I + B/2(I + B/3(... (I + B/12))))
+    let mut e: Vec<S> = vec![S::zero(); p * p];
+    for i in 0..p {
+        e[i * p + i] = S::one();
+    }
+    for k in (1..=12).rev() {
+        let mut t = mul(&b, &e);
+        let inv = 1.0 / k as f64;
+        for v in t.iter_mut() {
+            *v = *v * inv;
+        }
+        for i in 0..p {
+            t[i * p + i] += S::one();
+        }
+        e = t;
+    }
+    for _ in 0..sq {
+        e = mul(&e, &e);
+    }
+    e
+}
+
+/// The tangent block's ingredients from the shape coordinates: `ℓ` (sum
+/// zero) and `e^{−A}`.
+fn sp_parts<S: crate::scalar::Scalar>(sh: &[S], p: usize) -> (Vec<S>, Vec<S>) {
+    let mut ell = vec![S::zero(); p];
+    for m in 1..p {
+        let h = 1.0 / ((m * (m + 1)) as f64).sqrt();
+        for k in 0..m {
+            ell[k] += sh[m - 1] * h;
+        }
+        ell[m] -= sh[m - 1] * (m as f64 * h);
+    }
+    let mut a = vec![S::zero(); p * p];
+    let mut idx = p - 1;
+    for r in 0..p {
+        for c in r + 1..p {
+            // −A
+            a[r * p + c] = S::zero() - sh[idx];
+            a[c * p + r] = sh[idx];
+            idx += 1;
+        }
+    }
+    (ell, expm_generic(&a, p))
+}
+
+fn loglik_sp<S: crate::scalar::Scalar>(fr: &SpFrame, eta: &[S], y: &[f64]) -> S {
+    let d = y.len();
+    let p = d - 1;
+    let (mu, sh) = eta.split_at(d);
+    let m = fr.lt.reference();
+    let e = fr.lt.tangent_basis();
+    let mut mm = S::zero();
+    let mut ymu = S::zero();
+    for i in 0..d {
+        mm += mu[i] * mu[i];
+        ymu += mu[i] * y[i];
+    }
+    let inv = S::one() / mm.sqrt();
+    let mh: Vec<S> = mu.iter().map(|&v| v * inv).collect();
+    let t = ymu * inv;
+    let v: Vec<S> = (0..d).map(|i| mh[i] + m[i]).collect();
+    let vv = v.iter().fold(S::zero(), |acc, &x| acc + x * x);
+    let vy = (0..d).fold(S::zero(), |acc, i| acc + v[i] * y[i]);
+    let kappa = vy * 2.0 / vv;
+    let u: Vec<S> = (0..d).map(|i| S::from_f64(y[i]) - kappa * v[i]).collect();
+    let z: Vec<S> = (0..p)
+        .map(|j| (0..d).fold(S::zero(), |acc, i| acc + u[i] * e[j * d + i]))
+        .collect();
+    // z0 = R0ᵀ z, w = e^{−A} z0
+    let z0: Vec<S> = (0..p)
+        .map(|j| (0..p).fold(S::zero(), |acc, i| acc + z[i] * fr.r0[i * p + j]))
+        .collect();
+    let (ell, ema) = sp_parts(sh, p);
+    let mut q = t * t;
+    for j in 0..p {
+        let wj = (0..p).fold(S::zero(), |acc, k| acc + ema[j * p + k] * z0[k]);
+        q += wj * wj * (S::zero() - ell[j]).exp();
+    }
+    let alpha = ymu / q.sqrt();
+    S::from_f64(-0.5 * p as f64 * crate::stats::normal::LN_2PI) - q.ln() * (0.5 * d as f64)
+        + (alpha * alpha - mm) * 0.5
+        + crate::loglik::log_m_p(alpha, p)
+}
+
+fn sp_grad(fr: &SpFrame, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
+    use crate::dual::{Dual, seed_array};
+    fn go<const N: usize>(fr: &SpFrame, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
+        let x: [Dual<N>; N] = seed_array(eta);
+        let v = loglik_sp(fr, &x, y);
+        g.copy_from_slice(&v.eps);
+        v.re
+    }
+    match eta.len() {
+        5 => go::<5>(fr, eta, y, g),
+        9 => go::<9>(fr, eta, y, g),
+        14 => go::<14>(fr, eta, y, g),
+        20 => go::<20>(fr, eta, y, g),
+        35 => go::<35>(fr, eta, y, g),
+        n => panic!("eta length {n}"),
+    }
+}
+
+/// `V` of the spectral shape at `eta`.
+fn sp_covariance(fr: &SpFrame, eta: &[f64]) -> DMatrix<f64> {
+    let d = fr.lt.dim();
+    let p = d - 1;
+    let (ell, ema) = sp_parts(&eta[d..], p);
+    let xi = fr.lt.frame_at(&eta[..d]);
+    let r0 = DMatrix::from_row_slice(p, p, &fr.r0);
+    let ea = DMatrix::from_row_slice(p, p, &ema).transpose(); // e^{A}
+    let rot = &xi * r0 * ea;
+    let lam = DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
+        p,
+        ell.iter().map(|l| l.exp()),
+    ));
+    let nm = eta[..d].iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mh = nalgebra::DVector::from_iterator(d, eta[..d].iter().map(|v| v / nm));
+    &mh * mh.transpose() + &rot * lam * rot.transpose()
+}
+
+/// Whitened L-BFGS for a per-observation kernel `kg` from `start` (the full
+/// coefficient vector, column-major). Returns (coef, converged, iterations).
+fn fit_kernel(
+    kg: &(dyn Fn(&[f64], &[f64], &mut [f64]) -> f64 + Sync),
+    start: Vec<f64>,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+) -> (DMatrix<f64>, bool, usize) {
+    use crate::optim::lbfgs::{FnObjective, LbfgsConfig, minimize};
+    let (n, d, p) = (y.nrows(), y.ncols(), x.ncols());
+    let (bd, pt) = (dims::eta_len(d), p + 1);
+    let nk = bd * pt;
+    let yv: Vec<f64> = (0..n)
+        .flat_map(|i| (0..d).map(move |k| (i, k)))
+        .map(|(i, k)| y[(i, k)])
+        .collect();
+    let xr = |i: usize, j: usize| if j == 0 { 1.0 } else { x[(i, j - 1)] };
+    let mut info = DMatrix::<f64>::zeros(nk, nk);
+    let (mut eta, mut g) = (vec![0.0; bd], vec![0.0; bd]);
+    let mut s = vec![0.0; nk];
+    for i in 0..n {
+        for (k, e) in eta.iter_mut().enumerate() {
+            *e = (0..pt).map(|j| start[j * bd + k] * xr(i, j)).sum();
+        }
+        kg(&eta, &yv[i * d..(i + 1) * d], &mut g);
+        for j in 0..pt {
+            for k in 0..bd {
+                s[j * bd + k] = g[k] * xr(i, j);
+            }
+        }
+        for a in 0..nk {
+            for c in 0..nk {
+                info[(a, c)] += s[a] * s[c];
+            }
+        }
+    }
+    let lt_inv = info
+        .cholesky()
+        .unwrap()
+        .l()
+        .transpose()
+        .try_inverse()
+        .unwrap();
+    let to_b = |th: &[f64]| -> Vec<f64> {
+        let v = &lt_inv * nalgebra::DVector::from_column_slice(th);
+        (0..nk).map(|a| start[a] + v[a]).collect()
+    };
+    let obj = FnObjective(|th: &[f64], out: &mut [f64]| {
+        let b = to_b(th);
+        let mut grad = vec![0.0; nk];
+        let (mut eta, mut g) = (vec![0.0; bd], vec![0.0; bd]);
+        let mut f = 0.0;
+        for i in 0..n {
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| b[j * bd + k] * xr(i, j)).sum();
+            }
+            f -= kg(&eta, &yv[i * d..(i + 1) * d], &mut g);
+            for j in 0..pt {
+                let w = xr(i, j);
+                for k in 0..bd {
+                    grad[j * bd + k] -= g[k] * w;
+                }
+            }
+        }
+        let gv = lt_inv.transpose() * nalgebra::DVector::from_column_slice(&grad);
+        out.copy_from_slice(gv.as_slice());
+        f
+    });
+    let cfg = LbfgsConfig {
+        memory: nk.clamp(10, 200),
+        max_iter: 2000,
+        max_fev: 40_000,
+        tol_grad: 1e-6,
+        ..LbfgsConfig::default()
+    };
+    let res = minimize(&obj, &vec![0.0; nk], &cfg);
+    (
+        DMatrix::from_column_slice(bd, pt, &to_b(&res.x)),
+        res.status.is_converged(),
+        res.n_iter,
+    )
+}
+
+/// Does the spectral shape (eigenvalues + one rotation e^A) fit without
+/// traps? On γ data (hard truth unless `STD=1`; env `D`, `N`, `R`):
+/// convergence, iterations and `V̂(x)` error against the γ and log-tangent
+/// production fits on the same data.
+/// `cargo test --release --lib spectral_fits -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn spectral_fits() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let p = d - 1;
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
+        .collect();
+    let rows: Vec<[(bool, usize, f64, f64); 3]> = (860..860 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let yv: Vec<f64> = (0..n)
+                .flat_map(|i| (0..d).map(move |k| (i, k)))
+                .map(|(i, k)| y[(i, k)])
+                .collect();
+            let (mu0, g0) = moment_start(&yv, n, d);
+            let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+            let nm = mu0.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let m: Vec<f64> = mu0.iter().map(|v| v / nm).collect();
+            let lt = crate::logtangent::LtFrame::new(&m);
+            let e = DMatrix::from_column_slice(d, p, lt.tangent_basis());
+            let tb = e.transpose() * &v0 * &e;
+            let eig = nalgebra::SymmetricEigen::new((&tb + tb.transpose()) * 0.5);
+            let mut w = eig.eigenvectors.clone();
+            if w.determinant() < 0.0 {
+                for r in 0..p {
+                    w[(r, 0)] = -w[(r, 0)];
+                }
+            }
+            let r0: Vec<f64> = (0..p)
+                .flat_map(|r| (0..p).map(move |c| (r, c)))
+                .map(|(r, c)| w[(r, c)])
+                .collect();
+            let fr = SpFrame { lt, r0 };
+            // start: ℓ = centred log-eigenvalues on the Helmert basis, A = 0
+            let ell: Vec<f64> = eig.eigenvalues.iter().map(|l| l.ln()).collect();
+            let mean = ell.iter().sum::<f64>() / p as f64;
+            let ell: Vec<f64> = ell.iter().map(|l| l - mean).collect();
+            let mut start = vec![0.0; bd * pt];
+            start[..d].copy_from_slice(&mu0);
+            for mm in 1..p {
+                let h = 1.0 / ((mm * (mm + 1)) as f64).sqrt();
+                start[d + mm - 1] =
+                    (0..mm).map(|k| ell[k] * h).sum::<f64>() - ell[mm] * mm as f64 * h;
+            }
+            let kg = |eta: &[f64], yi: &[f64], g: &mut [f64]| sp_grad(&fr, eta, yi, g);
+            let t = Instant::now();
+            let (c, conv, it) = fit_kernel(&kg, start, &x, &y);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let ve = (0..200)
+                .map(|i| geodesic(&vtrue[i], &sp_covariance(&fr, &eta_at(&c, i))))
+                .sum::<f64>()
+                / 200.0;
+            let mut out = [
+                (conv, it, ms, ve),
+                (false, 0, 0.0, 0.0),
+                (false, 0, 0.0, 0.0),
+            ];
+            for (k, shape) in [Shape::Gamma, Shape::LogTangent].into_iter().enumerate() {
+                let t = Instant::now();
+                let f = EsagRegressor::new()
+                    .with_shape(shape)
+                    .with_parallel(false)
+                    .fit(&x, &y)
+                    .unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let lt = f.lt_frame();
+                let ve = (0..200)
+                    .map(|i| {
+                        geodesic(
+                            &vtrue[i],
+                            &f.distribution_at(&eta_at(&f.coef, i), lt.as_ref())
+                                .unwrap()
+                                .covariance(),
+                        )
+                    })
+                    .sum::<f64>()
+                    / 200.0;
+                out[k + 1] = (f.converged, f.n_iter, ms, ve);
+            }
+            out
+        })
+        .collect();
+    println!(
+        "d={d} n={n} {} truth, gamma data, {reps} datasets:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        }
+    );
+    for (k, name) in [
+        "spectral (prototype)",
+        "gamma (production)",
+        "log-tangent (production)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut it: Vec<usize> = rows.iter().map(|r| r[k].1).collect();
+        let mut ve: Vec<f64> = rows.iter().map(|r| r[k].3).collect();
+        it.sort_unstable();
+        ve.sort_by(f64::total_cmp);
+        println!(
+            "  {name:<26} converged {}/{reps}, median iterations {}, V error {:.3}",
+            rows.iter().filter(|r| r[k].0).count(),
+            it[it.len() / 2],
+            ve[ve.len() / 2]
+        );
+    }
+}
+
+/// How anisotropic are the standard and hard γ truths, and does the
+/// likelihood prefer γ over log-tangent on their data? Per truth: mean
+/// geodesic distance of V(x) from I, median largest/smallest tangent
+/// eigenvalue ratio, and on γ data (n = 2000) the log-likelihood of the γ
+/// and log-tangent fits (equal parameter counts, so ΔAIC = −2Δll).
+/// `cargo test --release --lib truth_anisotropy -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn truth_anisotropy() {
+    use rayon::prelude::*;
+    for d in [5usize, 8] {
+        for (name, b) in [("standard", standard_truth(d, 5)), ("hard", hard_truth(d))] {
+            let (x, _) = simulate(&b, 500, 1, Shape::Gamma);
+            let eye = DMatrix::<f64>::identity(d, d);
+            let mut ratios = vec![];
+            let mut dist = 0.0;
+            for i in 0..500 {
+                let eta: Vec<f64> = (0..b.nrows())
+                    .map(|k| b[(k, 0)] + (0..5).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+                    .collect();
+                let fr = crate::frame::Frame::new(&eta[..d], &eta[d..]);
+                let lmax = fr.lambda.iter().fold(0.0f64, |a, &v| a.max(v));
+                let lmin = fr.lambda.iter().fold(f64::INFINITY, |a, &v| a.min(v));
+                ratios.push(lmax / lmin);
+                dist += geodesic(&eye, &Esag::from_eta(&eta).unwrap().covariance());
+            }
+            ratios.sort_by(f64::total_cmp);
+            let gaps: Vec<f64> = (900u64..904)
+                .into_par_iter()
+                .map(|seed| {
+                    let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+                    let g = EsagRegressor::new()
+                        .with_parallel(false)
+                        .fit(&x, &y)
+                        .unwrap();
+                    let l = EsagRegressor::new()
+                        .with_shape(Shape::LogTangent)
+                        .with_parallel(false)
+                        .fit(&x, &y)
+                        .unwrap();
+                    g.log_likelihood - l.log_likelihood
+                })
+                .collect();
+            println!(
+                "d={d} {name:<8}: V(x) {:.2} from isotropy, median eigenvalue ratio {:.1}; ll(gamma) - ll(log-tangent) on gamma data: {:?}",
+                dist / 500.0,
+                ratios[250],
+                gaps.iter().map(|v| format!("{v:+.1}")).collect::<Vec<_>>()
+            );
+        }
+    }
+}
