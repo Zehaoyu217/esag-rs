@@ -2524,8 +2524,11 @@ fn sp_covariance(fr: &SpFrame, eta: &[f64]) -> DMatrix<f64> {
 
 /// Whitened L-BFGS for a per-observation kernel `kg` from `start` (the full
 /// coefficient vector, column-major). Returns (coef, converged, iterations).
+/// A per-observation log-density and gradient in `eta`.
+type ObsKernel<'a> = &'a (dyn Fn(&[f64], &[f64], &mut [f64]) -> f64 + Sync);
+
 fn fit_kernel(
-    kg: &(dyn Fn(&[f64], &[f64], &mut [f64]) -> f64 + Sync),
+    kg: ObsKernel<'_>,
     start: Vec<f64>,
     x: &DMatrix<f64>,
     y: &DMatrix<f64>,
