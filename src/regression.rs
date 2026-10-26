@@ -394,7 +394,58 @@ impl EsagRegressor {
                 }
             }
         }
+        if pinned && data.d <= EXCLUSION_MAX_D && matches!(self.init, Init::Auto) {
+            best = self.exclusion_rounds(x, y, &data, best, &mask);
+        }
         self.finalize(&data, best, mask)
+    }
+
+    /// Rescue of a trapped gamma fit. A trap is not a root of the score
+    /// equations, and the regular root next to it is reached by fitting
+    /// without the trapped observations, warm, then with them again. This
+    /// is repeated, excluding every observation trapped so far, while each
+    /// round improves the likelihood (at most [`EXCLUSION_ROUNDS`]). On the
+    /// hard scenario (`gamma_exclusion_rounds` in `fit_profile.rs`) this
+    /// reaches a regular root, always with a higher likelihood than the
+    /// trap, in 3 of 12 trapped fits at `d = 5` and 2 of 12 at `d = 6`; it
+    /// never did at `d = 7` or 8, hence [`EXCLUSION_MAX_D`].
+    fn exclusion_rounds(
+        &self,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        data: &RegressionData,
+        mut best: RawFit,
+        mask: &DMatrix<bool>,
+    ) -> RawFit {
+        let free = free_params(mask);
+        let mut out: Vec<usize> = vec![];
+        for _ in 0..EXCLUSION_ROUNDS {
+            let trapped = singular_observations(data, &best.coef);
+            if trapped.is_empty() {
+                break;
+            }
+            out.extend(trapped);
+            out.sort_unstable();
+            out.dedup();
+            let keep: Vec<usize> = (0..data.n)
+                .filter(|i| out.binary_search(i).is_err())
+                .collect();
+            let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
+            let ys = DMatrix::from_fn(keep.len(), y.ncols(), |a, j| y[(keep[a], j)]);
+            let Ok(sub) = self.data(&xs, &ys) else { break };
+            let rest = self.optimize(&sub, &best.coef, &free, self.max_iter);
+            let mut next = self.optimize(data, &rest.coef, &free, self.max_iter);
+            next.n_iter += best.n_iter + rest.n_iter;
+            next.n_fev += best.n_fev + rest.n_fev;
+            if !next.beats(&best) {
+                break;
+            }
+            best = next;
+            if best.converged {
+                break;
+            }
+        }
+        best
     }
 
     /// Fit starting from an explicit coefficient matrix (warm start). Used by
@@ -1219,6 +1270,11 @@ fn perturbed_starts(
 const SINGULAR_GRADIENT: f64 = 20.0;
 /// ... and it lies within this relative distance of a singular set.
 const SINGULAR_DISTANCE: f64 = 1e-2;
+/// Most rounds of [`EsagRegressor::exclusion_rounds`]; rescues came within
+/// two rounds (eight changed nothing).
+const EXCLUSION_ROUNDS: usize = 3;
+/// Largest `d` at which trapped gamma fits get exclusion rounds.
+const EXCLUSION_MAX_D: usize = 6;
 
 /// Observations of a gamma fit at `b` that sit at a singular set of the
 /// parameterization, where `V(γ)` is discontinuous: a group `j ≥ 2` whose

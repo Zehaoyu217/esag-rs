@@ -854,6 +854,25 @@ fn pinned_gamma_fit_is_reported() {
     assert!(lt.converged && lt.singular_obs.is_empty());
 }
 
+/// A trapped γ fit (d = 5, hard scenario, n = 500, seed 950) is rescued by
+/// exclusion rounds: they reach a regular root (converged, no trapped
+/// observation) with a higher likelihood than the trap.
+#[test]
+fn trapped_gamma_fit_is_rescued() {
+    let (x, y) = simulate(&hard_truth(5), 500, 950, Shape::Gamma);
+    let cfg = config(5, Shape::Gamma);
+    let data = cfg.data(&x, &y).unwrap();
+    let mask = cfg.resolve_mask(&data).unwrap();
+    let b0 = cfg.initial_coef(&data).unwrap();
+    let raw = cfg.optimize(&data, &b0, &free_params(&mask), cfg.max_iter);
+    assert!(!raw.converged && !singular_observations(&data, &raw.coef).is_empty());
+    let trap = raw.neg_ll;
+    let res = cfg.exclusion_rounds(&x, &y, &data, raw, &mask);
+    assert!(res.converged, "not rescued");
+    assert!(singular_observations(&data, &res.coef).is_empty());
+    assert!(res.neg_ll < trap - 1.0, "{} vs trap {trap}", res.neg_ll);
+}
+
 /// The most extreme fitted shape over the observations: log-tangent
 /// `max_i ‖S(x_i)‖_F` (log condition number scale of V's tangent block) and
 /// the largest per-observation log-density, for converged and failed fits.
@@ -2025,4 +2044,37 @@ fn group_norm_reach() {
             );
         }
     }
+}
+
+/// Seeds where exclusion rounds rescue a trapped γ race (d = 5, hard
+/// scenario, env `N`): for writing the regression test.
+/// `cargo test --release --lib rescue_seed_search -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn rescue_seed_search() {
+    use rayon::prelude::*;
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let b = hard_truth(5);
+    let hits: Vec<(u64, f64)> = (900u64..960)
+        .into_par_iter()
+        .filter_map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let cfg = config(5, Shape::Gamma);
+            let data = cfg.data(&x, &y).unwrap();
+            let mask = cfg.resolve_mask(&data).unwrap();
+            let free = free_params(&mask);
+            let b0 = cfg.initial_coef(&data).unwrap();
+            let raw = cfg.optimize(&data, &b0, &free, cfg.max_iter);
+            if raw.converged || singular_observations(&data, &raw.coef).is_empty() {
+                return None;
+            }
+            let before = raw.neg_ll;
+            let res = cfg.exclusion_rounds(&x, &y, &data, raw, &mask);
+            (res.converged && res.neg_ll < before).then_some((seed, before - res.neg_ll))
+        })
+        .collect();
+    println!("n = {n}: rescued seeds {hits:?}");
 }

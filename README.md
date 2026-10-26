@@ -662,7 +662,9 @@ continuous. Consequences:
   them reliably. This is a property of the γ-linear model, not of the
   optimizer; the log-tangent model on the same kind of data converges in
   251 of 252 fits from n = 200 on, and at d = 4 in 36 of 36, 19–110×
-  faster than γ.
+  faster than γ. Trapped γ fits at d ≤ 6 get up to three exclusion rounds
+  (refit without the trapped observations, then with them), which reach a
+  regular root in about a quarter of them, at 1.5–5× the time.
 * **The frame's pole.** `onb(μ)` is singular where `μ_0 = μ_1 = 0`. When
   the data's mean direction is near that set (for example near `e_d`), γ
   fits slow down even at d = 3 (105 vs 28 ms); the γ model is not

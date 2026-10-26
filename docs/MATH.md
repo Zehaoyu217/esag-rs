@@ -202,7 +202,14 @@ compared on the hard scenario (`gamma_regular_root`,
   them back (up to 8 rounds) reaches a regular root in 3 of 12 trapped fits
   at `d = 5, n = 2000`, 5 of 12 at `n = 500` and 0 of 12 at `d = 8`, at
   2.5–11 times the time. Every root it reached had a higher likelihood
-  than the trap (+1.3 to +11.7).
+  than the trap (+1.3 to +11.7). With at most 3 rounds the counts are the
+  same at `d = 5`, 2 of 12 at `d = 6`, and 0 of 12 at `d = 7` (at 10 times
+  the time). So `EsagRegressor::fit` runs these rounds (at most 3, stopping
+  when a round does not raise the likelihood) for trapped γ fits at
+  `d ≤ 6`. On the hard scenario (`hard_scenario -- fit`, one core) γ then
+  converges in 3 of 12 fits at `d = 5` and `d = 6` with `n = 2000`, in a
+  median 1.0 and 1.3 s (0.69 s before at `d = 5`). Regression test:
+  `trapped_gamma_fit_is_rescued`.
 
 At a regular root, estimation noise puts some high-leverage observation's
 fitted trailing pair near zero, so a trap lies next to the root and the
