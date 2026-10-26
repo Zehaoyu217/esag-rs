@@ -144,6 +144,13 @@ pub(crate) fn simulate_with(
                 let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
                 Esag::from_covariance(&eta[..d], &v).unwrap()
             }
+            Shape::GammaRot => {
+                // the γ-rot truth in the frame with reference m and the
+                // identity basis
+                let fr = crate::gamma_rot::GrFrame::stereo(m);
+                let v = fr.covariance(&eta[..d], &eta[d..]);
+                Esag::from_covariance(&eta[..d], &v).unwrap()
+            }
         };
         dist.sample_one(&dist.frame(), &mut rng, &mut buf);
         for k in 0..d {
@@ -5144,4 +5151,323 @@ fn gamma_rot_fits() {
         med(rows.iter().map(|r| r.9).collect()),
         med(rows.iter().map(|r| r.10).collect())
     );
+}
+
+/// The production `Shape::GammaRot` pipeline against the log-tangent one,
+/// unpenalized and penalized, at realistic `n`. Env: `D`, `N`, `R`,
+/// `SEED0` (default 1400), `STD=1` (standard truth), `DATA=rot` (data from
+/// the γ-rot model read off the same coefficient matrix; `SCALE` multiplies
+/// its shape slopes), `PEN=0` to skip the penalized fits. Penalized fits
+/// penalize the shape slopes, select by BIC at relaxed refits, and are
+/// scored at the relaxed refit: adaptive group LASSO over the eigen parts
+/// (`κ_j` alone, `ω_j` as a group, group 1 as a pair) and over the groups
+/// (`(κ_j, ω_j)` together) for γ-rot; adaptive LASSO and adaptive group
+/// LASSO (covariate parts) for log-tangent. `V̂` is the mean geodesic error
+/// of `V̂(x)` on 200 fresh points.
+/// `cargo test --release --lib gamma_rot_prod -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_rot_prod() {
+    use crate::gamma_rot::{GrFrame, RotLink};
+    use crate::penalized::{Grouping, PenalizedEsag, Target};
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let seed0 = env("SEED0", 1400) as u64;
+    let rot_data = std::env::var("DATA").as_deref() == Ok("rot");
+    let pen = std::env::var("PEN").as_deref() != Ok("0");
+    let scale: f64 = std::env::var("SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let mut b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    if rot_data && scale != 1.0 {
+        for k in d..b.nrows() {
+            for j in 1..b.ncols() {
+                b[(k, j)] *= scale;
+            }
+        }
+    }
+    let (bd, pt) = (b.nrows(), b.ncols());
+    // the γ-rot truth is read in the frame with reference center(d) and the
+    // identity basis
+    let tf = GrFrame::new(&center(d), RotLink::Stereo);
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| {
+            let e = eta(&b, i);
+            if rot_data {
+                tf.covariance(&e[..d], &e[d..])
+            } else {
+                Esag::from_eta(&e).unwrap().covariance()
+            }
+        })
+        .collect();
+    let score = |f: &EsagRegressorFit| -> f64 {
+        let lt = f.lt_frame();
+        (0..200)
+            .map(|i| {
+                geodesic(
+                    &vtrue[i],
+                    &f.distribution_at(&eta(&f.coef, i), lt.as_ref())
+                        .unwrap()
+                        .covariance(),
+                )
+            })
+            .sum::<f64>()
+            / 200.0
+    };
+    // (name, converged, ms, V error, active groups or NaN)
+    type Cell = (String, bool, f64, f64, f64);
+    let rows: Vec<Vec<Cell>> = (seed0..seed0 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = if rot_data {
+                simulate_rot(&b, n, seed, &tf)
+            } else {
+                simulate(&b, n, seed, Shape::Gamma)
+            };
+            let mut cells: Vec<Cell> = vec![];
+            // the truth's log-likelihood on this dataset (γ-rot data): the
+            // fit of the true model gains about K/2 over it at a regular
+            // maximum
+            let ll_truth = if rot_data {
+                (0..n)
+                    .map(|i| {
+                        let e: Vec<f64> = (0..bd)
+                            .map(|k| {
+                                b[(k, 0)]
+                                    + (0..pt - 1).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>()
+                            })
+                            .collect();
+                        let yi: Vec<f64> = (0..d).map(|k| y[(i, k)]).collect();
+                        crate::gamma_rot::loglik_gr::<f64>(&tf, &e, &yi)
+                    })
+                    .sum::<f64>()
+            } else {
+                f64::NAN
+            };
+            for (name, shape) in [
+                ("gamma-rot", Shape::GammaRot),
+                ("log-tangent", Shape::LogTangent),
+            ] {
+                let t = Instant::now();
+                let f = config(d, shape).fit(&x, &y).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let gain = f.log_likelihood - ll_truth;
+                cells.push((
+                    format!("{name}, full model"),
+                    f.converged,
+                    ms,
+                    score(&f),
+                    gain,
+                ));
+            }
+            if std::env::var("SPEC").is_ok() && d <= 8 {
+                // the spectral prototype (eigenvalues + one rotation e^A,
+                // forward-mode, whitened L-BFGS): the ordering-free eigen chart
+                let t = Instant::now();
+                let yv: Vec<f64> = (0..n)
+                    .flat_map(|i| (0..d).map(move |k| (i, k)))
+                    .map(|(i, k)| y[(i, k)])
+                    .collect();
+                let (mu0, g0) = moment_start(&yv, n, d);
+                let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
+                let nm = mu0.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let m: Vec<f64> = mu0.iter().map(|v| v / nm).collect();
+                let lt = crate::logtangent::LtFrame::new(&m);
+                let p = d - 1;
+                let e = DMatrix::from_column_slice(d, p, lt.tangent_basis());
+                let tb = e.transpose() * &v0 * &e;
+                let eig = nalgebra::SymmetricEigen::new((&tb + tb.transpose()) * 0.5);
+                let mut w = eig.eigenvectors.clone();
+                if w.determinant() < 0.0 {
+                    for r in 0..p {
+                        w[(r, 0)] = -w[(r, 0)];
+                    }
+                }
+                let r0: Vec<f64> = (0..p)
+                    .flat_map(|r| (0..p).map(move |c| (r, c)))
+                    .map(|(r, c)| w[(r, c)])
+                    .collect();
+                let sfr = SpFrame { lt, r0 };
+                let ell: Vec<f64> = eig.eigenvalues.iter().map(|l| l.ln()).collect();
+                let mean = ell.iter().sum::<f64>() / p as f64;
+                let ell: Vec<f64> = ell.iter().map(|l| l - mean).collect();
+                let mut start = vec![0.0; bd * pt];
+                start[..d].copy_from_slice(&mu0);
+                for mm in 1..p {
+                    let h = 1.0 / ((mm * (mm + 1)) as f64).sqrt();
+                    start[d + mm - 1] =
+                        (0..mm).map(|k| ell[k] * h).sum::<f64>() - ell[mm] * mm as f64 * h;
+                }
+                let kg = |eta: &[f64], yi: &[f64], g: &mut [f64]| sp_grad(&sfr, eta, yi, g);
+                let (c, conv, _it) = fit_kernel(&kg, start, &x, &y);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let err = (0..200)
+                    .map(|i| geodesic(&vtrue[i], &sp_covariance(&sfr, &eta(&c, i))))
+                    .sum::<f64>()
+                    / 200.0;
+                cells.push((
+                    "spectral (prototype), full model".to_string(),
+                    conv,
+                    ms,
+                    err,
+                    f64::NAN,
+                ));
+            }
+            if rot_data {
+                // the same model class as the truth (its basis, the identity),
+                // from the default starts, and from the truth itself
+                let eye = DMatrix::identity(d - 1, d - 1);
+                for (name, init) in [
+                    ("gamma-rot, full model, truth's basis", Init::Auto),
+                    (
+                        "gamma-rot, full model, from the truth",
+                        Init::Custom(b.clone()),
+                    ),
+                ] {
+                    let t = Instant::now();
+                    let f = config(d, Shape::GammaRot)
+                        .with_init(init)
+                        .with_rot_basis(Some(eye.clone()))
+                        .fit(&x, &y)
+                        .unwrap();
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    let gain = f.log_likelihood - ll_truth;
+                    cells.push((name.to_string(), f.converged, ms, score(&f), gain));
+                }
+            }
+            if pen {
+                let presets: Vec<(&str, PenalizedEsag)> = vec![
+                    (
+                        "gamma-rot, adaptive group LASSO (eigen parts)",
+                        PenalizedEsag::adaptive_group_lasso()
+                            .grouping(Grouping::EigenParts)
+                            .shape(Shape::GammaRot),
+                    ),
+                    (
+                        "gamma-rot, adaptive group LASSO (groups)",
+                        PenalizedEsag::adaptive_group_lasso()
+                            .grouping(Grouping::GammaGroups)
+                            .shape(Shape::GammaRot),
+                    ),
+                    (
+                        "gamma-rot, adaptive LASSO",
+                        PenalizedEsag::adaptive_lasso().shape(Shape::GammaRot),
+                    ),
+                    (
+                        "log-tangent, adaptive LASSO",
+                        PenalizedEsag::adaptive_lasso().shape(Shape::LogTangent),
+                    ),
+                    (
+                        "log-tangent, adaptive group LASSO (cov. parts)",
+                        PenalizedEsag::adaptive_group_lasso()
+                            .grouping(Grouping::CovariatePart)
+                            .shape(Shape::LogTangent),
+                    ),
+                ];
+                for (name, pe) in presets {
+                    if let Ok(f) = std::env::var("PRESET")
+                        && !name.contains(f.as_str())
+                    {
+                        continue;
+                    }
+                    let pe = pe
+                        .target(Target::ShapeSlopes)
+                        .lt_reference(center(d))
+                        .bic()
+                        .with_parallel(false);
+                    let t = Instant::now();
+                    match pe.fit(&x, &y) {
+                        Ok(path) => {
+                            let ms = t.elapsed().as_secs_f64() * 1e3;
+                            let best = path.best();
+                            let active = best.active.iter().filter(|a| **a).count() as f64;
+                            let (conv, err) = match path.relaxed.as_ref() {
+                                Some(r) => (r.converged, score(r)),
+                                None => (best.converged, f64::NAN),
+                            };
+                            cells.push((name.to_string(), conv, ms, err, active));
+                        }
+                        Err(e) => {
+                            eprintln!("  seed {seed}: {name} failed: {e}");
+                            cells.push((name.to_string(), false, f64::NAN, f64::NAN, f64::NAN));
+                        }
+                    }
+                }
+            }
+            if std::env::var("TRACE").is_ok() {
+                for c in &cells {
+                    println!(
+                        "  seed {seed}: {:<48} {} {:8.0} ms  V {:.3}  active {}",
+                        c.0,
+                        if c.1 { "ok  " } else { "FAIL" },
+                        c.2,
+                        c.3,
+                        c.4
+                    );
+                }
+            }
+            cells
+        })
+        .collect();
+    let med = |mut v: Vec<f64>| {
+        v.retain(|x| x.is_finite());
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    println!(
+        "d={d} n={n} {} truth, {} data, seeds {seed0}..{}, penalties on the shape slopes, BIC at relaxed refits:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        },
+        if rot_data {
+            format!("gamma-rot (shape slopes x{scale})")
+        } else {
+            "gamma".to_string()
+        },
+        seed0 + reps
+    );
+    for k in 0..rows[0].len() {
+        let name = &rows[0][k].0;
+        let conv = rows.iter().filter(|r| r[k].1).count();
+        let extra = {
+            let a = med(rows.iter().map(|r| r[k].4).collect());
+            if !a.is_finite() {
+                String::new()
+            } else if name.contains("full model") {
+                format!(
+                    ", log-lik gain over the truth {a:.0} (K/2 = {:.0})",
+                    (bd * pt) as f64 / 2.0
+                )
+            } else {
+                format!(", active groups {a:.0}")
+            }
+        };
+        println!(
+            "  {name:<48} converged {conv}/{reps}, median {:7.0} ms, V error {:.3}{extra}",
+            med(rows.iter().map(|r| r[k].2).collect()),
+            med(rows.iter().map(|r| r[k].3).collect()),
+        );
+    }
 }

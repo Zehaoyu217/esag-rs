@@ -26,6 +26,7 @@ pub mod error;
 pub mod estimator;
 pub mod frame;
 pub mod gamma_rot;
+pub mod gamma_rot_adjoint;
 pub mod gamma_smooth;
 pub mod gamma_transported;
 pub mod hdual;
@@ -41,6 +42,7 @@ pub mod preprocessing;
 pub mod regression;
 pub mod rotation;
 pub mod scalar;
+pub mod spectral;
 pub mod stats;
 pub(crate) mod summary;
 

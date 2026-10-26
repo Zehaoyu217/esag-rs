@@ -43,8 +43,22 @@ def data():
 
 @pytest.fixture(scope="module")
 def res(data):
+    # the data come from Yu & Huang's gamma model, so these tests fit it;
+    # the default shape (gamma-rot) is Paine's gamma at d = 3, a different
+    # regression model
     X, Y = data
-    return esag.ESAG(Y, X).fit()
+    return esag.ESAG(Y, X, shape="gamma").fit()
+
+
+def test_default_shape_fits(data):
+    X, Y = data
+    r = esag.ESAG(Y, X).fit()
+    assert r.model.shape == "gamma-rot" and r.converged
+    assert list(r.params.columns) == ["mu[1]", "mu[2]", "mu[3]", "gamma[1]", "gamma[2]"]
+    # the mean model is the same: the fitted mean directions agree closely
+    g = esag.ESAG(Y, X, shape="gamma").fit()
+    cos = np.sum(r.predict(X.values[:50]).values * g.predict(X.values[:50]).values, axis=1)
+    assert (cos > 0.999).all()
 
 
 def test_fit_recovers_truth_and_labels(res):
@@ -219,27 +233,35 @@ def test_auto_shape():
     y /= np.linalg.norm(y, axis=1, keepdims=True)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        assert esag.ESAG(y).shape == "gamma"
-        assert esag.ESAG(y[:, :3], rng.normal(size=(50, 2))).shape == "gamma"
+        assert esag.ESAG(y).shape == "gamma-rot"
+        assert esag.ESAG(y[:, :3], rng.normal(size=(50, 2))).shape == "gamma-rot"
         assert esag.ESAG(y, rng.normal(size=(50, 2)), shape="log-tangent").shape == "log-tangent"
+        assert esag.ESAG(y, shape="gamma").shape == "gamma"
 
 
-def test_auto_shape_fits_both_at_d4():
-    # d = 4 with covariates: fit() compares gamma and log-tangent
+def test_gamma_rot_fit_at_d4():
+    # d = 4 with covariates: the default (gamma-rot) converges, stores its
+    # frame, and refits the same model from the stored frame
     rng = np.random.default_rng(4)
     x = rng.normal(size=(400, 2))
     eta = np.column_stack([np.full(400, 2.0), 0.5 * x[:, 0], np.full(400, 0.8), np.ones(400)])
     y = eta + rng.normal(size=(400, 4)) * np.array([1.0, 0.6, 0.4, 0.3])
     y /= np.linalg.norm(y, axis=1, keepdims=True)
     m = esag.ESAG(y, x)
-    with pytest.warns(esag.ShapeWarning, match="and log-tangent and kept"):
-        res = m.fit()
-    assert m.shape in ("gamma", "log-tangent")
-    g = esag.ESAG(y, x, shape="gamma").fit()
-    lt = esag.ESAG(y, x, shape="log-tangent").fit()
-    best = g if (g.converged and g.llf >= lt.llf) else lt
-    assert abs(res.llf - best.llf) < 1e-8
-    assert list(res.params.columns) == list(best.params.columns)
+    res = m.fit()
+    assert m.shape == "gamma-rot" and res.converged
+    assert "gamma-rot" in str(res.summary())
+    assert res.lt_reference is not None and res.rot_basis is not None
+    assert np.asarray(res.rot_basis).shape == (3, 3)
+    again = esag.ESAG(y, x, lt_reference=res.lt_reference, rot_basis=res.rot_basis).fit()
+    assert abs(again.llf - res.llf) < 1e-6
+    # the eigen-part grouping is available for gamma-rot
+    reg = m.fit_regularized("adaptive_group_lasso", groups="eigen_parts", target="shape_slopes")
+    assert reg.params.shape == res.params.shape
+    # without covariates every shape fits the same distribution
+    a = esag.ESAG(y, shape="gamma").fit()
+    b = esag.ESAG(y, shape="gamma-rot").fit()
+    assert abs(a.llf - b.llf) < 1e-6
 
 
 def test_gamma_transported():
@@ -248,8 +270,6 @@ def test_gamma_transported():
     y = rng.normal(size=(300, 3)) * 0.3 + np.array([0.05, 0.08, 1.0])
     y /= np.linalg.norm(y, axis=1, keepdims=True)
     x = rng.normal(size=(300, 2))
-    with pytest.warns(esag.ShapeWarning, match="transported"):
-        assert esag.ESAG(y, x).shape == "gamma-transported"
     res = esag.ESAG(y, x, shape="gamma-transported").fit()
     assert res.converged and "transported" in str(res.summary())
     assert res.lt_reference is not None

@@ -88,6 +88,9 @@ enum ShapeKind {
     /// gamma in the tangent frame transported from the data's mean
     /// direction (no pole at mu_0 = mu_1 = 0)
     GammaTransported,
+    /// gamma made smooth: eigenvalue ratios and rotation vectors per group, in
+    /// the transported frame (no singular set; at d = 3 Paine et al.'s gamma)
+    GammaRot,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -388,6 +391,7 @@ fn run() -> Res<()> {
                     ShapeKind::Gamma => Shape::Gamma,
                     ShapeKind::LogTangent => Shape::LogTangent,
                     ShapeKind::GammaTransported => Shape::GammaTransported,
+                    ShapeKind::GammaRot => Shape::GammaRot,
                 })
                 .fit(&xm, &ym)?;
             outln!("{}", fit.summary());
@@ -543,6 +547,7 @@ fn run() -> Res<()> {
                         ShapeKind::Gamma => Shape::Gamma,
                         ShapeKind::LogTangent => Shape::LogTangent,
                         ShapeKind::GammaTransported => Shape::GammaTransported,
+                        ShapeKind::GammaRot => Shape::GammaRot,
                     })
                 }
             };

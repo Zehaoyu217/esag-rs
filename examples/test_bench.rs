@@ -25,6 +25,7 @@ fn main() {
         let shapes: Vec<Shape> = match std::env::var("SHAPE").as_deref() {
             Ok("gamma") => vec![Shape::Gamma],
             Ok("lt") => vec![Shape::LogTangent],
+            Ok("gr") | Ok("gamma-rot") => vec![Shape::GammaRot],
             _ => vec![Shape::Gamma, Shape::LogTangent],
         };
         for shape in shapes {

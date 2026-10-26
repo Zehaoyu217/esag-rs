@@ -89,8 +89,15 @@ pub enum Grouping {
     Parameter,
     /// All target coefficients as one group (with `Target::Shape`: isotropy).
     All,
-    /// The groups `γ_(1), …, γ_(d−2)` of Yu & Huang's γ (per column).
+    /// The groups `γ_(1), …, γ_(d−2)` of Yu & Huang's γ (per column); for
+    /// [`Shape::GammaRot`] the same rows (group 1, then each `(κ_j, ω_j)`).
     GammaGroups,
+    /// For [`Shape::GammaRot`], per column: group 1 (Paine's pair) as one
+    /// group, and for each group `j ≥ 2` its eigenvalue coordinate `κ_j`
+    /// alone and its rotation vector `ω_j` as one group. Zeroing an `ω_j`
+    /// group keeps axis `j + 1` where it is as the covariate varies;
+    /// zeroing a `κ_j` keeps its variance ratio.
+    EigenParts,
     /// Explicit groups of `(row, column)` coefficients of `B` (column 0 is
     /// the intercept).
     Custom(Vec<Vec<(usize, usize)>>),
@@ -220,6 +227,10 @@ pub struct PenalizedEsag {
     /// mean direction); see [`EsagRegressor::lt_reference`].
     #[serde(default)]
     pub lt_reference: Option<Vec<f64>>,
+    /// Basis rotation of the gamma-rot frame (default: from the unpenalized
+    /// fit's pilot); see [`EsagRegressor::rot_basis`].
+    #[serde(default)]
+    pub rot_basis: Option<DMatrix<f64>>,
 }
 
 impl PenalizedEsag {
@@ -245,6 +256,7 @@ impl PenalizedEsag {
             feature_names: None,
             response_names: None,
             lt_reference: None,
+            rot_basis: None,
         }
     }
     /// LASSO on every slope coefficient.
@@ -389,6 +401,11 @@ impl PenalizedEsag {
         self.lt_reference = Some(m);
         self
     }
+    /// Basis rotation of the gamma-rot frame.
+    pub fn rot_basis(mut self, r0: DMatrix<f64>) -> Self {
+        self.rot_basis = Some(r0);
+        self
+    }
     /// A short name of the method ("adaptive group LASSO", …).
     pub fn method_name(&self) -> String {
         let weights = match self.weighting {
@@ -475,6 +492,7 @@ impl PenalizedEsag {
                 // log-tangent frame, not one from its own training rows
                 let mut same_frame = self.clone();
                 same_frame.lt_reference = prep.config.lt_reference.clone();
+                same_frame.rot_basis = prep.config.rot_basis.clone();
                 let v = same_frame.cross_validate(x, y, &prep.lambdas, folds, seed, score)?;
                 for (p, &c) in points.iter_mut().zip(&v) {
                     p.cv = Some(c);
@@ -668,6 +686,7 @@ impl PenalizedPath {
             (_, Grouping::Parameter) => "parameter".to_string(),
             (_, Grouping::All) => "one group".to_string(),
             (_, Grouping::GammaGroups) => "gamma groups".to_string(),
+            (_, Grouping::EigenParts) => "eigen parts".to_string(),
             (_, Grouping::Custom(g)) => format!("{} groups", g.len()),
         };
         let selection = match c.selection {
@@ -881,6 +900,7 @@ impl Prepared {
         let mut config = EsagRegressor::new()
             .with_shape(cfg.shape)
             .with_lt_reference(cfg.lt_reference.clone())
+            .with_rot_basis(cfg.rot_basis.clone())
             .with_parallel(cfg.parallel)
             .with_hessian(false);
         if let Some(n) = &cfg.feature_names {
@@ -983,7 +1003,10 @@ impl Prepared {
                 .collect(),
             Grouping::All => vec![target.iter().map(|&(k, j)| idx(k, j)).collect()],
             Grouping::GammaGroups => {
-                if !matches!(cfg.shape, Shape::Gamma | Shape::GammaTransported) {
+                if !matches!(
+                    cfg.shape,
+                    Shape::Gamma | Shape::GammaTransported | Shape::GammaRot
+                ) {
                     return Err(EsagError::Data(
                         "Grouping::GammaGroups needs a gamma shape".into(),
                     ));
@@ -998,6 +1021,33 @@ impl Prepared {
                                 .map(|k| idx(k, j))
                                 .collect::<Vec<usize>>()
                         })
+                    })
+                    .collect()
+            }
+            Grouping::EigenParts => {
+                if cfg.shape != Shape::GammaRot {
+                    return Err(EsagError::Data(
+                        "Grouping::EigenParts needs Shape::GammaRot".into(),
+                    ));
+                }
+                // per column: group 1 (Paine's pair) as one group; for each
+                // group j >= 2 its eigenvalue coordinate kappa_j alone and its
+                // rotation vector omega_j as one group
+                (0..pt)
+                    .flat_map(|j| {
+                        let tg = &target;
+                        let pick = move |rows: std::ops::Range<usize>| {
+                            rows.filter(|&k| tg.contains(&(k, j)))
+                                .map(|k| idx(k, j))
+                                .collect::<Vec<usize>>()
+                        };
+                        let mut gs = vec![pick(d..d + 2)];
+                        for jg in 2..=d - 2 {
+                            let start = d + jg * (jg + 1) / 2 - 1;
+                            gs.push(pick(start..start + 1));
+                            gs.push(pick(start + 1..start + jg + 1));
+                        }
+                        gs
                     })
                     .collect()
             }

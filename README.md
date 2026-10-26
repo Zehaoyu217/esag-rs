@@ -648,6 +648,32 @@ The full list of R-code issues found while porting is in
 
 ## The γ parameterization: what porting found
 
+**γ-rot (`Shape::GammaRot`, Python `shape="gamma-rot"`, the default of
+`shape="auto"`) is γ made smooth.** It keeps Yu & Huang's groups and
+their meaning (each group: how much variance its eigen-axis has against
+the axes below it, and where the axis points) and changes the map: group 1
+is Paine et al.'s γ (so at d = 3 it is the original ESAG parameterization),
+a group `j ≥ 2` is a log variance ratio `κ_j` against the geometric mean
+of the lower axes plus a rotation vector `ω_j` placing the axis by the
+minimal rotation of its block (Cayley form), in the tangent frame
+transported from the data's mean direction and turned by a basis rotation
+from a pilot log-tangent fit. `V` depends smoothly on the coordinates
+everywhere, so there are no cliffs, no traps and no non-regular suprema;
+zero groups are ordinary points, so group penalties may select them. Its
+reverse-mode kernel costs what γ's does (49–272 ns per observation at
+d = 3–10, 4–10× less than the log-tangent's at d ≥ 5). On the hard scenario
+every fit converges (γ: 0–4 of 8 at d = 5–8); on γ data its `V̂(x)` error
+is γ's where γ converges and the log-tangent's within 0.1; on its own data
+it beats the log-tangent (0.45 vs 0.60 at d = 5, n = 2000), and with the
+adaptive group LASSO over its eigen groups (`Grouping::GammaGroups`,
+`Grouping::EigenParts`; Python `groups="gamma"` / `"eigen_parts"`) it is
+the most accurate model measured at d = 8 (0.49–0.53 against 0.59–0.68 for
+the log-tangent family, n = 2000). What remains: the model depends on the
+axis ordering and basis stored with the fit (`rot_basis`, `lt_reference`),
+rotation slopes of nearly tied axes are weakly identified (regularize, as
+above), and its penalized paths are slow at d = 8 (about a minute).
+`docs/MATH.md` §2 has the map, the measurements and the open items.
+
 `γ ↦ V` is discontinuous wherever a group `j ≥ 2`, or the last two entries
 of such a group, vanish while lower groups do not: approaching such a point
 from different directions gives `V`s that differ by O(1) however close one
@@ -688,8 +714,8 @@ continuous. Consequences:
   writes the same γ map in the frame transported from the data's mean
   direction. Without covariates it is the γ fit; near the pole it is 3–5×
   faster and converges more often (d = 4: 10 of 12 fits against 5 of 12;
-  `docs/MATH.md` §2). Gamma summaries recommend it there, and Python's
-  `shape="auto"` picks it.
+  `docs/MATH.md` §2). Gamma summaries recommend it there. (γ-rot uses the
+  transported frame throughout and has no pole.)
 * **Project 3.** Exact zeros of a group `j ≥ 2` or of a trailing pair sit
   on the set, and both of the paper's simulation truths lie on it (nudging
   them by 1e−9 changes `V` by 4.6 and 0.8–1.0). The penalized module

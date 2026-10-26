@@ -82,7 +82,7 @@ PENALTIES = (
 #: ``fit_regularized(target=...)``: which coefficients are penalized.
 TARGETS = ("slopes", "mean", "shape_slopes", "shape")
 #: ``fit_regularized(groups=...)``: how the target is grouped.
-GROUPINGS = ("covariate", "covariate_part", "parameter", "all", "gamma")
+GROUPINGS = ("covariate", "covariate_part", "parameter", "all", "gamma", "eigen_parts")
 #: ``ESAGResults.test(null=...)`` choices.
 NULLS = ("isotropy", "mu", "shape", "feature", "constant_shape")
 
@@ -163,42 +163,47 @@ class ESAG:
     exog : (n, p) array-like or None
         Covariates (no constant needed; one is added). ``None`` fits an
         i.i.d. ESAG.
-    shape : {"auto", "gamma", "gamma-transported", "log-tangent"}
-        Shape parameterization. ``"gamma"`` is the papers' (Paine et al.
-        2018; Yu & Huang). ``"gamma-transported"`` is the same gamma map in
-        the tangent frame transported from the data's mean direction
-        instead of ``onb(mu)``: the same fit without covariates, and no
-        slowdown when the mean direction is near the pole of ``onb``
-        (``mu_0 = mu_1 = 0``), where gamma fits are 3-5x slower and converge
-        less often. ``"log-tangent"`` writes V through the matrix
-        exponential of a traceless symmetric matrix in the tangent space;
-        it is smooth everywhere, so regressions at d >= 4 with covariates
-        fit reliably. ``"auto"`` uses gamma when d = 3 or there are no
-        covariates (gamma-transported if the data's mean direction is
-        within about 17 degrees of that pole). At d >= 4 with covariates,
-        :meth:`fit` fits both gamma and log-tangent and keeps gamma if it
-        converged with the higher log-likelihood, else log-tangent. It
-        raises a :class:`ShapeWarning` saying what it did (penalized fits
-        use log-tangent). With covariates the shapes are different
-        (non-nested) regression models with equal parameter counts, so
-        AIC/BIC compare them by log-likelihood. Neither replaces the other:
-        on strongly anisotropic data from gamma, gamma recovers V(x) two to
-        three times better than log-tangent.
+    shape : {"auto", "gamma-rot", "gamma", "gamma-transported", "log-tangent"}
+        Shape parameterization. ``"gamma-rot"`` (what ``"auto"`` uses) is
+        Yu & Huang's gamma made smooth: the same groups, each read as a log
+        eigenvalue ratio and a rotation vector placing the eigen-axis, in
+        the tangent frame transported from the data's mean direction and
+        turned by a basis rotation chosen from a pilot fit; at d = 3 it is
+        Paine et al.'s (2018) gamma. V depends smoothly on its coordinates
+        everywhere, so regressions converge where gamma's fits stop at
+        non-regular points, and zero groups are ordinary points (group
+        penalties can select them). ``"gamma"`` is the papers' gamma (Yu &
+        Huang; eigenvalue ratios and spherical angles, with a singular set
+        where its regressions at d >= 4 can get trapped).
+        ``"gamma-transported"`` is that gamma map in the transported frame
+        (no pole at ``mu_0 = mu_1 = 0``). ``"log-tangent"`` writes V through
+        the matrix exponential of a traceless symmetric matrix: smooth,
+        first-order identifiable everywhere, fastest, but without the
+        eigen-decomposition reading of its coefficients. With covariates
+        the shapes are different (non-nested) regression models with equal
+        parameter counts, so AIC/BIC compare them by log-likelihood.
     missing : {"none", "drop"}
         ``"drop"`` removes rows with NaN in endog or exog; ``"none"`` raises.
     lt_reference : array-like of length d, optional
-        Reference direction of the log-tangent and gamma-transported frames (default: the data's
-        mean direction, stored with the fit as ``results.lt_reference`` and
-        printed in the summary). The log-tangent regression model depends on
-        it, since s linear in x in one frame is not linear in another. Pass
+        Reference direction of the gamma-rot, log-tangent and
+        gamma-transported frames (default: the data's mean direction,
+        stored with the fit as ``results.lt_reference`` and printed in the
+        summary). These regression models depend on it, since coordinates
+        linear in x in one frame are not linear in another. Pass
         ``lt_reference=results.lt_reference`` to fit the same model to other
         data, or set it to fit a model defined in a given frame (e.g. a
         simulation truth); it has no effect for ``shape="gamma"``. Without
         covariates it does not change the fitted distribution.
+    rot_basis : (d-1, d-1) array-like, optional
+        Basis rotation of the gamma-rot frame (default: the eigenframe of a
+        pilot log-tangent fit at the mean design row, stored with the fit as
+        ``results.rot_basis``). The gamma-rot regression model depends on
+        it; pass ``rot_basis=results.rot_basis`` with ``lt_reference`` to
+        fit the same model to other data.
     """
 
     def __init__(self, endog, exog=None, shape: str = "auto", missing: str = "none",
-                 lt_reference=None):
+                 lt_reference=None, rot_basis=None):
         y = _as_2d(endog, "endog")
         self.endog_names = _names(endog, y.shape[1], "y")
         if exog is None:
@@ -222,46 +227,28 @@ class ESAG:
         x = np.ascontiguousarray(x[:, keep_cols])
         self.exog_names = ["const"] + [exog_names[j] for j in keep_cols]
         d = y.shape[1]
-        self._auto_both = False
         if shape == "auto":
-            shape = "gamma" if d <= 3 or x.shape[1] == 0 else "log-tangent"
-            if shape == "log-tangent":
-                # fit() fits gamma and log-tangent and keeps the better one
-                self._auto_both = True
-            elif _onb_pole_distance(y) < _POLE_NEAR:
-                shape = "gamma-transported"
-                warnings.warn(
-                    "shape='auto' chose gamma in the transported frame: the data's mean "
-                    "direction is within about 17 degrees of the pole of onb(mu) "
-                    "(mu_0 = mu_1 = 0), where gamma fits are slow and often fail; "
-                    "pass shape='gamma' for the onb frame, or "
-                    "shape='gamma-transported' to silence this warning",
-                    ShapeWarning,
-                    stacklevel=2,
-                )
+            shape = "gamma-rot"
         self.shape = shape
         self.endog = y
         self.exog = x
         self.nobs = y.shape[0]
         self.k_endog = d
         self.param_names = _esag.param_rows(d, shape)
-        def native(sh):
-            return _esag.Model(
-                y,
-                x,
-                exog_names=self.exog_names[1:],
-                endog_names=self.endog_names,
-                shape=sh,
-                lt_reference=None if lt_reference is None else [float(v) for v in lt_reference],
-            )
-
-        self._native = native(shape)
-        self._natives = {shape: self._native}
-        if self._auto_both:
-            # the gamma candidate: in the transported frame near the onb pole
-            self._gamma_kind = ("gamma-transported" if _onb_pole_distance(y) < _POLE_NEAR
-                                else "gamma")
-            self._natives[self._gamma_kind] = native(self._gamma_kind)
+        if rot_basis is not None:
+            rb = np.asarray(rot_basis, dtype=np.float64)
+            if rb.shape != (d - 1, d - 1):
+                raise ValueError(f"rot_basis must be ({d - 1}, {d - 1})")
+            rot_basis = [[float(v) for v in row] for row in rb]
+        self._native = _esag.Model(
+            y,
+            x,
+            exog_names=self.exog_names[1:],
+            endog_names=self.endog_names,
+            shape=shape,
+            lt_reference=None if lt_reference is None else [float(v) for v in lt_reference],
+            rot_basis=rot_basis,
+        )
 
     def _exog_new(self, exog) -> np.ndarray:
         x = _as_2d(exog, "exog")
@@ -280,27 +267,7 @@ class ESAG:
         ``cov=False`` skips the observed information (no standard errors).
         """
         kw = dict(maxiter=maxiter, tol=tol, restarts=restarts, seed=seed, cov=cov)
-        if not self._auto_both:
-            return ESAGResults(self, self._native.fit(**kw))
-        # shape="auto", d >= 4 with covariates: the two shapes are different
-        # regression models with equal parameter counts; keep gamma if it
-        # converged (a trapped fit is no MLE) with the higher likelihood
-        lt = self._natives["log-tangent"].fit(**kw)
-        g = self._natives[self._gamma_kind].fit(**kw)
-        gap = g.llf - lt.llf
-        keep = self._gamma_kind if g.converged and gap >= 0 else "log-tangent"
-        self.shape = keep
-        self._native = self._natives[keep]
-        self.param_names = _esag.param_rows(self.k_endog, keep)
-        warnings.warn(
-            f"shape='auto' (d >= 4 with covariates) fitted {self._gamma_kind} and log-tangent "
-            f"and kept {keep}: log-likelihood gamma - log-tangent = {gap:+.2f}, gamma "
-            f"{'converged' if g.converged else 'did not converge'}; pass shape='gamma' or "
-            f"shape='log-tangent' to fit one",
-            ShapeWarning,
-            stacklevel=2,
-        )
-        return ESAGResults(self, g if keep == "gamma" else lt)
+        return ESAGResults(self, self._native.fit(**kw))
 
     def fit_regularized(
         self,
@@ -343,9 +310,14 @@ class ESAG:
             (default: all target coefficients of one covariate),
             ``"covariate_part"`` (a covariate's mean slopes and its shape
             slopes separately), ``"parameter"`` (one group per row of B),
-            ``"all"``, ``"gamma"`` (the papers' gamma groups); or explicit
-            groups as lists of ``(parameter, variable)`` pairs, by name
-            (``("mu[1]", "x1")``) or index.
+            ``"all"``, ``"gamma"`` (the gamma groups, per covariate: for
+            gamma-rot each group's log eigenvalue ratio and rotation vector
+            together), ``"eigen_parts"`` (gamma-rot only, per covariate: group
+            1 as a pair, then each log eigenvalue ratio alone and each
+            rotation vector as a group, so a covariate can move an axis's
+            variance without turning it, or turn it without changing its
+            variance); or explicit groups as lists of ``(parameter,
+            variable)`` pairs, by name (``("mu[1]", "x1")``) or index.
         adaptive : bool or float, optional
             Adaptive weights ||theta_mle||^-r: ``True`` (r = 1), a number r,
             or ``False`` (plain weights). Defaults to the preset's.
@@ -373,10 +345,8 @@ class ESAG:
         if alpha is not None:
             a = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
             lambdas = [float(v) * self.nobs for v in a]
-        # under shape="auto" at d >= 4 with covariates, penalize the smooth
-        # shape (exact zeros of gamma groups sit on its singular set)
-        shape = "log-tangent" if self._auto_both else self.shape
-        native = self._natives.get(shape, self._native).fit_regularized(
+        shape = self.shape
+        native = self._native.fit_regularized(
             penalty=penalty,
             target=target,
             groups=groups,
@@ -494,8 +464,18 @@ class ESAGResults(_CoefTable):
     lt_reference = property(
         lambda self: None if self._native.lt_reference is None
         else np.asarray(self._native.lt_reference),
-        doc="Reference direction m of the log-tangent frame (None for gamma). "
+        doc="Reference direction m of the transported frame (None for gamma). "
             "ESAG(..., lt_reference=m) fits the same model to other data.")
+    rot_basis = property(
+        lambda self: None if self._native.rot_basis is None
+        else np.asarray(self._native.rot_basis),
+        doc="Basis rotation of the gamma-rot frame (None for the other shapes). "
+            "ESAG(..., lt_reference=m, rot_basis=R) fits the same model to other data.")
+    #: Whether the fit is a certified non-regular maximum of gamma's
+    #: likelihood (its ``singular_obs`` sit on the singular set).
+    non_regular = property(lambda self: bool(self._native.non_regular))
+    #: Observations set aside by an opt-in set-aside fit (normally empty).
+    set_aside_obs = property(lambda self: list(self._native.set_aside_obs))
 
     def summary(self, alpha: float = 0.05) -> Summary:
         return Summary(self._native.summary(alpha))

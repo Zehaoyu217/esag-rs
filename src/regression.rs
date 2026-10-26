@@ -65,6 +65,18 @@ pub enum Shape {
     /// with the data's mean direction near that set, fits need about a
     /// fifth of the iterations (`docs/MATH.md` §2).
     GammaTransported,
+    /// Yu & Huang's `gamma` made smooth ([`crate::gamma_rot`]): the same
+    /// groups, each read as an eigenvalue ratio (against the geometric mean
+    /// of the lower axes) and a rotation vector placing the axis, in the
+    /// tangent frame transported from a reference direction
+    /// ([`EsagRegressor::lt_reference`]) and turned by a fixed basis
+    /// rotation ([`EsagRegressor::with_rot_basis`]; by default the
+    /// eigenframe of the moment estimate, so every axis starts at its pole).
+    /// Group 1 is Paine et al.'s `γ`, so at `d = 3` this is the original
+    /// ESAG parameterization. `V` depends smoothly on the coordinates
+    /// everywhere: no cliffs, no non-regular suprema, and zero groups are
+    /// ordinary points (`docs/MATH.md` §2).
+    GammaRot,
 }
 
 /// How the optimiser is initialised.
@@ -160,6 +172,20 @@ pub struct EsagRegressor {
     /// the data, and the summary says so.
     #[serde(default)]
     pub set_aside: bool,
+    /// Link of the rotation vectors of [`Shape::GammaRot`] (default
+    /// [`crate::gamma_rot::RotLink::Stereo`]).
+    #[serde(default = "default_rot_link")]
+    pub rot_link: crate::gamma_rot::RotLink,
+    /// Basis rotation `R_0` of [`Shape::GammaRot`] (`(d−1) × (d−1)`,
+    /// orthogonal). `None`: the eigenframe of the moment estimate, chosen by
+    /// `fit` and stored with the fit (the regression model depends on it,
+    /// as it does on [`EsagRegressor::lt_reference`]).
+    #[serde(default)]
+    pub rot_basis: Option<DMatrix<f64>>,
+}
+
+fn default_rot_link() -> crate::gamma_rot::RotLink {
+    crate::gamma_rot::RotLink::Stereo
 }
 
 impl Default for EsagRegressor {
@@ -192,6 +218,8 @@ impl EsagRegressor {
             refit_decrement: None,
             handover: None,
             set_aside: false,
+            rot_link: crate::gamma_rot::RotLink::Stereo,
+            rot_basis: None,
         }
     }
 
@@ -199,6 +227,19 @@ impl EsagRegressor {
     /// aside ([`EsagRegressor::set_aside`]).
     pub fn with_set_aside(mut self, v: bool) -> Self {
         self.set_aside = v;
+        self
+    }
+
+    /// The link of the rotation vectors of [`Shape::GammaRot`].
+    pub fn with_rot_link(mut self, link: crate::gamma_rot::RotLink) -> Self {
+        self.rot_link = link;
+        self
+    }
+
+    /// The basis rotation of [`Shape::GammaRot`] (`None`: the eigenframe of
+    /// the moment estimate).
+    pub fn with_rot_basis(mut self, r0: Option<DMatrix<f64>>) -> Self {
+        self.rot_basis = r0;
         self
     }
     /// Whether to add an intercept column.
@@ -280,10 +321,28 @@ impl EsagRegressor {
                 }
                 None => mean_direction(&data.y, data.n, data.d),
             };
-            if self.shape == Shape::LogTangent {
-                data.lt = Some(LtFrame::new(&m));
-            } else {
-                data.gt = Some(LtFrame::new(&m));
+            match self.shape {
+                Shape::LogTangent => data.lt = Some(LtFrame::new(&m)),
+                Shape::GammaTransported => data.gt = Some(LtFrame::new(&m)),
+                Shape::GammaRot => {
+                    let fr = crate::gamma_rot::GrFrame::new(&m, self.rot_link);
+                    let r0 = match &self.rot_basis {
+                        Some(r0) => {
+                            let p = data.d - 1;
+                            if r0.nrows() != p || r0.ncols() != p {
+                                return Err(EsagError::Shape(format!(
+                                    "rot_basis must be {p}×{p}, got {}×{}",
+                                    r0.nrows(),
+                                    r0.ncols()
+                                )));
+                            }
+                            r0.clone()
+                        }
+                        None => rot_basis_from_moments(&fr, &data),
+                    };
+                    data.gr = Some(fr.with_basis(&r0));
+                }
+                Shape::Gamma => {}
             }
         }
         Ok(data)
@@ -301,6 +360,31 @@ impl EsagRegressor {
     /// configuration (including `seed`), not on thread timing or the number
     /// of threads.
     pub fn fit(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<EsagRegressorFit> {
+        // Gamma-rot with covariates: a pilot log-tangent fit (smooth, one
+        // start) gives the basis rotation, unless one is set, and a start
+        // (`rot_informed_start`).
+        if self.shape == Shape::GammaRot && matches!(self.init, Init::Auto) && x.ncols() > 0 {
+            let mut cfg = self.clone();
+            cfg.shape = Shape::LogTangent;
+            cfg.compute_hessian = false;
+            cfg.rot_basis = None;
+            if let Ok(pilot) = cfg.fit(x, y) {
+                let mut me = self.clone();
+                if me.rot_basis.is_none() {
+                    me.rot_basis = rot_basis_from_pilot(&me, &pilot, x, y);
+                }
+                return me.fit_with_pilot(x, y, Some(&pilot));
+            }
+        }
+        self.fit_with_pilot(x, y, None)
+    }
+
+    fn fit_with_pilot(
+        &self,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        pilot: Option<&EsagRegressorFit>,
+    ) -> Result<EsagRegressorFit> {
         let data = self.data(x, y)?;
         let mask = self.resolve_mask(&data)?;
         let inits: Vec<Init> = match &self.init {
@@ -322,12 +406,50 @@ impl EsagRegressor {
         // (one of them converged there) and trapped in 10.
         let lt_start = (data.lt.is_none()
             && data.gt.is_none()
+            && data.gr.is_none()
             && data.p > 0
             && matches!(self.init, Init::Auto))
         .then(|| self.lt_informed_start(x, y, &data, &mask))
         .flatten();
         if let Some(s) = &lt_start {
             starts.push(s.clone());
+        }
+        // Gamma-rot with covariates: the least-squares start from the pilot
+        // log-tangent fit's V̂(x_i), raced with the moment and R-style starts
+        // (the likelihood has several regular maxima; `docs/MATH.md` §2)
+        if let (Some(p), Some(_)) = (pilot, &data.gr) {
+            match self.rot_informed_start(p, &data, &mask) {
+                Some(s) => starts.push(s),
+                None => {
+                    if std::env::var("ESAG_DEBUG_START").is_ok() {
+                        eprintln!("gamma-rot: the least-squares start from the pilot failed");
+                    }
+                }
+            }
+        }
+        if let (Ok(_), Some(fr)) = (std::env::var("ESAG_DEBUG_START"), &data.gr) {
+            let free = free_params(&mask);
+            for (k, s) in starts.iter().enumerate() {
+                let r = self.optimize(&data, s, &free, self.max_iter);
+                let xmax = r.coef.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                // largest rotation angle of any group over the observations
+                let (bd, pt, d) = (data.b_dim, data.p_total, data.d);
+                let mut amax = 0.0f64;
+                let mut eta = vec![0.0; bd];
+                for i in 0..data.n {
+                    for (kk, e) in eta.iter_mut().enumerate() {
+                        *e = (0..pt).map(|j| r.coef[(kk, j)] * data.x[i * pt + j]).sum();
+                    }
+                    for gr in 2..=d - 2 {
+                        let a = fr.axis(&eta[d..], gr);
+                        amax = amax.max(a[gr].clamp(-1.0, 1.0).acos().to_degrees());
+                    }
+                }
+                eprintln!(
+                    "gamma-rot start {k}: -ll {:.3} after {} iterations, {:?}, |g| {:.1e}, max|coef| {:.3e}, max axis angle {:.0} deg",
+                    r.neg_ll, r.n_iter, r.status, r.grad_norm_inf, xmax, amax
+                );
+            }
         }
         if self.n_restarts > 0 {
             let centers = starts.clone();
@@ -412,7 +534,7 @@ impl EsagRegressor {
         // such fits at d ≥ 5), even starts at the true coefficients do; the
         // weight homotopy below handles trapped fits instead.
         let trapped = |b: &DMatrix<f64>| {
-            data.lt.is_none() && data.p > 0 && !near_singular_observations(&data, b).is_empty()
+            data.gamma_like() && data.p > 0 && !near_singular_observations(&data, b).is_empty()
         };
         let pinned = !best.converged && trapped(&best.coef);
         // Nor where the likelihood is unbounded (a fitted V(x_i) heading for
@@ -498,6 +620,112 @@ impl EsagRegressor {
             }
         }
         self.finalize(&data, best, mask)
+    }
+
+    /// A gamma-rot start from the pilot log-tangent fit: its mean
+    /// coefficients, and for the shape the least-squares regression on the
+    /// design of the gamma-rot coordinates of every observation's fitted
+    /// `V̂(x_i)`, labelled consistently: each observation's eigen-axes are
+    /// matched to the frame's axes `e_1..e_{d−1}` (largest overlaps first)
+    /// and signed towards them, so that the coordinates of neighbouring
+    /// observations vary continuously instead of jumping between members
+    /// of the equivalence class ([`GrFrame::coords_from_eigen_signed`]).
+    /// With the basis rotation from the same pilot
+    /// ([`rot_basis_from_pilot`]) the axes at the mean design row are the
+    /// frame's axes. Shape rows are regressed on their free columns only.
+    /// `None` if a covariance or the least squares fail.
+    fn rot_informed_start(
+        &self,
+        pilot: &EsagRegressorFit,
+        data: &RegressionData,
+        mask: &DMatrix<bool>,
+    ) -> Option<DMatrix<f64>> {
+        let fr = data.gr.as_ref()?;
+        let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
+        let p = d - 1;
+        let g = bd - d;
+        let lt = pilot.lt_frame();
+        let mut cs: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let xi = &data.x[i * pt..(i + 1) * pt];
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| (0..pt).map(|c| pilot.coef[(k, c)] * xi[c]).sum())
+                .collect();
+            let v = pilot.distribution_at(&eta, lt.as_ref()).ok()?.covariance();
+            let frame = fr.tangent_frame(&eta[..d]);
+            let w = frame.transpose() * &v * &frame;
+            let eig = nalgebra::SymmetricEigen::new((&w + w.transpose()) * 0.5);
+            let logs: Vec<f64> = eig.eigenvalues.iter().map(|l| l.ln()).collect();
+            let mean = logs.iter().sum::<f64>() / p as f64;
+            // greedy matching of eigenvectors to the axes, largest |overlap| first
+            let mut pairs: Vec<(f64, usize, usize)> = (0..p)
+                .flat_map(|j| (0..p).map(move |k| (j, k)))
+                .map(|(j, k)| (eig.eigenvectors[(k, j)].abs(), j, k))
+                .collect();
+            pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let mut of_axis = vec![usize::MAX; p];
+            let mut used = vec![false; p];
+            for &(_, j, k) in &pairs {
+                if !used[j] && of_axis[k] == usize::MAX {
+                    of_axis[k] = j;
+                    used[j] = true;
+                }
+            }
+            let mut lam = vec![0.0; p];
+            let mut cur = DMatrix::zeros(p, p);
+            for k in 0..p {
+                let j = of_axis[k];
+                lam[k] = (logs[j] - mean).exp();
+                let sgn = if eig.eigenvectors[(k, j)] >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                for r in 0..p {
+                    cur[(r, k)] = sgn * eig.eigenvectors[(r, j)];
+                }
+            }
+            let ci = fr.coords_from_eigen_signed(&lam, cur);
+            if !ci.iter().all(|v| v.is_finite()) {
+                return None;
+            }
+            cs.push(ci);
+        }
+        let mut s = DMatrix::zeros(bd, pt);
+        for j in 0..pt {
+            for r in 0..d {
+                s[(r, j)] = pilot.coef[(r, j)];
+            }
+        }
+        // shape rows grouped by their free columns
+        let mut done = vec![false; g];
+        for k0 in 0..g {
+            if done[k0] {
+                continue;
+            }
+            let cols: Vec<usize> = (0..pt).filter(|&c| mask[(d + k0, c)]).collect();
+            let rows: Vec<usize> = (k0..g)
+                .filter(|&k| !done[k] && (0..pt).all(|c| mask[(d + k, c)] == mask[(d + k0, c)]))
+                .collect();
+            for &k in &rows {
+                done[k] = true;
+            }
+            if cols.is_empty() {
+                continue;
+            }
+            let xs = DMatrix::from_fn(n, cols.len(), |i, a| data.x[i * pt + cols[a]]);
+            let rhs = DMatrix::from_fn(n, rows.len(), |i, a| cs[i][rows[a]]);
+            let sol = (xs.transpose() * &xs)
+                .cholesky()?
+                .solve(&(xs.transpose() * rhs));
+            for (a, &k) in rows.iter().enumerate() {
+                for (b, &c) in cols.iter().enumerate() {
+                    s[(d + k, c)] = sol[(b, a)];
+                }
+            }
+        }
+        zero_fixed(&mut s, mask);
+        s.iter().all(|v| v.is_finite()).then_some(s)
     }
 
     /// A gamma start from the log-tangent fit of the same data, whose
@@ -620,7 +848,7 @@ impl EsagRegressor {
         best: &RawFit,
         mask: &DMatrix<bool>,
     ) -> Option<(RawFit, Vec<usize>)> {
-        if data.lt.is_some() || data.gt.is_some() {
+        if data.lt.is_some() || data.gt.is_some() || data.gr.is_some() {
             return None;
         }
         let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
@@ -1217,7 +1445,7 @@ impl EsagRegressor {
         let raw = self.optimize(&data, b0, &free, self.max_iter);
         // the R-style restart rescues warm starts at low dimension; for
         // gamma at d >= 5 with covariates it does not converge either
-        let retry = data.d <= 4 || data.p == 0 || data.lt.is_some();
+        let retry = data.d <= 4 || data.p == 0 || data.smooth();
         if raw.converged || self.max_iter == 0 || !retry {
             return self.finalize(&data, raw, mask);
         }
@@ -1267,8 +1495,8 @@ impl EsagRegressor {
                 b.copy_from(m);
             }
             Init::RStyle => {
-                // gamma: just off the isotropic kink; log-tangent: smooth at 0
-                let shape0 = if data.lt.is_some() { 0.0 } else { 1e-3 };
+                // gamma: just off the isotropic kink; the smooth shapes: 0
+                let shape0 = if data.smooth() { 0.0 } else { 1e-3 };
                 for j in 0..p_total {
                     for k in 0..d {
                         b[(k, j)] = 1.0;
@@ -1280,12 +1508,17 @@ impl EsagRegressor {
             }
             Init::DataDriven | Init::Auto => {
                 let (mu0, gamma0) = moment_start(&data.y, data.n, d);
-                let shape0 = match &data.lt {
-                    None => gamma0,
-                    Some(fr) => {
+                let shape0 = match (&data.lt, &data.gr) {
+                    (None, None) => gamma0,
+                    (Some(fr), _) => {
                         let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
                         let v = DMatrix::from_row_slice(d, d, &v);
                         crate::logtangent::s_from_covariance(fr, &mu0, &v)
+                    }
+                    (None, Some(fr)) => {
+                        let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
+                        let v = DMatrix::from_row_slice(d, d, &v);
+                        fr.coords_from_covariance(&mu0, &v)
                     }
                 };
                 for k in 0..d {
@@ -1626,7 +1859,7 @@ impl EsagRegressor {
         // Pick the canonical member of the {B, B with gamma group 1 negated}
         // equivalence class (identical likelihood, see `canonicalize_coef`).
         let mut coef = best.coef.clone();
-        if data.lt.is_none()
+        if data.gamma_like()
             && data.gt.is_none()
             && data.p_total == 1
             && mask.iter().all(|&f| f)
@@ -1654,7 +1887,7 @@ impl EsagRegressor {
                 best.grad = g;
             }
         }
-        if data.lt.is_none() && canonicalize_coef(&mut coef, data.d) {
+        if data.gamma_like() && canonicalize_coef(&mut coef, data.d) {
             for (xi, &(k, _)) in best.x.iter_mut().zip(&free) {
                 if k == data.d || k == data.d + 1 {
                     *xi = -*xi;
@@ -1774,9 +2007,13 @@ impl EsagRegressor {
         if let Some(fr) = data.lt.as_ref().or(data.gt.as_ref()) {
             config.lt_reference = Some(fr.reference().to_vec());
         }
+        if let Some(fr) = &data.gr {
+            config.lt_reference = Some(fr.lt_frame().reference().to_vec());
+            config.rot_basis = fr.basis();
+        }
         config.precondition = None;
         config.local_precondition = false;
-        let singular_obs = if best.converged || data.lt.is_some() {
+        let singular_obs = if best.converged || data.smooth() {
             vec![]
         } else {
             singular_observations(data, &coef)
@@ -1851,6 +2088,66 @@ fn mean_direction(y: &[f64], n: usize, d: usize) -> Vec<f64> {
 /// the mean direction `m̂`, the tangent-plane scatter
 /// `S = mean_i (I − m̂m̂ᵀ) y_i y_iᵀ (I − m̂m̂ᵀ)`, and the near-mode
 /// approximation `S ≈ V/‖μ‖²`. Hence `‖μ‖ = (Π σ_j)^{−1/(2(d−1))}` from the
+/// The default basis rotation of a [`Shape::GammaRot`] fit without a pilot:
+/// the eigenframe of the moment estimate's tangent covariance in `fr`'s
+/// frame (eigenvalues ascending, determinant +1). In that basis the moment
+/// estimate has every axis at its pole (`ω_j = 0`), so the regression's
+/// rotation vectors describe turns away from the pooled shape.
+fn rot_basis_from_moments(fr: &crate::gamma_rot::GrFrame, data: &RegressionData) -> DMatrix<f64> {
+    let (d, n) = (data.d, data.n);
+    let (mu0, gamma0) = moment_start(&data.y, n, d);
+    let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
+    let v = DMatrix::from_row_slice(d, d, &v);
+    eigen_basis(fr, &mu0, &v)
+}
+
+/// The basis rotation of a [`Shape::GammaRot`] fit from a pilot log-tangent
+/// fit: the eigenframe of the pilot's `V̂` at the mean design row, so that
+/// the fitted axes there are the frame's axes. `None` if the pilot's
+/// covariance there cannot be formed.
+fn rot_basis_from_pilot(
+    cfg: &EsagRegressor,
+    pilot: &EsagRegressorFit,
+    x: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+) -> Option<DMatrix<f64>> {
+    let data = RegressionData::new(x, y, cfg.fit_intercept).ok()?;
+    let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
+    let m = match &cfg.lt_reference {
+        Some(m) if m.len() == d => m.clone(),
+        _ => mean_direction(&data.y, n, d),
+    };
+    let fr = crate::gamma_rot::GrFrame::new(&m, cfg.rot_link);
+    let xbar: Vec<f64> = (0..pt)
+        .map(|c| (0..n).map(|i| data.x[i * pt + c]).sum::<f64>() / n as f64)
+        .collect();
+    let eta: Vec<f64> = (0..bd)
+        .map(|k| (0..pt).map(|c| pilot.coef[(k, c)] * xbar[c]).sum())
+        .collect();
+    let lt = pilot.lt_frame();
+    let v = pilot.distribution_at(&eta, lt.as_ref()).ok()?.covariance();
+    let r0 = eigen_basis(&fr, &eta[..d], &v);
+    r0.iter().all(|v| v.is_finite()).then_some(r0)
+}
+
+/// The eigenvectors of `Ξ(μ̂)ᵀ V Ξ(μ̂)` (eigenvalues ascending, determinant
+/// +1), with `Ξ` the frame `fr` without its basis rotation.
+fn eigen_basis(fr: &crate::gamma_rot::GrFrame, mu: &[f64], v: &DMatrix<f64>) -> DMatrix<f64> {
+    let p = mu.len() - 1;
+    let xi = fr.tangent_frame(mu);
+    let w = xi.transpose() * v * xi;
+    let eig = nalgebra::SymmetricEigen::new((&w + w.transpose()) * 0.5);
+    let mut idx: Vec<usize> = (0..p).collect();
+    idx.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+    let mut r0 = DMatrix::from_fn(p, p, |r, c| eig.eigenvectors[(r, idx[c])]);
+    if r0.determinant() < 0.0 {
+        for r in 0..p {
+            r0[(r, 0)] = -r0[(r, 0)];
+        }
+    }
+    r0
+}
+
 /// tangent eigenvalues `σ_j` of `S`, and `γ` is the parameter of the shape of
 /// `S` ([`crate::param::gamma_from_covariance`]). Group norms are capped at 25.
 pub(crate) fn moment_start(y: &[f64], n: usize, d: usize) -> (Vec<f64>, Vec<f64>) {
@@ -2246,7 +2543,7 @@ fn nearest_singular(data: &RegressionData, eta: &[f64]) -> (f64, SingularSet) {
 /// and its relative distance to the nearest singular set (see
 /// [`singular_observations`]). Empty for the log-tangent shape.
 fn singular_rows(data: &RegressionData, b: &DMatrix<f64>) -> Vec<(f64, f64)> {
-    if data.lt.is_some() {
+    if data.smooth() {
         return vec![];
     }
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
@@ -2270,7 +2567,7 @@ fn singular_rows(data: &RegressionData, b: &DMatrix<f64>) -> Vec<(f64, f64)> {
 /// Such a fit sits on the singular set for every observation at once; it
 /// comes from a path that reversed the group's direction through zero.
 pub(crate) fn collapsed_groups(data: &RegressionData, b: &DMatrix<f64>) -> Vec<usize> {
-    if data.lt.is_some() || data.d < 4 {
+    if data.smooth() || data.d < 4 {
         return vec![];
     }
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
@@ -2383,6 +2680,8 @@ pub(crate) struct RegressionData {
     /// The transported frame of [`Shape::GammaTransported`] (`None`: gamma
     /// in `onb(mu)`, or log-tangent).
     pub gt: Option<LtFrame>,
+    /// The frame of [`Shape::GammaRot`] (`None`: another shape).
+    pub gr: Option<crate::gamma_rot::GrFrame>,
     /// Observation weights of the log-likelihood (`None`: all 1), for the
     /// weight homotopy of [`EsagRegressor::homotopy_rounds`].
     pub w: Option<Vec<f64>>,
@@ -2396,7 +2695,19 @@ impl RegressionData {
     /// and the restart waves still rescue fits (one of 12 on the hard
     /// scenario at n = 2000), so `d = 4` keeps them.
     pub(crate) fn gamma_cliffs(&self) -> bool {
-        self.lt.is_none() && self.d >= 5 && self.p > 0
+        self.gamma_like() && self.d >= 5 && self.p > 0
+    }
+
+    /// A shape whose map is smooth everywhere (log-tangent, gamma-rot): no
+    /// singular sets, no traps, no canonical sign of group 1.
+    pub(crate) fn smooth(&self) -> bool {
+        self.lt.is_some() || self.gr.is_some()
+    }
+
+    /// Yu & Huang's gamma map, in `onb(mu)` or in the transported frame:
+    /// the shapes with gamma's singular sets.
+    pub(crate) fn gamma_like(&self) -> bool {
+        !self.smooth()
     }
 
     pub(crate) fn new(x: &DMatrix<f64>, y: &DMatrix<f64>, intercept: bool) -> Result<Self> {
@@ -2462,6 +2773,7 @@ impl RegressionData {
             y: yf,
             lt: None,
             gt: None,
+            gr: None,
             w: None,
         })
     }
@@ -2837,7 +3149,12 @@ impl crate::optim::prox::SmoothObjective for SmoothNegLogLik<'_> {
     fn value_grad_hess(&self, theta: &[f64], grad: &mut [f64], hess: &mut [f64]) -> f64 {
         let data = self.inner.data;
         let b = self.inner.assemble(theta);
-        let (f, g, h) = joint_loglik_grad_hess(data, &b, self.inner.parallel);
+        // (`ObsHessian::Opg`, the expected information, was measured as a
+        // metric for gamma-rot paths: the same solutions, 1.4× slower than
+        // the Hessian by differences, because the proximal Newton then needs
+        // more iterations)
+        let (f, g, h) =
+            joint_loglik_grad_hess_with(data, &b, self.inner.parallel, ObsHessian::Exact);
         let (bd, full) = (data.b_dim, data.b_dim * data.p_total);
         let free = self.inner.free;
         let nf = free.len();
@@ -3174,10 +3491,11 @@ fn small_grad_fixed<const BD: usize>(gm: &mut [f64], ge: &[f64], blk: &[f64], pt
 /// parameterization.
 #[inline]
 fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
-    match (&data.lt, &data.gt) {
-        (Some(fr), _) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
-        (None, Some(fr)) => crate::gamma_transported::loglik_gt_grad(fr, eta, y, g),
-        (None, None) => loglik::loglik_eta_grad(eta, y, g),
+    match (&data.lt, &data.gt, &data.gr) {
+        (Some(fr), _, _) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
+        (None, Some(fr), _) => crate::gamma_transported::loglik_gt_grad(fr, eta, y, g),
+        (None, None, Some(fr)) => crate::gamma_rot_adjoint::loglik_gr_grad_rev(fr, eta, y, g),
+        (None, None, None) => loglik::loglik_eta_grad(eta, y, g),
     }
 }
 
@@ -3196,6 +3514,13 @@ pub(crate) enum ObsHessian {
     /// kink) give the polishing Newton steps a better model than the
     /// pointwise Hessian (measured on unconverged d = 4 and 5 fits).
     Differences,
+    /// The outer product of the score, `−s_i s_iᵀ`: the expected information
+    /// in place of the observed one. A metric for the proximal Newton of
+    /// penalized paths with shapes that have no exact Hessian (gamma-rot,
+    /// gamma-transported), where differences cost `2·b_dim` gradients per
+    /// observation; the solution of the penalized problem does not depend
+    /// on the metric.
+    Opg,
 }
 
 /// Per-observation value, gradient and Hessian in `eta` for the data's
@@ -3209,12 +3534,25 @@ fn obs_hessian(
     g: &mut [f64],
     h: &mut [f64],
 ) -> f64 {
+    if kind == ObsHessian::Opg {
+        let f = kernel_grad(data, eta, y, g);
+        let n = g.len();
+        for a in 0..n {
+            for c in 0..n {
+                h[a * n + c] = -g[a] * g[c];
+            }
+        }
+        return f;
+    }
     if let Some(fr) = &data.lt {
         // exact (one eigen-decomposition; ~2.7× the gradient at d = 8)
         return crate::logtangent::loglik_lt_hess(fr, eta, y, g, h);
     }
     if let Some(fr) = &data.gt {
         return crate::gamma_transported::loglik_gt_hess_fd(fr, eta, y, g, h);
+    }
+    if let Some(fr) = &data.gr {
+        return crate::gamma_rot_adjoint::loglik_gr_hess_fd_rev(fr, eta, y, g, h);
     }
     if kind == ObsHessian::Differences && data.d >= 4 {
         return crate::hdual::loglik_eta_hess_fd(eta, y, g, h);
@@ -3360,8 +3698,26 @@ pub fn shape_distribution(shape: Shape, lt: Option<&LtFrame>, eta: &[f64]) -> Re
             let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
             Esag::from_covariance(&eta[..d], &v)
         }
+        (Shape::GammaRot, _) => Err(EsagError::Shape(
+            "a gamma-rot distribution needs its frame: use EsagRegressorFit::distribution_at"
+                .into(),
+        )),
         _ => Esag::from_eta(eta),
     }
+}
+
+/// The distribution of one linear predictor of a [`Shape::GammaRot`] model
+/// with frame `fr`.
+pub fn gamma_rot_distribution(fr: &crate::gamma_rot::GrFrame, eta: &[f64]) -> Result<Esag> {
+    let d = fr.dim();
+    if eta.len() != dims::eta_len(d) {
+        return Err(EsagError::Shape(format!(
+            "eta has length {} but the frame has d = {d}",
+            eta.len()
+        )));
+    }
+    let v = fr.covariance(&eta[..d], &eta[d..]);
+    Esag::from_covariance(&eta[..d], &v)
 }
 
 /// Residual diagnostics for a fitted model.
@@ -3561,15 +3917,36 @@ impl EsagRegressorFit {
                 crate::logtangent::eigen_frame(fr, &eta[..d], &eta[d..])
             }
             (Shape::GammaTransported, Some(fr)) => Frame::transported(fr, &eta[..d], &eta[d..]),
+            (Shape::GammaRot, _) => match self.gr_frame() {
+                Some(fr) => Frame::gamma_rot(&fr, &eta[..d], &eta[d..]),
+                None => Frame::new(&eta[..d], &eta[d..]),
+            },
             _ => Frame::new(&eta[..d], &eta[d..]),
         }
     }
 
-    /// The tangent frame of a `Shape::LogTangent` or
-    /// `Shape::GammaTransported` fit.
+    /// The tangent frame of a `Shape::LogTangent`, `Shape::GammaTransported`
+    /// or `Shape::GammaRot` fit (its reference direction).
     pub fn lt_frame(&self) -> Option<LtFrame> {
         match (self.config.shape, &self.config.lt_reference) {
-            (Shape::LogTangent | Shape::GammaTransported, Some(m)) => Some(LtFrame::new(m)),
+            (Shape::LogTangent | Shape::GammaTransported | Shape::GammaRot, Some(m)) => {
+                Some(LtFrame::new(m))
+            }
+            _ => None,
+        }
+    }
+
+    /// The frame of a `Shape::GammaRot` fit (reference direction, link and
+    /// basis rotation); `None` for the other shapes.
+    pub fn gr_frame(&self) -> Option<crate::gamma_rot::GrFrame> {
+        match (self.config.shape, &self.config.lt_reference) {
+            (Shape::GammaRot, Some(m)) => {
+                let fr = crate::gamma_rot::GrFrame::new(m, self.config.rot_link);
+                Some(match &self.config.rot_basis {
+                    Some(r0) => fr.with_basis(r0),
+                    None => fr,
+                })
+            }
             _ => None,
         }
     }
@@ -3588,8 +3965,7 @@ impl EsagRegressorFit {
         y: &DMatrix<f64>,
         full: &[(usize, usize)],
     ) -> Result<f64> {
-        let mut data = RegressionData::new(x, y, self.fit_intercept)?;
-        data.lt = self.lt_frame();
+        let data = self.config.data(x, y)?;
         let nf = full.len();
         let (info, g) = score_info(&data, &self.coef, full);
         // Order the kept coefficients first: the Cholesky factor `L` of `I`
@@ -3613,6 +3989,12 @@ impl EsagRegressorFit {
     /// The distribution for one linear predictor `eta` (in this model's
     /// shape parameterization; pass `self.lt_frame()` for log-tangent fits).
     pub fn distribution_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Result<Esag> {
+        if self.config.shape == Shape::GammaRot {
+            return match self.gr_frame() {
+                Some(fr) => gamma_rot_distribution(&fr, eta),
+                None => Esag::from_eta(eta),
+            };
+        }
         shape_distribution(self.config.shape, lt, eta)
     }
 
@@ -3627,6 +4009,7 @@ impl EsagRegressorFit {
         }
         let eta = self.linear_predictor(x)?;
         let lt = self.lt_frame();
+        let gr = self.gr_frame();
         let mut out = DVector::zeros(data.n);
         let mut e = vec![0.0; self.b_dim()];
         let mut grad = vec![0.0; self.b_dim()];
@@ -3635,11 +4018,12 @@ impl EsagRegressorFit {
                 e[k] = eta[(i, k)];
             }
             let yi = &data.y[i * self.d..(i + 1) * self.d];
-            out[i] = match (self.config.shape, &lt) {
-                (Shape::LogTangent, Some(fr)) => crate::logtangent::loglik_lt(fr, &e, yi),
-                (Shape::GammaTransported, Some(fr)) => {
+            out[i] = match (self.config.shape, &lt, &gr) {
+                (Shape::LogTangent, Some(fr), _) => crate::logtangent::loglik_lt(fr, &e, yi),
+                (Shape::GammaTransported, Some(fr), _) => {
                     crate::gamma_transported::loglik_gt_grad(fr, &e, yi, &mut grad)
                 }
+                (Shape::GammaRot, _, Some(fr)) => crate::gamma_rot::loglik_gr::<f64>(fr, &e, yi),
                 _ => loglik::loglik_eta(&e, yi),
             };
         }
@@ -3826,6 +4210,7 @@ impl EsagRegressorFit {
             Shape::Gamma => "gamma",
             Shape::LogTangent => "log-tangent",
             Shape::GammaTransported => "gamma (transported)",
+            Shape::GammaRot => "gamma-rot",
         };
         let mut left = vec![
             ("Dep. Variable:".to_string(), dep),
@@ -3933,6 +4318,13 @@ impl EsagRegressorFit {
             let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
             notes.push(format!(
                 "Gamma shape in the tangent frame transported from the reference\n    direction m = ({}) instead of onb(mu). With covariates the\n    model depends on m: pass it as lt_reference to fit the same model\n    to other data.",
+                m.join(", ")
+            ));
+        }
+        if let (Shape::GammaRot, Some(m)) = (self.config.shape, &self.config.lt_reference) {
+            let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
+            notes.push(format!(
+                "Gamma-rot shape: group 1 is Paine's gamma, group j >= 2 is a log\n    eigenvalue ratio kappa_j (axis j+1 against the geometric mean of the\n    lower axes) and a rotation vector omega_j placing the axis, in the\n    tangent frame transported from m = ({}) and turned by the basis\n    rotation stored with the fit. With covariates the model depends on m\n    and on that basis: pass lt_reference and rot_basis to fit the same\n    model to other data.",
                 m.join(", ")
             ));
         }

@@ -140,6 +140,40 @@ impl Frame<f64> {
     }
 }
 
+impl Frame<f64> {
+    /// The frame of the `γ`-rot map ([`crate::gamma_rot`]): the eigen-axes
+    /// of `W = fr.tangent_covariance(gamma)` carried into `ℝ^d` by the
+    /// tangent frame `Ξ(μ̂) R_0`, and `μ̂` last.
+    pub fn gamma_rot(fr: &crate::gamma_rot::GrFrame, mu: &[f64], gamma: &[f64]) -> Frame<f64> {
+        let d = mu.len();
+        let p = d - 1;
+        let w = fr.tangent_covariance(gamma);
+        let eig = nalgebra::SymmetricEigen::new(w);
+        let xi = fr.tangent_frame(mu);
+        let u = &xi * &eig.eigenvectors;
+        let mut basis = vec![0.0; d * d];
+        for j in 0..p {
+            for r in 0..d {
+                basis[j * d + r] = u[(r, j)];
+            }
+        }
+        let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for r in 0..d {
+            basis[p * d + r] = if mu_norm > 0.0 {
+                mu[r] / mu_norm
+            } else {
+                fr.lt_frame().reference()[r]
+            };
+        }
+        Frame {
+            d,
+            mu_norm,
+            lambda: eig.eigenvalues.iter().copied().collect(),
+            basis,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

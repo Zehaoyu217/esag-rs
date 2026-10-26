@@ -35,9 +35,10 @@ fn shape_of(s: &str) -> PyResult<Shape> {
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "gamma" => Ok(Shape::Gamma),
         "gamma-transported" | "gt" => Ok(Shape::GammaTransported),
+        "gamma-rot" | "gammarot" | "gr" => Ok(Shape::GammaRot),
         "log-tangent" | "logtangent" | "lt" => Ok(Shape::LogTangent),
         other => Err(err(format!(
-            "unknown shape {other:?} (gamma, gamma-transported, log-tangent)"
+            "unknown shape {other:?} (gamma, gamma-rot, gamma-transported, log-tangent)"
         ))),
     }
 }
@@ -51,7 +52,7 @@ struct PyModel {
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None))]
+    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None, rot_basis=None))]
     fn new(
         endog: PyReadonlyArray2<'_, f64>,
         exog: Option<PyReadonlyArray2<'_, f64>>,
@@ -60,6 +61,7 @@ impl PyModel {
         shape: &str,
         hasconst: bool,
         lt_reference: Option<Vec<f64>>,
+        rot_basis: Option<Vec<Vec<f64>>>,
     ) -> PyResult<Self> {
         let y = to_dmatrix(&endog);
         let x = match &exog {
@@ -93,6 +95,13 @@ impl PyModel {
                 return Err(err("lt_reference must have one entry per endog column"));
             }
             m = m.lt_reference(r);
+        }
+        if let Some(r0) = rot_basis {
+            let p = y.ncols() - 1;
+            if r0.len() != p || r0.iter().any(|row| row.len() != p) {
+                return Err(err(format!("rot_basis must be {p} x {p}")));
+            }
+            m = m.rot_basis(DMatrix::from_fn(p, p, |r, c| r0[r][c]));
         }
         Ok(Self { inner: m })
     }
@@ -181,6 +190,7 @@ impl PyModel {
                         "parameter" | "equation" => Grouping::Parameter,
                         "all" | "one" => Grouping::All,
                         "gamma" | "gamma_groups" => Grouping::GammaGroups,
+                        "eigen_parts" | "eigen" => Grouping::EigenParts,
                         other => {
                             return Err(err(format!(
                                 "unknown groups {other:?} (covariate, covariate_part, parameter, all, gamma)"
@@ -230,7 +240,7 @@ fn param_rows(d: usize, shape: &str) -> PyResult<Vec<String>> {
         return Err(err("d must be at least 2"));
     }
     let tag = match shape_of(shape)? {
-        Shape::Gamma | Shape::GammaTransported => "gamma",
+        Shape::Gamma | Shape::GammaTransported | Shape::GammaRot => "gamma",
         Shape::LogTangent => "s",
     };
     let g = esag::dims::gamma_len(d);
@@ -348,10 +358,31 @@ impl PyResults {
     fn n_iter(&self) -> usize {
         self.inner.n_iter
     }
-    /// Reference direction of the log-tangent frame (`None` for gamma).
+    /// Reference direction of the transported frame (`None` for gamma).
     #[getter]
     fn lt_reference(&self) -> Option<Vec<f64>> {
         self.inner.lt_frame().map(|f| f.reference().to_vec())
+    }
+    /// Basis rotation of the gamma-rot frame, row-major rows (`None` for
+    /// the other shapes).
+    #[getter]
+    fn rot_basis(&self) -> Option<Vec<Vec<f64>>> {
+        self.inner.gr_frame().and_then(|f| f.basis()).map(|r0| {
+            (0..r0.nrows())
+                .map(|r| (0..r0.ncols()).map(|c| r0[(r, c)]).collect())
+                .collect()
+        })
+    }
+    /// Whether the fit is a certified non-regular maximum of gamma's
+    /// likelihood (observations listed in `singular_obs` on its singular set).
+    #[getter]
+    fn non_regular(&self) -> bool {
+        self.inner.non_regular
+    }
+    /// Observations set aside by an opt-in `set_aside` fit.
+    #[getter]
+    fn set_aside_obs(&self) -> Vec<usize> {
+        self.inner.set_aside_obs.clone()
     }
     #[pyo3(signature = (alpha=0.05))]
     fn summary(&self, alpha: f64) -> String {

@@ -72,6 +72,13 @@ impl EsagModel {
         self.config.lt_reference = Some(m);
         self
     }
+    /// Basis rotation `R_0` of the gamma-rot frame (default: from a pilot
+    /// fit). The gamma-rot regression model depends on it; set it, with
+    /// `lt_reference`, to fit the same model to other data.
+    pub fn rot_basis(mut self, r0: DMatrix<f64>) -> Self {
+        self.config.rot_basis = Some(r0);
+        self
+    }
     /// Add a constant column (default `true`).
     pub fn has_constant(mut self, v: bool) -> Self {
         self.config.fit_intercept = v;
@@ -134,6 +141,9 @@ impl EsagModel {
         }
         if let Some(m) = &self.config.lt_reference {
             p = p.lt_reference(m.clone());
+        }
+        if let Some(r0) = &self.config.rot_basis {
+            p = p.rot_basis(r0.clone());
         }
         p.fit(&self.exog, &self.endog)
     }
