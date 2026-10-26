@@ -720,6 +720,7 @@ src/scalar.rs, dual.rs          Scalar trait; forward-mode AD
 src/param.rs, onb.rs,           γ → (λ, θ, φ); basis; Givens rotation; eigen-frame of V
   rotation.rs, frame.rs
 src/loglik.rs                   log-density, stable log M_p, exact gradient
+src/adjoint.rs, adjoint_hess.rs reverse-mode gradient; exact Hessian (γ)
 src/optim/                      L-BFGS (resumable; strong + approximate Wolfe), FD Hessian,
                                   proximal Newton for penalized fits
 src/logtangent.rs               smooth log-tangent shape: kernel, exact gradient and Hessian

@@ -382,12 +382,18 @@ penalized fit (§8), which is well defined. The penalized paths handle this
 case (§8, "Small samples").
 
 **Standard errors.** `esag` reports the inverse observed information. It is
-assembled as `Σ_i (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`, with per-observation Hessians from
-second-order dual numbers (`hdual`) at d = 3, and from central differences
-of the exact gradient for d ≥ 4. The two agree to about 1e-8, and the
-differences are faster there. The Kronecker sum is one matrix product per
-chunk over the unique entries (`x_{j1}x_{j2}`, `j1 ≤ j2`, times
-`H_i[k1,k2]`, `k1 ≤ k2`). When standard errors are requested, L-BFGS hands
+assembled as `Σ_i (x̃_i x̃_iᵀ) ⊗ ∇²_η ℓ_i`. The per-observation Hessian of γ
+is exact (`adjoint_hess`): the adjoint's forward pass and reverse sweep,
+one forward sweep of tangents in the angles of the rotation chain, where
+`z` is a chain of rotations by one angle each, then the polar steps of
+the reverse sweep back to γ. It costs 0.09, 0.42 and 2.1 µs at d = 3, 5
+and 8 (1.7–14 gradients), 2.7× less than second-order dual numbers at
+d = 3 and 5–7× less than the central differences of the gradient that
+were used for d ≥ 4, and agrees with the dual numbers to rounding. The
+Kronecker sum is one matrix product per chunk of observations over the
+unique entries (`x_{j1}x_{j2}`, `j1 ≤ j2`, times `H_i[k1,k2]`, `k1 ≤ k2`).
+On one core (n = 2000, 5 covariates) the joint Hessian takes 0.32, 1.3 and
+6.3 ms at d = 3, 5 and 8, 2.5, 7 and 16 gradients. When standard errors are requested, L-BFGS hands
 over once the mean gradient per observation is below 1e−4, and up to eight
 simplified Newton steps reuse this one Hessian to polish the optimum to
 ‖∇ℓ‖ ≈ 1e-10 (if the Hessian is not negative definite there, L-BFGS

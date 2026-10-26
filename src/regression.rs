@@ -1952,10 +1952,11 @@ fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> 
     }
 }
 
-/// Per-observation value, gradient and Hessian in `eta`. Exact second-order
-/// AD for `d = 3` (0.36 µs); for `d ≥ 4` central differences of the exact
-/// reverse-mode gradient, which are faster (d = 4: 1.25 vs 1.9 µs; d = 6:
-/// 4.0 vs 23 µs) and agree with the exact Hessian to ~1e-8 relative.
+/// Per-observation value, gradient and Hessian in `eta`. For γ the exact
+/// Hessian of [`crate::adjoint_hess`]: 0.09, 0.22, 0.42 and 2.1 µs at
+/// d = 3, 4, 5 and 8, against 0.25 µs for hyper-dual numbers at d = 3 and
+/// 1.5, 2.7 and 11 µs for the central differences of the gradient used
+/// before for d ≥ 4.
 #[inline]
 fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: &mut [f64]) -> f64 {
     if let Some(fr) = &data.lt {
@@ -1965,11 +1966,7 @@ fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: 
     if let Some(fr) = &data.gt {
         return crate::gamma_transported::loglik_gt_hess_fd(fr, eta, y, g, h);
     }
-    if eta.len() == 5 {
-        crate::hdual::loglik_eta_hess(eta, y, g, h)
-    } else {
-        crate::hdual::loglik_eta_hess_fd(eta, y, g, h)
-    }
+    crate::adjoint_hess::loglik_hess_adjoint(eta, y, g, h)
 }
 
 /// Joint log-likelihood, gradient and Hessian with respect to the full
@@ -1996,12 +1993,15 @@ pub(crate) fn joint_loglik_grad_hess(
     let b_rm: Vec<f64> = (0..bd)
         .flat_map(|k| (0..pt).map(move |j| b[(k, j)]))
         .collect();
+    // Per chunk, the products and entries of observation r are column r of
+    // `w` and `hs` (contiguous), and the chunk contributes `hs wᵀ`
+    // (bd(bd+1)/2 × pt(pt+1)/2).
     let body = |rows: std::ops::Range<usize>| -> (f64, Vec<f64>, DMatrix<f64>) {
         let m = rows.len();
         let mut f = 0.0;
         let mut g = vec![0.0; full];
-        let mut hs = DMatrix::<f64>::zeros(m, hpairs.len());
-        let mut w = DMatrix::<f64>::zeros(m, xpairs.len());
+        let mut hs = DMatrix::<f64>::zeros(hpairs.len(), m);
+        let mut w = DMatrix::<f64>::zeros(xpairs.len(), m);
         let mut eta = vec![0.0; bd];
         let mut ge = vec![0.0; bd];
         let mut he = vec![0.0; bd * bd];
@@ -2021,41 +2021,47 @@ pub(crate) fn joint_loglik_grad_hess(
                     g[j * bd + k] += ge[k] * xi[j];
                 }
             }
-            for (q, &(k1, k2)) in hpairs.iter().enumerate() {
-                hs[(r, q)] = he[k1 * bd + k2];
+            // the upper triangle of H_i, row by row (the order of `hpairs`)
+            let col = &mut hs.as_mut_slice()[r * hpairs.len()..(r + 1) * hpairs.len()];
+            let mut q = 0;
+            for k1 in 0..bd {
+                let len = bd - k1;
+                col[q..q + len].copy_from_slice(&he[k1 * bd + k1..(k1 + 1) * bd]);
+                q += len;
             }
-            for (a, &(j1, j2)) in xpairs.iter().enumerate() {
-                w[(r, a)] = xi[j1] * xi[j2];
+            let col = &mut w.as_mut_slice()[r * xpairs.len()..(r + 1) * xpairs.len()];
+            for (v, &(j1, j2)) in col.iter_mut().zip(&xpairs) {
+                *v = xi[j1] * xi[j2];
             }
         }
-        (f, g, w.tr_mul(&hs))
+        (f, g, hs * w.transpose())
     };
-    let (f, g, c) = if parallel && data.n >= 2 * PAR_CHUNK {
-        // At most 64 chunks, summed in order.
-        let chunk = PAR_CHUNK.max(data.n.div_ceil(64));
-        let n_chunks = data.n.div_ceil(chunk);
-        let parts: Vec<(f64, Vec<f64>, DMatrix<f64>)> = (0..n_chunks)
-            .into_par_iter()
-            .map(|c| body(c * chunk..((c + 1) * chunk).min(data.n)))
-            .collect();
-        let mut f = 0.0;
-        let mut g = vec![0.0; full];
-        let mut c = DMatrix::<f64>::zeros(xpairs.len(), hpairs.len());
-        for (fc, gc, cc) in parts {
-            f += fc;
-            for (a, b) in g.iter_mut().zip(&gc) {
-                *a += b;
-            }
-            c += cc;
-        }
-        (f, g, c)
+    // Fixed chunks (at most 64), summed in order: the result does not depend
+    // on `parallel` or on the number of threads, and the per-chunk scratch
+    // stays small (at d = 8 and n = 2000, one chunk of all observations
+    // made the Hessian 1.4× slower on one core).
+    let chunk = PAR_CHUNK.max(data.n.div_ceil(64));
+    let n_chunks = data.n.div_ceil(chunk);
+    let part = |c: usize| body(c * chunk..((c + 1) * chunk).min(data.n));
+    let parts: Vec<(f64, Vec<f64>, DMatrix<f64>)> = if parallel && data.n >= 2 * PAR_CHUNK {
+        (0..n_chunks).into_par_iter().map(part).collect()
     } else {
-        body(0..data.n)
+        (0..n_chunks).map(part).collect()
     };
+    let mut f = 0.0;
+    let mut g = vec![0.0; full];
+    let mut c = DMatrix::<f64>::zeros(hpairs.len(), xpairs.len());
+    for (fc, gc, cc) in parts {
+        f += fc;
+        for (a, b) in g.iter_mut().zip(&gc) {
+            *a += b;
+        }
+        c += cc;
+    }
     let mut h = vec![0.0; full * full];
     for (a, &(j1, j2)) in xpairs.iter().enumerate() {
         for (q, &(k1, k2)) in hpairs.iter().enumerate() {
-            let v = c[(a, q)];
+            let v = c[(q, a)];
             // H is symmetric and each H_i is symmetric: four mirror images
             h[(j1 * bd + k1) * full + j2 * bd + k2] = v;
             h[(j1 * bd + k2) * full + j2 * bd + k1] = v;
@@ -2820,3 +2826,7 @@ mod kernel_timing {
 /// Where a full fit spends its time when both `μ` and `V` depend on `x`.
 #[cfg(test)]
 pub(crate) mod fit_profile;
+
+/// Single-core cost of γ fits.
+#[cfg(test)]
+mod gamma_profile;

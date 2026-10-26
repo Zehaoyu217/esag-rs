@@ -185,7 +185,8 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
   over-rejection of the bootstrap LR test.
 * Performance branch: the frame-free, trig-free kernel
   (`loglik::quad_form_parts`); a hand-written adjoint gradient
-  (`adjoint.rs`); second-order duals (`hdual.rs`) for the d = 3 Hessian;
+  (`adjoint.rs`); second-order duals (`hdual.rs`) for the d = 3 Hessian
+  (now the test reference, see the γ-speed branch);
   `Scalar::DERIV_ORDER`; the inverse map `param::gamma_from_covariance`
   (moment start, canonical γ for intercept-only fits); starts sharing an
   iteration budget; xoshiro256++ streams from `stream_rng(seed, tag, index)`.
@@ -219,3 +220,6 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
     paper's six methods are offered as a reproduction mode in γ
     (`PenalizedEsag::paper`). `docs/project3/` holds
     the spec of the R code and the methodology review.
+* γ-speed branch: the exact Hessian of the γ log-density for every d
+  (`adjoint_hess.rs`, built on the adjoint's tape) replaces the hyper-dual
+  Hessian at d = 3 and central differences of the gradient at d ≥ 4.
