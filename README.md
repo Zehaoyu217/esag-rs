@@ -242,7 +242,7 @@ reproducible and don't depend on the thread count; a test checks this.
 ## Validation
 
 All `cargo test --release` suites pass: 190 tests, plus 45 slow studies,
-diagnostics and benchmarks marked `#[ignore]`. The Python package's 24
+diagnostics and benchmarks marked `#[ignore]`. The Python package's 25
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
 **Against the original R code.** Fixtures in `tests/fixtures` were produced

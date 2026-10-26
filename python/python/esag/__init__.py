@@ -173,14 +173,17 @@ class ESAG:
         less often. ``"log-tangent"`` writes V through the matrix
         exponential of a traceless symmetric matrix in the tangent space;
         it is smooth everywhere, so regressions at d >= 4 with covariates
-        fit quickly and reliably. ``"auto"`` uses gamma when d = 3 or there
-        are no covariates (gamma-transported if the data's mean direction
-        is within about 17 degrees of that pole), and log-tangent
-        otherwise, with a :class:`ShapeWarning` when it picks anything but
-        gamma. With covariates the three are different (non-nested)
-        regression models for the shape, as the shape coefficients enter
-        linearly in different coordinates or frames; the mean model is the
-        same. Compare them by AIC/BIC.
+        fit reliably. ``"auto"`` uses gamma when d = 3 or there are no
+        covariates (gamma-transported if the data's mean direction is
+        within about 17 degrees of that pole). At d >= 4 with covariates,
+        :meth:`fit` fits both gamma and log-tangent and keeps gamma if it
+        converged with the higher log-likelihood, else log-tangent. It
+        raises a :class:`ShapeWarning` saying what it did (penalized fits
+        use log-tangent). With covariates the shapes are different
+        (non-nested) regression models with equal parameter counts, so
+        AIC/BIC compare them by log-likelihood. Neither replaces the other:
+        on strongly anisotropic data from gamma, gamma recovers V(x) two to
+        three times better than log-tangent.
     missing : {"none", "drop"}
         ``"drop"`` removes rows with NaN in endog or exog; ``"none"`` raises.
     lt_reference : array-like of length d, optional
@@ -219,17 +222,12 @@ class ESAG:
         x = np.ascontiguousarray(x[:, keep_cols])
         self.exog_names = ["const"] + [exog_names[j] for j in keep_cols]
         d = y.shape[1]
+        self._auto_both = False
         if shape == "auto":
             shape = "gamma" if d <= 3 or x.shape[1] == 0 else "log-tangent"
             if shape == "log-tangent":
-                warnings.warn(
-                    "shape='auto' chose the log-tangent model (d >= 4 with covariates), "
-                    "a different shape regression from the gamma model of Yu & Huang; "
-                    "pass shape='gamma' for that model, or shape='log-tangent' to "
-                    "silence this warning",
-                    ShapeWarning,
-                    stacklevel=2,
-                )
+                # fit() fits gamma and log-tangent and keeps the better one
+                self._auto_both = True
             elif _onb_pole_distance(y) < _POLE_NEAR:
                 shape = "gamma-transported"
                 warnings.warn(
@@ -247,14 +245,23 @@ class ESAG:
         self.nobs = y.shape[0]
         self.k_endog = d
         self.param_names = _esag.param_rows(d, shape)
-        self._native = _esag.Model(
-            y,
-            x,
-            exog_names=self.exog_names[1:],
-            endog_names=self.endog_names,
-            shape=shape,
-            lt_reference=None if lt_reference is None else [float(v) for v in lt_reference],
-        )
+        def native(sh):
+            return _esag.Model(
+                y,
+                x,
+                exog_names=self.exog_names[1:],
+                endog_names=self.endog_names,
+                shape=sh,
+                lt_reference=None if lt_reference is None else [float(v) for v in lt_reference],
+            )
+
+        self._native = native(shape)
+        self._natives = {shape: self._native}
+        if self._auto_both:
+            # the gamma candidate: in the transported frame near the onb pole
+            self._gamma_kind = ("gamma-transported" if _onb_pole_distance(y) < _POLE_NEAR
+                                else "gamma")
+            self._natives[self._gamma_kind] = native(self._gamma_kind)
 
     def _exog_new(self, exog) -> np.ndarray:
         x = _as_2d(exog, "exog")
@@ -272,8 +279,28 @@ class ESAG:
         ``restarts`` adds perturbed starts (the best likelihood wins);
         ``cov=False`` skips the observed information (no standard errors).
         """
-        return ESAGResults(self, self._native.fit(maxiter=maxiter, tol=tol, restarts=restarts,
-                                                  seed=seed, cov=cov))
+        kw = dict(maxiter=maxiter, tol=tol, restarts=restarts, seed=seed, cov=cov)
+        if not self._auto_both:
+            return ESAGResults(self, self._native.fit(**kw))
+        # shape="auto", d >= 4 with covariates: the two shapes are different
+        # regression models with equal parameter counts; keep gamma if it
+        # converged (a trapped fit is no MLE) with the higher likelihood
+        lt = self._natives["log-tangent"].fit(**kw)
+        g = self._natives[self._gamma_kind].fit(**kw)
+        gap = g.llf - lt.llf
+        keep = self._gamma_kind if g.converged and gap >= 0 else "log-tangent"
+        self.shape = keep
+        self._native = self._natives[keep]
+        self.param_names = _esag.param_rows(self.k_endog, keep)
+        warnings.warn(
+            f"shape='auto' (d >= 4 with covariates) fitted {self._gamma_kind} and log-tangent "
+            f"and kept {keep}: log-likelihood gamma - log-tangent = {gap:+.2f}, gamma "
+            f"{'converged' if g.converged else 'did not converge'}; pass shape='gamma' or "
+            f"shape='log-tangent' to fit one",
+            ShapeWarning,
+            stacklevel=2,
+        )
+        return ESAGResults(self, g if keep == "gamma" else lt)
 
     def fit_regularized(
         self,
@@ -346,7 +373,10 @@ class ESAG:
         if alpha is not None:
             a = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
             lambdas = [float(v) * self.nobs for v in a]
-        native = self._native.fit_regularized(
+        # under shape="auto" at d >= 4 with covariates, penalize the smooth
+        # shape (exact zeros of gamma groups sit on its singular set)
+        shape = "log-tangent" if self._auto_both else self.shape
+        native = self._natives.get(shape, self._native).fit_regularized(
             penalty=penalty,
             target=target,
             groups=groups,
@@ -360,7 +390,7 @@ class ESAG:
             paper=paper,
             custom_groups=custom,
         )
-        return RegularizedResults(self, native)
+        return RegularizedResults(self, native, _esag.param_rows(self.k_endog, shape))
 
     def _coef_index(self, e) -> tuple:
         k, j = e
@@ -384,17 +414,23 @@ class _CoefTable:
 
     model: ESAG
 
+    @property
+    def _names(self) -> list:
+        # the parameter names of the shape this result was fitted in
+        return getattr(self, "_param_names", None) or self.model.param_names
+
     def _df(self, m: np.ndarray):
         # statsmodels (MNLogit) layout: rows = exog names, columns = equations
-        return _frame(np.asarray(m).T, self.model.exog_names, self.model.param_names)
+        return _frame(np.asarray(m).T, self.model.exog_names, self._names)
 
 
 class ESAGResults(_CoefTable):
     """Results of :meth:`ESAG.fit` (statsmodels-style attributes)."""
 
-    def __init__(self, model: ESAG, native):
+    def __init__(self, model: ESAG, native, param_names=None):
         self.model = model
         self._native = native
+        self._param_names = list(param_names or model.param_names)
 
     # statsmodels attributes ------------------------------------------------
     @property
@@ -424,7 +460,7 @@ class ESAGResults(_CoefTable):
         lo, hi = self._native.conf_int(alpha)
         if _pd is None:
             return lo, hi
-        idx = _pd.MultiIndex.from_product([self.model.param_names, self.model.exog_names],
+        idx = _pd.MultiIndex.from_product([self._names, self.model.exog_names],
                                           names=["equation", "exog"])
         return _pd.DataFrame({"lower": np.asarray(lo).ravel(), "upper": np.asarray(hi).ravel()},
                              index=idx)
@@ -435,7 +471,7 @@ class ESAGResults(_CoefTable):
         if c is None:
             raise ValueError("fitted with cov=False")
         cov, free = c
-        labels = [f"{self.model.param_names[k]}:{self.model.exog_names[j]}" for k, j in free]
+        labels = [f"{self._names[k]}:{self.model.exog_names[j]}" for k, j in free]
         return _frame(np.asarray(cov), labels, labels)
 
     llf = property(lambda self: self._native.llf, doc="Maximised log-likelihood.")
@@ -477,7 +513,7 @@ class ESAGResults(_CoefTable):
         coordinates, per observation."""
         x = self.model.exog if exog is None else self.model._exog_new(exog)
         out = np.asarray(self._native.linear_predictor(x))
-        return _frame(out, range(out.shape[0]), self.model.param_names)
+        return _frame(out, range(out.shape[0]), self._names)
 
     def loglike_obs(self):
         return np.asarray(self._native.loglike_obs(self.model.exog, self.model.endog))
@@ -679,9 +715,10 @@ class RegularizedResults(_CoefTable):
     standard errors), which ``summary()`` reports.
     """
 
-    def __init__(self, model: ESAG, native):
+    def __init__(self, model: ESAG, native, param_names=None):
         self.model = model
         self._native = native
+        self._param_names = list(param_names or model.param_names)
 
     @property
     def params(self):

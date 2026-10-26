@@ -217,15 +217,29 @@ def test_auto_shape():
     rng = np.random.default_rng(2)
     y = rng.normal(size=(50, 5))
     y /= np.linalg.norm(y, axis=1, keepdims=True)
-    with pytest.warns(esag.ShapeWarning, match="log-tangent"):
-        assert esag.ESAG(y, rng.normal(size=(50, 2))).shape == "log-tangent"
-    with pytest.warns(esag.ShapeWarning, match="d >= 4"):
-        assert esag.ESAG(y[:, :4], rng.normal(size=(50, 2))).shape == "log-tangent"
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert esag.ESAG(y).shape == "gamma"
         assert esag.ESAG(y[:, :3], rng.normal(size=(50, 2))).shape == "gamma"
         assert esag.ESAG(y, rng.normal(size=(50, 2)), shape="log-tangent").shape == "log-tangent"
+
+
+def test_auto_shape_fits_both_at_d4():
+    # d = 4 with covariates: fit() compares gamma and log-tangent
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(400, 2))
+    eta = np.column_stack([np.full(400, 2.0), 0.5 * x[:, 0], np.full(400, 0.8), np.ones(400)])
+    y = eta + rng.normal(size=(400, 4)) * np.array([1.0, 0.6, 0.4, 0.3])
+    y /= np.linalg.norm(y, axis=1, keepdims=True)
+    m = esag.ESAG(y, x)
+    with pytest.warns(esag.ShapeWarning, match="and log-tangent and kept"):
+        res = m.fit()
+    assert m.shape in ("gamma", "log-tangent")
+    g = esag.ESAG(y, x, shape="gamma").fit()
+    lt = esag.ESAG(y, x, shape="log-tangent").fit()
+    best = g if (g.converged and g.llf >= lt.llf) else lt
+    assert abs(res.llf - best.llf) < 1e-8
+    assert list(res.params.columns) == list(best.params.columns)
 
 
 def test_gamma_transported():
