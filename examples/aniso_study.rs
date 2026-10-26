@@ -19,7 +19,7 @@
 mod big;
 use esag::distribution::Esag;
 use esag::inference::{Restriction, hypothesis_test, score_test};
-use esag::logtangent::{LtFrame, covariance};
+use esag::logtangent::LtFrame;
 use esag::regression::{EsagRegressor, Shape};
 use nalgebra::DMatrix;
 use rayon::prelude::*;
@@ -61,13 +61,7 @@ fn true_dist(b: &DMatrix<f64>, x: &[f64], d: usize, shape: Shape) -> Esag {
     let eta: Vec<f64> = (0..b.nrows())
         .map(|k| b[(k, 0)] + (0..P).map(|j| b[(k, j + 1)] * x[j]).sum::<f64>())
         .collect();
-    match shape {
-        Shape::Gamma => Esag::from_eta(&eta).unwrap(),
-        Shape::LogTangent => {
-            let v = covariance(&LtFrame::standard(d), &eta[..d], &eta[d..]);
-            Esag::from_covariance(&eta[..d], &v).unwrap()
-        }
-    }
+    esag::regression::shape_distribution(shape, Some(&LtFrame::standard(d)), &eta).unwrap()
 }
 
 fn q(v: &mut [f64], p: f64) -> f64 {

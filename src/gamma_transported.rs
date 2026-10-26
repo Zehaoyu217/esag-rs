@@ -60,6 +60,47 @@ pub fn loglik_gt_grad(frame: &LtFrame, eta: &[f64], y: &[f64], grad: &mut [f64])
     }
 }
 
+/// Log-density, exact gradient and the Hessian in `eta` by central
+/// differences of [`loglik_gt_grad`] (step `1e−5·max(1, |eta_i|)`,
+/// symmetrised), as [`crate::hdual::loglik_eta_hess_fd`] does for `γ`.
+///
+/// # Panics
+/// As [`loglik_gt_grad`], or if `hess.len() != eta.len()²`.
+pub fn loglik_gt_hess_fd(
+    frame: &LtFrame,
+    eta: &[f64],
+    y: &[f64],
+    grad: &mut [f64],
+    hess: &mut [f64],
+) -> f64 {
+    let n = eta.len();
+    assert_eq!(hess.len(), n * n, "hess must have length eta.len()²");
+    let f = loglik_gt_grad(frame, eta, y, grad);
+    let mut e = eta.to_vec();
+    let (mut gp, mut gm) = (vec![0.0; n], vec![0.0; n]);
+    for i in 0..n {
+        let h = 1e-5 * eta[i].abs().max(1.0);
+        let (xp, xm) = (eta[i] + h, eta[i] - h);
+        e[i] = xp;
+        loglik_gt_grad(frame, &e, y, &mut gp);
+        e[i] = xm;
+        loglik_gt_grad(frame, &e, y, &mut gm);
+        e[i] = eta[i];
+        let inv = 1.0 / (xp - xm);
+        for j in 0..n {
+            hess[j * n + i] = (gp[j] - gm[j]) * inv;
+        }
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let s = 0.5 * (hess[i * n + j] + hess[j * n + i]);
+            hess[i * n + j] = s;
+            hess[j * n + i] = s;
+        }
+    }
+    f
+}
+
 /// Number of length-`d` scratch vectors.
 const NV: usize = 8;
 

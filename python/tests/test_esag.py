@@ -228,6 +228,24 @@ def test_auto_shape():
         assert esag.ESAG(y, rng.normal(size=(50, 2)), shape="log-tangent").shape == "log-tangent"
 
 
+def test_gamma_transported():
+    rng = np.random.default_rng(5)
+    # mean direction near e_3, the pole of onb(mu) at d = 3
+    y = rng.normal(size=(300, 3)) * 0.3 + np.array([0.05, 0.08, 1.0])
+    y /= np.linalg.norm(y, axis=1, keepdims=True)
+    x = rng.normal(size=(300, 2))
+    with pytest.warns(esag.ShapeWarning, match="transported"):
+        assert esag.ESAG(y, x).shape == "gamma-transported"
+    res = esag.ESAG(y, x, shape="gamma-transported").fit()
+    assert res.converged and "transported" in str(res.summary())
+    assert res.lt_reference is not None
+    # without covariates the fitted distribution is gamma's
+    a = esag.ESAG(y, shape="gamma").fit()
+    b = esag.ESAG(y, shape="gamma-transported").fit()
+    assert abs(a.llf - b.llf) < 1e-6
+    np.testing.assert_allclose(a.covariance()[0], b.covariance()[0], atol=1e-6)
+
+
 def test_distribution():
     dist = esag.Distribution([1.0, -0.5, 2.0], [0.6, -0.3])
     y = dist.sample(2000, seed=1)

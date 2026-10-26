@@ -51,8 +51,22 @@ __all__ = [
     "__version__",
 ]
 
+#: Below this sqrt(m_0^2 + m_1^2) of the data's mean direction m (about 17
+#: degrees from the pole set of onb), shape="auto" prefers the transported
+#: frame for gamma. The slow cases measured sat at 0.12-0.19 (gamma 3-5x
+#: slower than gamma-transported), the generic ones at 0.60-0.78.
+_POLE_NEAR = 0.3
+
+
+def _onb_pole_distance(y: np.ndarray) -> float:
+    m = (y / np.linalg.norm(y, axis=1, keepdims=True)).mean(axis=0)
+    n = np.linalg.norm(m)
+    return float(np.hypot(m[0], m[1]) / n) if n > 0 else 1.0
+
+
 class ShapeWarning(UserWarning):
-    """``shape="auto"`` chose the log-tangent model instead of gamma."""
+    """``shape="auto"`` chose a shape other than gamma (log-tangent, or
+    gamma in the transported frame)."""
 
 
 #: ``fit_regularized(penalty=...)`` choices.
@@ -149,27 +163,35 @@ class ESAG:
     exog : (n, p) array-like or None
         Covariates (no constant needed; one is added). ``None`` fits an
         i.i.d. ESAG.
-    shape : {"auto", "gamma", "log-tangent"}
+    shape : {"auto", "gamma", "gamma-transported", "log-tangent"}
         Shape parameterization. ``"gamma"`` is the papers' (Paine et al.
-        2018; Yu & Huang). ``"log-tangent"`` writes V through the matrix
+        2018; Yu & Huang). ``"gamma-transported"`` is the same gamma map in
+        the tangent frame transported from the data's mean direction
+        instead of ``onb(mu)``: the same fit without covariates, and no
+        slowdown when the mean direction is near the pole of ``onb``
+        (``mu_0 = mu_1 = 0``), where gamma fits are 3-5x slower and converge
+        less often. ``"log-tangent"`` writes V through the matrix
         exponential of a traceless symmetric matrix in the tangent space;
         it is smooth everywhere, so regressions at d >= 4 with covariates
         fit quickly and reliably. ``"auto"`` uses gamma when d = 3 or there
-        are no covariates, and log-tangent otherwise, with a
-        :class:`ShapeWarning` when it picks log-tangent. With covariates the
-        two are different (non-nested) regression models for the shape, as
-        the shape coefficients enter linearly in different coordinates; the
-        mean model is the same. Compare them by AIC/BIC.
+        are no covariates (gamma-transported if the data's mean direction
+        is within about 17 degrees of that pole), and log-tangent
+        otherwise, with a :class:`ShapeWarning` when it picks anything but
+        gamma. With covariates the three are different (non-nested)
+        regression models for the shape, as the shape coefficients enter
+        linearly in different coordinates or frames; the mean model is the
+        same. Compare them by AIC/BIC.
     missing : {"none", "drop"}
         ``"drop"`` removes rows with NaN in endog or exog; ``"none"`` raises.
     lt_reference : array-like of length d, optional
-        Reference direction of the log-tangent frame (default: the data's
+        Reference direction of the log-tangent and gamma-transported frames (default: the data's
         mean direction, stored with the fit as ``results.lt_reference`` and
         printed in the summary). The log-tangent regression model depends on
         it, since s linear in x in one frame is not linear in another. Pass
         ``lt_reference=results.lt_reference`` to fit the same model to other
         data, or set it to fit a model defined in a given frame (e.g. a
-        simulation truth); it has no effect for ``shape="gamma"``.
+        simulation truth); it has no effect for ``shape="gamma"``. Without
+        covariates it does not change the fitted distribution.
     """
 
     def __init__(self, endog, exog=None, shape: str = "auto", missing: str = "none",
@@ -205,6 +227,17 @@ class ESAG:
                     "a different shape regression from the gamma model of Yu & Huang; "
                     "pass shape='gamma' for that model, or shape='log-tangent' to "
                     "silence this warning",
+                    ShapeWarning,
+                    stacklevel=2,
+                )
+            elif _onb_pole_distance(y) < _POLE_NEAR:
+                shape = "gamma-transported"
+                warnings.warn(
+                    "shape='auto' chose gamma in the transported frame: the data's mean "
+                    "direction is within about 17 degrees of the pole of onb(mu) "
+                    "(mu_0 = mu_1 = 0), where gamma fits are slow and often fail; "
+                    "pass shape='gamma' for the onb frame, or "
+                    "shape='gamma-transported' to silence this warning",
                     ShapeWarning,
                     stacklevel=2,
                 )

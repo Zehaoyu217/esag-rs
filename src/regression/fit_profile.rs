@@ -139,6 +139,11 @@ pub(crate) fn simulate_with(
                 let v = crate::logtangent::covariance(&lt, &eta[..d], &eta[d..]);
                 Esag::from_covariance(&eta[..d], &v).unwrap()
             }
+            Shape::GammaTransported => {
+                let f = crate::frame::Frame::transported(&lt, &eta[..d], &eta[d..]);
+                let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
+                Esag::from_covariance(&eta[..d], &v).unwrap()
+            }
         };
         dist.sample_one(&dist.frame(), &mut rng, &mut buf);
         for k in 0..d {
@@ -150,7 +155,7 @@ pub(crate) fn simulate_with(
 
 pub(crate) fn config(d: usize, shape: Shape) -> EsagRegressor {
     let mut cfg = EsagRegressor::new().with_shape(shape).with_parallel(false);
-    if shape == Shape::LogTangent {
+    if shape != Shape::Gamma {
         cfg = cfg.with_lt_reference(Some(center(d)));
     }
     cfg
@@ -871,6 +876,70 @@ fn trapped_gamma_fit_is_rescued() {
     assert!(res.converged, "not rescued");
     assert!(singular_observations(&data, &res.coef).is_empty());
     assert!(res.neg_ll < trap - 1.0, "{} vs trap {trap}", res.neg_ll);
+}
+
+/// Without covariates `Shape::GammaTransported` is `Shape::Gamma`: the same
+/// family, so the same fitted distribution.
+#[test]
+fn transported_gamma_without_covariates_is_gamma() {
+    for d in [3usize, 5] {
+        let b = DMatrix::from_column_slice(dims::eta_len(d), 1, &{
+            let mut v: Vec<f64> = center(d).iter().map(|x| 2.0 * x).collect();
+            v.extend(unit(dims::gamma_len(d), 3).iter().map(|x| 0.8 * x));
+            v
+        });
+        let (_, y) = simulate(&b, 400, 31, Shape::Gamma);
+        let x = DMatrix::zeros(400, 0);
+        let a = EsagRegressor::new()
+            .with_parallel(false)
+            .fit(&x, &y)
+            .unwrap();
+        let t = EsagRegressor::new()
+            .with_shape(Shape::GammaTransported)
+            .with_parallel(false)
+            .fit(&x, &y)
+            .unwrap();
+        assert!(a.converged && t.converged);
+        assert!(
+            (a.log_likelihood - t.log_likelihood).abs() < 1e-6,
+            "d = {d}"
+        );
+        let e = |f: &EsagRegressorFit| {
+            let eta: Vec<f64> = (0..f.coef.nrows()).map(|k| f.coef[(k, 0)]).collect();
+            f.distribution_at(&eta, f.lt_frame().as_ref())
+                .unwrap()
+                .covariance()
+        };
+        assert!((e(&a) - e(&t)).abs().max() < 1e-5, "d = {d}");
+    }
+}
+
+/// With the mean direction near the pole of `onb` (d = 4, hard truth), the
+/// transported frame converges and is faster.
+#[test]
+fn transported_gamma_converges_near_the_pole() {
+    let d = 4;
+    let mut m: Vec<f64> = unit(d, 1);
+    m[d - 1] += 2.0;
+    let nm = m.iter().map(|v| v * v).sum::<f64>().sqrt();
+    m.iter_mut().for_each(|v| *v /= nm);
+    let mut b = hard_truth(d);
+    for k in 0..d {
+        b[(k, 0)] = 2.5 * m[k];
+    }
+    let (x, y) = simulate_with(&b, 1000, 841, Shape::Gamma, 0.5, &m);
+    let fit = EsagRegressor::new()
+        .with_shape(Shape::GammaTransported)
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    assert!(fit.converged && fit.singular_obs.is_empty());
+    assert!(fit.summary().contains("transported"));
+    let onb = EsagRegressor::new()
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    assert!(onb.summary().contains("near the pole"));
 }
 
 /// The most extreme fitted shape over the observations: log-tangent
@@ -2199,6 +2268,95 @@ fn gamma_frame_pole() {
             rows.iter().filter(|r| r[f].0).count(),
             it[it.len() / 2],
             ms[ms.len() / 2],
+            ve[ve.len() / 2]
+        );
+    }
+}
+
+/// Production fits, `Shape::Gamma` (onb) against `Shape::GammaTransported`,
+/// on γ data with a generic mean direction or one near the onb pole
+/// (`POLE=1`); `STD=1` for the standard truth. Env `D`, `N`, `R`. One core
+/// per fit.
+/// `cargo test --release --lib gamma_transported_fits -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_transported_fits() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 3), env("N", 2000), env("R", 12) as u64);
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+        .collect();
+    let rows: Vec<[(bool, f64, f64); 2]> = (840..840 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let mut out = [(false, 0.0, 0.0); 2];
+            for (k, shape) in [Shape::Gamma, Shape::GammaTransported]
+                .into_iter()
+                .enumerate()
+            {
+                let cfg = EsagRegressor::new().with_shape(shape).with_parallel(false);
+                let t = Instant::now();
+                let fit = cfg.fit(&x, &y).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let lt = fit.lt_frame();
+                let ve = (0..200)
+                    .map(|i| {
+                        geodesic(
+                            &vtrue[i],
+                            &fit.distribution_at(&eta(&fit.coef, i), lt.as_ref())
+                                .unwrap()
+                                .covariance(),
+                        )
+                    })
+                    .sum::<f64>()
+                    / 200.0;
+                out[k] = (fit.converged, ms, ve);
+            }
+            out
+        })
+        .collect();
+    println!(
+        "d={d} n={n} {} truth, mean direction {}, {reps} datasets:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        },
+        if std::env::var("POLE").is_ok() {
+            "near the onb pole"
+        } else {
+            "generic"
+        }
+    );
+    for (k, name) in ["gamma (onb)", "gamma (transported)"].iter().enumerate() {
+        let mut ms: Vec<f64> = rows.iter().map(|r| r[k].1).collect();
+        let mut ve: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+        ms.sort_by(f64::total_cmp);
+        ve.sort_by(f64::total_cmp);
+        println!(
+            "  {name:<20} converged {:>2}/{reps}, median {:>6.1} ms, max {:>6.1} ms, V error {:.3}",
+            rows.iter().filter(|r| r[k].0).count(),
+            ms[ms.len() / 2],
+            ms[ms.len() - 1],
             ve[ve.len() / 2]
         );
     }

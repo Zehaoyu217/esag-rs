@@ -1,7 +1,6 @@
 //! Large regression fits: d = 7–8 responses, 5–6 covariates.
 //! `cargo run --release --example big_fit [-- --quick]`
 
-use esag::distribution::Esag;
 use esag::regression::{EsagRegressor, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
@@ -69,13 +68,7 @@ pub fn sim_from(
         for k in 0..bd {
             eta[k] = b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>();
         }
-        let dist = match shape {
-            Shape::Gamma => Esag::from_eta(&eta).unwrap(),
-            Shape::LogTangent => {
-                let v = esag::logtangent::covariance(&lt, &eta[..d], &eta[d..]);
-                Esag::from_covariance(&eta[..d], &v).unwrap()
-            }
-        };
+        let dist = esag::regression::shape_distribution(shape, Some(&lt), &eta).unwrap();
         dist.sample_one(&dist.frame(), &mut rng, &mut buf);
         for k in 0..d {
             y[(i, k)] = buf[k];

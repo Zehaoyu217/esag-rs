@@ -983,9 +983,9 @@ impl Prepared {
                 .collect(),
             Grouping::All => vec![target.iter().map(|&(k, j)| idx(k, j)).collect()],
             Grouping::GammaGroups => {
-                if cfg.shape != Shape::Gamma {
+                if !matches!(cfg.shape, Shape::Gamma | Shape::GammaTransported) {
                     return Err(EsagError::Data(
-                        "Grouping::GammaGroups needs Shape::Gamma".into(),
+                        "Grouping::GammaGroups needs a gamma shape".into(),
                     ));
                 }
                 (0..pt)

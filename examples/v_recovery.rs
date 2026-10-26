@@ -17,7 +17,7 @@
 mod big;
 use esag::distribution::Esag;
 use esag::inference::bootstrap_refits;
-use esag::logtangent::{LtFrame, covariance};
+use esag::logtangent::LtFrame;
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
@@ -32,13 +32,7 @@ fn true_dist(b: &DMatrix<f64>, x: &[f64], d: usize, shape: Shape) -> Esag {
     let eta: Vec<f64> = (0..b.nrows())
         .map(|k| b[(k, 0)] + (0..P).map(|j| b[(k, j + 1)] * x[j]).sum::<f64>())
         .collect();
-    match shape {
-        Shape::Gamma => Esag::from_eta(&eta).unwrap(),
-        Shape::LogTangent => {
-            let v = covariance(&LtFrame::standard(d), &eta[..d], &eta[d..]);
-            Esag::from_covariance(&eta[..d], &v).unwrap()
-        }
-    }
+    esag::regression::shape_distribution(shape, Some(&LtFrame::standard(d)), &eta).unwrap()
 }
 
 /// Affine-invariant (geodesic) distance ‖log(V^{-1/2} W V^{-1/2})‖_F.

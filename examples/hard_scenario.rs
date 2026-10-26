@@ -16,7 +16,7 @@
 //! data come from in `fit`; default: the fitted shape).
 use esag::distribution::Esag;
 use esag::inference::{Restriction, hypothesis_test, score_test};
-use esag::logtangent::{LtFrame, covariance};
+use esag::logtangent::LtFrame;
 use esag::penalized::{Grouping, PenalizedEsag};
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
@@ -114,13 +114,7 @@ fn eta_at(b: &DMatrix<f64>, x: &[f64]) -> Vec<f64> {
 
 fn true_dist(b: &DMatrix<f64>, x: &[f64], d: usize, shape: Shape) -> Esag {
     let eta = eta_at(b, x);
-    match shape {
-        Shape::Gamma => Esag::from_eta(&eta).unwrap(),
-        Shape::LogTangent => {
-            let v = covariance(&LtFrame::new(&center(d)), &eta[..d], &eta[d..]);
-            Esag::from_covariance(&eta[..d], &v).unwrap()
-        }
-    }
+    esag::regression::shape_distribution(shape, Some(&LtFrame::new(&center(d))), &eta).unwrap()
 }
 
 fn covariates(n: usize, rng: &mut ChaCha8Rng) -> DMatrix<f64> {

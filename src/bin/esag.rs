@@ -83,8 +83,11 @@ enum ShapeKind {
     /// Yu & Huang's gamma (the papers' model)
     Gamma,
     /// the smooth log-tangent coordinates (no singular set; recommended for
-    /// regressions with several covariates at d >= 5)
+    /// regressions with covariates at d >= 4)
     LogTangent,
+    /// gamma in the tangent frame transported from the data's mean
+    /// direction (no pole at mu_0 = mu_1 = 0)
+    GammaTransported,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -384,6 +387,7 @@ fn run() -> Res<()> {
                 .with_shape(match shape {
                     ShapeKind::Gamma => Shape::Gamma,
                     ShapeKind::LogTangent => Shape::LogTangent,
+                    ShapeKind::GammaTransported => Shape::GammaTransported,
                 })
                 .fit(&xm, &ym)?;
             outln!("{}", fit.summary());
@@ -538,6 +542,7 @@ fn run() -> Res<()> {
                     e.shape(match shape {
                         ShapeKind::Gamma => Shape::Gamma,
                         ShapeKind::LogTangent => Shape::LogTangent,
+                        ShapeKind::GammaTransported => Shape::GammaTransported,
                     })
                 }
             };

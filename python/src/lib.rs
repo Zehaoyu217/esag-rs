@@ -34,8 +34,11 @@ fn to_py<'py>(py: Python<'py>, m: &DMatrix<f64>) -> Bound<'py, PyArray2<f64>> {
 fn shape_of(s: &str) -> PyResult<Shape> {
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "gamma" => Ok(Shape::Gamma),
+        "gamma-transported" | "gt" => Ok(Shape::GammaTransported),
         "log-tangent" | "logtangent" | "lt" => Ok(Shape::LogTangent),
-        other => Err(err(format!("unknown shape {other:?} (gamma, log-tangent)"))),
+        other => Err(err(format!(
+            "unknown shape {other:?} (gamma, gamma-transported, log-tangent)"
+        ))),
     }
 }
 
@@ -227,7 +230,7 @@ fn param_rows(d: usize, shape: &str) -> PyResult<Vec<String>> {
         return Err(err("d must be at least 2"));
     }
     let tag = match shape_of(shape)? {
-        Shape::Gamma => "gamma",
+        Shape::Gamma | Shape::GammaTransported => "gamma",
         Shape::LogTangent => "s",
     };
     let g = esag::dims::gamma_len(d);

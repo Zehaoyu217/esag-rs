@@ -55,6 +55,16 @@ pub enum Shape {
     /// distributions and parameter count as `gamma`, but `V` depends smoothly
     /// on `s`, so the likelihood has no cliffs (see `docs/MATH.md`).
     LogTangent,
+    /// Yu & Huang's `gamma` map, written in the tangent frame transported
+    /// from a reference direction (as [`Shape::LogTangent`]'s,
+    /// [`crate::gamma_transported`]) instead of `onb(mu)`. The frames
+    /// coincide at the reference (the data's mean direction unless
+    /// [`EsagRegressor::lt_reference`] is set), so a fit without covariates
+    /// is the `gamma` fit; with covariates the model differs through how
+    /// the frame turns with `mu(x)`. It has no pole at `mu_0 = mu_1 = 0`:
+    /// with the data's mean direction near that set, fits need about a
+    /// fifth of the iterations (`docs/MATH.md` §2).
+    GammaTransported,
 }
 
 /// How the optimiser is initialised.
@@ -236,7 +246,7 @@ impl EsagRegressor {
     /// Validated data with the kernel for this configuration's shape.
     pub(crate) fn data(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<RegressionData> {
         let mut data = RegressionData::new(x, y, self.fit_intercept)?;
-        if self.shape == Shape::LogTangent {
+        if self.shape != Shape::Gamma {
             let m = match &self.lt_reference {
                 Some(m) => {
                     if m.len() != data.d {
@@ -250,7 +260,11 @@ impl EsagRegressor {
                 }
                 None => mean_direction(&data.y, data.n, data.d),
             };
-            data.lt = Some(LtFrame::new(&m));
+            if self.shape == Shape::LogTangent {
+                data.lt = Some(LtFrame::new(&m));
+            } else {
+                data.gt = Some(LtFrame::new(&m));
+            }
         }
         Ok(data)
     }
@@ -855,7 +869,12 @@ impl EsagRegressor {
         // Pick the canonical member of the {B, B with gamma group 1 negated}
         // equivalence class (identical likelihood, see `canonicalize_coef`).
         let mut coef = best.coef.clone();
-        if data.lt.is_none() && data.p_total == 1 && mask.iter().all(|&f| f) && data.d >= 4 {
+        if data.lt.is_none()
+            && data.gt.is_none()
+            && data.p_total == 1
+            && mask.iter().all(|&f| f)
+            && data.d >= 4
+        {
             // Intercept-only fit: replace gamma by the canonical member of its
             // equivalence class (same V, same likelihood), so equivalent
             // solutions report identical gamma in every dimension.
@@ -979,7 +998,7 @@ impl EsagRegressor {
 
         let feature_names = self.param_column_names(data);
         let mut config = self.clone();
-        if let Some(fr) = &data.lt {
+        if let Some(fr) = data.lt.as_ref().or(data.gt.as_ref()) {
             config.lt_reference = Some(fr.reference().to_vec());
         }
         config.precondition = None;
@@ -1275,6 +1294,12 @@ const SINGULAR_DISTANCE: f64 = 1e-2;
 const EXCLUSION_ROUNDS: usize = 3;
 /// Largest `d` at which trapped gamma fits get exclusion rounds.
 const EXCLUSION_MAX_D: usize = 6;
+/// A mean direction with `√(μ̂_0² + μ̂_1²)` below this (about 17° from the
+/// pole set of `onb(μ)`) gets a summary note recommending
+/// [`Shape::GammaTransported`]. The slow cases measured sat at 0.12–0.19
+/// (gamma 3–5× slower there and converging less often), the generic ones at
+/// 0.60–0.78.
+const POLE_NEAR: f64 = 0.3;
 
 /// Observations of a gamma fit at `b` that sit at a singular set of the
 /// parameterization, where `V(γ)` is discontinuous: a group `j ≥ 2` whose
@@ -1301,10 +1326,20 @@ pub(crate) fn singular_observations(data: &RegressionData, b: &DMatrix<f64>) -> 
             let gn = g.iter().map(|v| v * v).sum::<f64>().sqrt();
             // relative distance to the nearest singular set
             let mm = eta[..d].iter().map(|v| v * v).sum::<f64>();
-            let mut dist = if mm > 0.0 {
-                ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt()
-            } else {
-                1.0
+            let mut dist = match (&data.gt, mm > 0.0) {
+                // transported frame: ‖μ̂ + m‖/2, zero at the antipode
+                (Some(fr), true) => {
+                    let inv = 1.0 / mm.sqrt();
+                    let m = fr.reference();
+                    (0..d)
+                        .map(|k| (eta[k] * inv + m[k]).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                        * 0.5
+                }
+                // onb(μ): its pole μ̂_0 = μ̂_1 = 0
+                (None, true) => ((eta[0] * eta[0] + eta[1] * eta[1]) / mm).sqrt(),
+                (_, false) => 1.0,
             };
             for gr in 2..=d - 2 {
                 let off = d + gr * (gr + 1) / 2 - 1;
@@ -1385,6 +1420,9 @@ pub(crate) struct RegressionData {
     /// Log-tangent frame when the shape rows are log-tangent coordinates
     /// (`None`: gamma).
     pub lt: Option<LtFrame>,
+    /// The transported frame of [`Shape::GammaTransported`] (`None`: gamma
+    /// in `onb(mu)`, or log-tangent).
+    pub gt: Option<LtFrame>,
 }
 
 impl RegressionData {
@@ -1460,6 +1498,7 @@ impl RegressionData {
             x: xf,
             y: yf,
             lt: None,
+            gt: None,
         })
     }
 }
@@ -1906,9 +1945,10 @@ fn joint_eval(
 /// parameterization.
 #[inline]
 fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
-    match &data.lt {
-        None => loglik::loglik_eta_grad(eta, y, g),
-        Some(fr) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
+    match (&data.lt, &data.gt) {
+        (Some(fr), _) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
+        (None, Some(fr)) => crate::gamma_transported::loglik_gt_grad(fr, eta, y, g),
+        (None, None) => loglik::loglik_eta_grad(eta, y, g),
     }
 }
 
@@ -1921,6 +1961,9 @@ fn obs_hessian(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64], h: 
     if let Some(fr) = &data.lt {
         // exact (one eigen-decomposition; ~2.7× the gradient at d = 8)
         return crate::logtangent::loglik_lt_hess(fr, eta, y, g, h);
+    }
+    if let Some(fr) = &data.gt {
+        return crate::gamma_transported::loglik_gt_hess_fd(fr, eta, y, g, h);
     }
     if eta.len() == 5 {
         crate::hdual::loglik_eta_hess(eta, y, g, h)
@@ -2021,6 +2064,27 @@ pub(crate) fn joint_loglik_grad_hess(
         }
     }
     (f, g, h)
+}
+
+/// The distribution of one linear predictor `eta = (mu, shape)` in the
+/// parameterization `shape`. `lt` is the tangent frame of
+/// [`Shape::LogTangent`] and [`Shape::GammaTransported`]; [`Shape::Gamma`]
+/// (and a missing frame) uses `onb(mu)`.
+pub fn shape_distribution(shape: Shape, lt: Option<&LtFrame>, eta: &[f64]) -> Result<Esag> {
+    let d = dims::dim_from_eta_len(eta.len())
+        .ok_or_else(|| EsagError::Shape(format!("eta of length {} fits no d", eta.len())))?;
+    match (shape, lt) {
+        (Shape::LogTangent, Some(fr)) => {
+            let v = crate::logtangent::covariance(fr, &eta[..d], &eta[d..]);
+            Esag::from_covariance(&eta[..d], &v)
+        }
+        (Shape::GammaTransported, Some(fr)) => {
+            let f = Frame::transported(fr, &eta[..d], &eta[d..]);
+            let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
+            Esag::from_covariance(&eta[..d], &v)
+        }
+        _ => Esag::from_eta(eta),
+    }
 }
 
 /// Residual diagnostics for a fitted model.
@@ -2201,16 +2265,20 @@ impl EsagRegressorFit {
     /// [`Esag`] for sampling, moments and residuals.
     pub fn frame_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Frame<f64> {
         let d = self.d;
-        match lt {
-            None => Frame::new(&eta[..d], &eta[d..]),
-            Some(fr) => crate::logtangent::eigen_frame(fr, &eta[..d], &eta[d..]),
+        match (self.config.shape, lt) {
+            (Shape::LogTangent, Some(fr)) => {
+                crate::logtangent::eigen_frame(fr, &eta[..d], &eta[d..])
+            }
+            (Shape::GammaTransported, Some(fr)) => Frame::transported(fr, &eta[..d], &eta[d..]),
+            _ => Frame::new(&eta[..d], &eta[d..]),
         }
     }
 
-    /// The log-tangent frame of a `Shape::LogTangent` fit.
+    /// The tangent frame of a `Shape::LogTangent` or
+    /// `Shape::GammaTransported` fit.
     pub fn lt_frame(&self) -> Option<LtFrame> {
         match (self.config.shape, &self.config.lt_reference) {
-            (Shape::LogTangent, Some(m)) => Some(LtFrame::new(m)),
+            (Shape::LogTangent | Shape::GammaTransported, Some(m)) => Some(LtFrame::new(m)),
             _ => None,
         }
     }
@@ -2254,14 +2322,7 @@ impl EsagRegressorFit {
     /// The distribution for one linear predictor `eta` (in this model's
     /// shape parameterization; pass `self.lt_frame()` for log-tangent fits).
     pub fn distribution_at(&self, eta: &[f64], lt: Option<&LtFrame>) -> Result<Esag> {
-        match lt {
-            None => Esag::from_eta(eta),
-            Some(fr) => {
-                let d = self.d;
-                let v = crate::logtangent::covariance(fr, &eta[..d], &eta[d..]);
-                Esag::from_covariance(&eta[..d], &v)
-            }
-        }
+        shape_distribution(self.config.shape, lt, eta)
     }
 
     /// Per-observation log-likelihood `log f(y_i; eta_i)`.
@@ -2277,14 +2338,18 @@ impl EsagRegressorFit {
         let lt = self.lt_frame();
         let mut out = DVector::zeros(data.n);
         let mut e = vec![0.0; self.b_dim()];
+        let mut grad = vec![0.0; self.b_dim()];
         for i in 0..data.n {
             for k in 0..self.b_dim() {
                 e[k] = eta[(i, k)];
             }
             let yi = &data.y[i * self.d..(i + 1) * self.d];
-            out[i] = match &lt {
-                None => loglik::loglik_eta(&e, yi),
-                Some(fr) => crate::logtangent::loglik_lt(fr, &e, yi),
+            out[i] = match (self.config.shape, &lt) {
+                (Shape::LogTangent, Some(fr)) => crate::logtangent::loglik_lt(fr, &e, yi),
+                (Shape::GammaTransported, Some(fr)) => {
+                    crate::gamma_transported::loglik_gt_grad(fr, &e, yi, &mut grad)
+                }
+                _ => loglik::loglik_eta(&e, yi),
             };
         }
         Ok(out)
@@ -2461,6 +2526,7 @@ impl EsagRegressorFit {
         let shape = match self.config.shape {
             Shape::Gamma => "gamma",
             Shape::LogTangent => "log-tangent",
+            Shape::GammaTransported => "gamma (transported)",
         };
         let mut left = vec![
             ("Dep. Variable:".to_string(), dep),
@@ -2551,6 +2617,23 @@ impl EsagRegressorFit {
             let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
             notes.push(format!(
                 "Log-tangent shape in the frame with reference direction\n    m = ({}).\n    The shape coefficients, and the model, depend on m: pass it as\n    lt_reference to fit the same model to other data.",
+                m.join(", ")
+            ));
+        }
+        if self.config.shape == Shape::Gamma && self.fit_intercept {
+            let mu: Vec<f64> = (0..self.d).map(|k| self.coef[(k, 0)]).collect();
+            let nm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let near = (mu[0] * mu[0] + mu[1] * mu[1]).sqrt() / nm;
+            if nm > 0.0 && near < POLE_NEAR {
+                notes.push(format!(
+                    "The mean direction at x = 0 is near the pole of the gamma frame\n    onb(mu) (mu_0 = mu_1 = 0; sqrt(mu_0² + mu_1²)/|mu| = {near:.3}), where gamma\n    fits are slow and converge less often. Shape::GammaTransported\n    (shape=\"gamma-transported\" in Python) uses a frame without that pole."
+                ));
+            }
+        }
+        if let (Shape::GammaTransported, Some(m)) = (self.config.shape, &self.config.lt_reference) {
+            let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
+            notes.push(format!(
+                "Gamma shape in the tangent frame transported from the reference\n    direction m = ({}) instead of onb(mu). With covariates the\n    model depends on m: pass it as lt_reference to fit the same model\n    to other data.",
                 m.join(", ")
             ));
         }
