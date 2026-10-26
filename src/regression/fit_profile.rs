@@ -1313,3 +1313,311 @@ fn trapped_leverage() {
         );
     }
 }
+
+/// Affine-invariant distance `‖log(V^{-1/2} W V^{-1/2})‖_F`.
+fn geodesic(v: &DMatrix<f64>, w: &DMatrix<f64>) -> f64 {
+    let li = v.clone().cholesky().unwrap().l().try_inverse().unwrap();
+    let m = &li * w * li.transpose();
+    let m = (&m + m.transpose()) * 0.5;
+    nalgebra::SymmetricEigen::new(m)
+        .eigenvalues
+        .iter()
+        .map(|e| e.ln().powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Exact Newton ascent on `ℓ(B) − (λ/2)‖shape slopes‖²` with a halving
+/// line search; stops at `max|g| < 1e-6` or after `iters` steps.
+fn newton_ridge(
+    data: &RegressionData,
+    b0: &DMatrix<f64>,
+    lambda: f64,
+    iters: usize,
+) -> DMatrix<f64> {
+    let (bd, pt, d) = (data.b_dim, data.p_total, data.d);
+    let k = bd * pt;
+    let pen = |b: &DMatrix<f64>| {
+        (1..pt)
+            .flat_map(|j| (d..bd).map(move |r| (r, j)))
+            .map(|(r, j)| b[(r, j)] * b[(r, j)])
+            .sum::<f64>()
+            * 0.5
+            * lambda
+    };
+    let mut b = b0.clone();
+    for _ in 0..iters {
+        let (f, g, h) = joint_loglik_grad_hess(data, &b, false);
+        let f0 = f - pen(&b);
+        let mut gv = DVector::from_column_slice(&g);
+        let mut neg = -DMatrix::from_column_slice(k, k, &h);
+        for j in 1..pt {
+            for r in d..bd {
+                let a = j * bd + r;
+                gv[a] -= lambda * b[(r, j)];
+                neg[(a, a)] += lambda;
+            }
+        }
+        if gv.amax() < 1e-6 {
+            break;
+        }
+        let step = match neg.clone().cholesky() {
+            Some(ch) => ch.solve(&gv),
+            None => {
+                let mut tau = 1e-3 * neg.diagonal().amax();
+                loop {
+                    let mut sh = neg.clone();
+                    for a in 0..k {
+                        sh[(a, a)] += tau;
+                    }
+                    if let Some(ch) = sh.cholesky() {
+                        break ch.solve(&gv);
+                    }
+                    tau *= 10.0;
+                }
+            }
+        };
+        let mut t = 1.0;
+        loop {
+            let mut cand = b.clone();
+            for j in 0..pt {
+                for r in 0..bd {
+                    cand[(r, j)] += t * step[j * bd + r];
+                }
+            }
+            let fc = joint_loglik_and_grad(data, &cand, false).0 - pen(&cand);
+            if fc.is_finite() && fc >= f0 {
+                b = cand;
+                break;
+            }
+            t *= 0.5;
+            if t < 1e-8 {
+                return b;
+            }
+        }
+    }
+    b
+}
+
+/// Can the regular root of the γ score equations be found where L-BFGS
+/// gets trapped? Strategies on the hard scenario (γ data, env `D`, `N`,
+/// `R`), each scored at its end point: log-likelihood, gradient, trapped
+/// observations, negative-definite Hessian, `V̂(x)` error on 200 fresh
+/// points, time.
+/// `cargo test --release --lib gamma_regular_root -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_regular_root() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let b = hard_truth(d);
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+        .collect();
+    let verr = |c: &DMatrix<f64>| {
+        (0..200)
+            .map(|i| geodesic(&vtrue[i], &Esag::from_eta(&eta(c, i)).unwrap().covariance()))
+            .sum::<f64>()
+            / 200.0
+    };
+    let names = [
+        "default fit",
+        "exclude trapped, refit, re-add",
+        "Newton from the default fit",
+        "Newton from the truth",
+        "ridge continuation + Newton",
+    ];
+    let mut table: Vec<Vec<(f64, bool, f64, f64)>> = vec![vec![]; names.len()];
+    for seed in 600..600 + reps {
+        let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+        let cfg = config(d, Shape::Gamma);
+        let data = cfg.data(&x, &y).unwrap();
+        let mut ends: Vec<(DMatrix<f64>, f64)> = vec![];
+        let t = Instant::now();
+        let f0 = cfg.fit(&x, &y).unwrap();
+        ends.push((f0.coef.clone(), t.elapsed().as_secs_f64() * 1e3));
+        // exclusion and re-inclusion, up to four rounds
+        let t = Instant::now();
+        let mut cur = f0.clone();
+        let mut out: Vec<usize> = vec![];
+        for _ in 0..4 {
+            if cur.converged {
+                break;
+            }
+            let s = singular_observations(&data, &cur.coef);
+            if s.is_empty() {
+                break;
+            }
+            out.extend(s);
+            out.sort_unstable();
+            out.dedup();
+            let keep: Vec<usize> = (0..n).filter(|i| out.binary_search(i).is_err()).collect();
+            let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
+            let ys = DMatrix::from_fn(keep.len(), d, |a, j| y[(keep[a], j)]);
+            let sub = cfg.fit_warm(&xs, &ys, &cur.coef).unwrap();
+            cur = cfg.fit_warm(&x, &y, &sub.coef).unwrap();
+        }
+        ends.push((cur.coef.clone(), t.elapsed().as_secs_f64() * 1e3));
+        let t = Instant::now();
+        let c = newton_ridge(&data, &f0.coef, 0.0, 40);
+        ends.push((c, t.elapsed().as_secs_f64() * 1e3));
+        let t = Instant::now();
+        let c = newton_ridge(&data, &b, 0.0, 40);
+        ends.push((c, t.elapsed().as_secs_f64() * 1e3));
+        // ridge continuation from the constant-shape fit
+        let t = Instant::now();
+        let constant = DMatrix::from_fn(bd, pt, |k, j| k < d || j == 0);
+        let mut c = cfg
+            .clone()
+            .with_mask(Some(constant))
+            .fit(&x, &y)
+            .unwrap()
+            .coef;
+        for lam in [1e3, 1e2, 1e1, 1.0, 0.0] {
+            c = newton_ridge(&data, &c, lam, if lam == 0.0 { 40 } else { 15 });
+        }
+        ends.push((c, t.elapsed().as_secs_f64() * 1e3));
+        for (k, (c, ms)) in ends.iter().enumerate() {
+            let (ll, g, h) = joint_loglik_grad_hess(&data, c, false);
+            let gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+            let nd = (-DMatrix::from_column_slice(bd * pt, bd * pt, &h))
+                .cholesky()
+                .is_some();
+            let trapped = !singular_observations(&data, c).is_empty();
+            let regular = gmax < 1e-3 && nd && !trapped;
+            println!(
+                "seed {seed} {:<32} ll {ll:.2}  max|g| {gmax:.1e}  trapped {}  regular {}  V err {:.3}  {ms:.0} ms",
+                names[k],
+                trapped as u8,
+                regular as u8,
+                verr(c)
+            );
+            table[k].push((ll, regular, verr(c), *ms));
+        }
+    }
+    println!("d = {d}, n = {n}, {reps} datasets:");
+    for (k, rows) in table.iter().enumerate() {
+        let reg = rows.iter().filter(|r| r.1).count();
+        let mut ve: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let mut ms: Vec<f64> = rows.iter().map(|r| r.3).collect();
+        ve.sort_by(f64::total_cmp);
+        ms.sort_by(f64::total_cmp);
+        let gain: Vec<String> = rows
+            .iter()
+            .zip(&table[0])
+            .map(|(r, r0)| format!("{:+.1}", r.0 - r0.0))
+            .collect();
+        println!(
+            "  {:<32} regular root {reg}/{}  median V err {:.3}  median {:.0} ms  ll vs default [{}]",
+            names[k],
+            rows.len(),
+            ve[ve.len() / 2],
+            ms[ms.len() / 2],
+            gain.join(" ")
+        );
+    }
+}
+
+/// Exclusion rounds for trapped γ fits: drop the trapped observations,
+/// refit the rest warm, re-add them, repeat (cumulative, up to `ROUNDS`).
+/// Success = a regular root of the full likelihood (converged, no trapped
+/// observation). Env `D`, `N`, `R`, `ROUNDS`, `STD=1` (standard truth).
+/// `cargo test --release --lib gamma_exclusion_rounds -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_exclusion_rounds() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps, rounds) = (
+        env("D", 5),
+        env("N", 2000),
+        env("R", 12) as u64,
+        env("ROUNDS", 8),
+    );
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let rows: Vec<(bool, bool, usize, f64, f64, f64)> = (700..700 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let cfg = config(d, Shape::Gamma);
+            let data = cfg.data(&x, &y).unwrap();
+            let t = Instant::now();
+            let f0 = cfg.fit(&x, &y).unwrap();
+            let t0 = t.elapsed().as_secs_f64() * 1e3;
+            let mut cur = f0.clone();
+            let mut out: Vec<usize> = vec![];
+            let mut used = 0;
+            while !cur.converged && used < rounds {
+                let s = singular_observations(&data, &cur.coef);
+                if s.is_empty() {
+                    break;
+                }
+                used += 1;
+                out.extend(s);
+                out.sort_unstable();
+                out.dedup();
+                let keep: Vec<usize> = (0..n).filter(|i| out.binary_search(i).is_err()).collect();
+                let xs = DMatrix::from_fn(keep.len(), x.ncols(), |a, j| x[(keep[a], j)]);
+                let ys = DMatrix::from_fn(keep.len(), d, |a, j| y[(keep[a], j)]);
+                let sub = cfg.fit_warm(&xs, &ys, &cur.coef).unwrap();
+                let next = cfg.fit_warm(&x, &y, &sub.coef).unwrap();
+                if next.converged || next.log_likelihood > cur.log_likelihood {
+                    cur = next;
+                }
+            }
+            let t1 = t.elapsed().as_secs_f64() * 1e3;
+            (
+                f0.converged,
+                cur.converged,
+                used,
+                cur.log_likelihood - f0.log_likelihood,
+                t0,
+                t1,
+            )
+        })
+        .collect();
+    let c0 = rows.iter().filter(|r| r.0).count();
+    let c1 = rows.iter().filter(|r| r.1).count();
+    let mut t0: Vec<f64> = rows.iter().map(|r| r.4).collect();
+    let mut t1: Vec<f64> = rows.iter().map(|r| r.5).collect();
+    t0.sort_by(f64::total_cmp);
+    t1.sort_by(f64::total_cmp);
+    let gains: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.0 && r.1)
+        .map(|r| format!("{:+.1}", r.3))
+        .collect();
+    let rounds_used: Vec<usize> = rows.iter().map(|r| r.2).collect();
+    println!(
+        "d={d} n={n}{}: converged {c0}/{reps} -> {c1}/{reps} with exclusion; rounds {rounds_used:?}; ll gain where rescued [{}]; median time {:.0} -> {:.0} ms",
+        if std::env::var("STD").is_ok() {
+            " standard"
+        } else {
+            " hard"
+        },
+        gains.join(" "),
+        t0[t0.len() / 2],
+        t1[t1.len() / 2]
+    );
+}

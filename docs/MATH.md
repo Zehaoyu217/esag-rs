@@ -186,6 +186,44 @@ is not an MLE in the usual sense. On the standard scenario (`examples/big_fit.rs
 γ fits at `n = 2000` converge (11 of 12), and the waves still rescue some
 fits that stall without a pinned observation (4 of 9).
 
+**Can the traps be avoided within γ?** On the estimation side, partly.
+A trap is not a root of the score equations: its gradient is huge, not
+zero. So the estimator to look for is the regular root, Cramér's
+consistent root, and some fits do reach one. Four ways of reaching it were
+compared on the hard scenario (`gamma_regular_root`,
+`gamma_exclusion_rounds`):
+
+* exact Newton crawls, even from the true coefficients (0 of 8 reach a
+  root in 40 steps), because near-singular observations make the Hessian
+  badly conditioned;
+* a ridge continuation on the shape slopes followed by Newton also stops
+  short (0 of 8);
+* excluding the trapped observations, refitting the rest warm and adding
+  them back (up to 8 rounds) reaches a regular root in 3 of 12 trapped fits
+  at `d = 5, n = 2000`, 5 of 12 at `n = 500` and 0 of 12 at `d = 8`, at
+  2.5–11 times the time. Every root it reached had a higher likelihood
+  than the trap (+1.3 to +11.7).
+
+At a regular root, estimation noise puts some high-leverage observation's
+fitted trailing pair near zero, so a trap lies next to the root and the
+root's basin is narrow. This should fade as `n` grows, because the true
+pairs stay away from zero (smallest ratio 0.26).
+
+On the parameterization side, no, as long as a group is an eigenvalue gap
+plus the direction of an eigenvector. At `d = 4`, group 2's angles place
+the top eigenvector at `(sin θ sin φ, −cos θ sin φ, cos φ)` on `S²`, and
+`Lo(θ₂) P₂(φ) Lo(θ₁)` completes the other two around it. With the lower
+eigenvalues distinct (group 1 nonzero), a `V` continuous in group 2's
+direction would need the other two eigenvector lines to be continuous
+tangent line fields on `S²`. None exists (Euler characteristic 2, the
+hairy-ball theorem). In general group `j`'s completion would need `j`
+orthogonal tangent line fields on `S^j`. That is impossible for even `j`,
+and for odd `j ≥ 3` it needs a parallelizable sphere, so `j ∈ {3, 7}`
+(Bott–Milnor, Kervaire). A redesign of γ in this form can move the jumps
+(for example to one point per sphere) but cannot remove them for `d ≥ 4`.
+Only a parameterization that does not split `V` into gaps and directions
+avoids them, which is what the log-tangent shape does.
+
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
 mean direction, cannot move that set away from the data. With the mean

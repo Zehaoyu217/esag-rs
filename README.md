@@ -236,7 +236,7 @@ reproducible and don't depend on the thread count; a test checks this.
 
 ## Validation
 
-All `cargo test --release` suites pass: 179 tests, plus 37 slow studies,
+All `cargo test --release` suites pass: 179 tests, plus 39 slow studies,
 diagnostics and benchmarks marked `#[ignore]`. The Python package's 23
 pytest tests (`python/tests`) pass on Python 3.9 and 3.13.
 
