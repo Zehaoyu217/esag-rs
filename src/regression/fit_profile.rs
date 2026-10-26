@@ -3626,3 +3626,120 @@ fn gamma_lt_start_status() {
         println!("{r}");
     }
 }
+
+/// Per-observation gradient and Hessian cost of the γ kernels at d = 7..10
+/// (d ≤ 8 have fixed-size stack paths, d ≥ 9 heap buffers).
+/// `cargo test --release --lib gamma_kernel_cost_big_d -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_kernel_cost_big_d() {
+    for d in [7usize, 8, 9, 10] {
+        let n = 4000;
+        let k = dims::eta_len(d);
+        let etas: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..k)
+                    .map(|j| ((i * 31 + j * 7) as f64 * 0.37).sin() + if j < d { 1.5 } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+        let ys: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let v: Vec<f64> = (0..d)
+                    .map(|j| ((i * 13 + j * 5) as f64 * 0.91).cos() + 1.0)
+                    .collect();
+                let s = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                v.iter().map(|x| x / s).collect()
+            })
+            .collect();
+        let (mut g, mut h) = (vec![0.0; k], vec![0.0; k * k]);
+        let time = |f: &mut dyn FnMut()| {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let t = Instant::now();
+                f();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best / n as f64 * 1e9
+        };
+        let mut acc = 0.0;
+        let tg = time(&mut || {
+            for i in 0..n {
+                acc += crate::adjoint::loglik_grad_adjoint(&etas[i], &ys[i], &mut g);
+            }
+        });
+        let th = time(&mut || {
+            for i in 0..n {
+                acc += crate::adjoint_hess::loglik_hess_adjoint(&etas[i], &ys[i], &mut g, &mut h);
+            }
+        });
+        println!("d={d:>2}: gamma gradient {tg:>6.0} ns/obs, Hessian {th:>7.0} ns/obs ({acc:.1e})");
+    }
+}
+
+/// Bootstrap tests for γ at large d (standard truth, n = 2000): score and
+/// full tests of the constant-shape null, one core, `B` replicates (env
+/// `D`, `B`), with the time of the original fit.
+/// `cargo test --release --lib gamma_big_d_tests -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_big_d_tests() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, nb) = (env("D", 8), env("B", 50));
+    let b = standard_truth(d, 5);
+    let (x, y) = simulate(&b, 2000, 930, Shape::Gamma);
+    let t = Instant::now();
+    let fit = EsagRegressor::new()
+        .with_parallel(false)
+        .fit(&x, &y)
+        .unwrap();
+    let tf = t.elapsed().as_secs_f64();
+    println!(
+        "d={d}: fit {} in {tf:.2} s",
+        if fit.converged {
+            "converged"
+        } else {
+            "not converged"
+        }
+    );
+    for score in [true, false] {
+        let t = Instant::now();
+        let r = if score {
+            crate::inference::score_test(
+                &fit,
+                &x,
+                &y,
+                crate::inference::Restriction::ConstantShape,
+                nb,
+                0,
+                1,
+            )
+        } else {
+            crate::inference::hypothesis_test(
+                &fit,
+                &x,
+                &y,
+                crate::inference::Restriction::ConstantShape,
+                nb,
+                0,
+                1,
+            )
+        }
+        .unwrap();
+        let s = t.elapsed().as_secs_f64();
+        println!(
+            "  {} test, B = {nb}: {s:.1} s on {} threads ({:.2} s per replicate); p(LM) {:.3}, p(LR) {:.3}, failed refits {}",
+            if score { "score" } else { "full " },
+            rayon::current_num_threads(),
+            s / nb as f64,
+            r.p_lm,
+            r.p_lr,
+            r.n_failed
+        );
+    }
+}
