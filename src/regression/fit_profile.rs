@@ -2797,3 +2797,832 @@ fn truth_anisotropy() {
         }
     }
 }
+
+/// Smallest relative trailing-pair norm (groups `j ≥ 2`) of each
+/// observation's γ at `b` (1 where there is no such group).
+fn pair_ratios(data: &RegressionData, b: &DMatrix<f64>) -> Vec<f64> {
+    let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+    let mut eta = vec![0.0; bd];
+    (0..data.n)
+        .map(|i| {
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|j| b[(k, j)] * data.x[i * pt + j]).sum();
+            }
+            let r = min_pair_ratio(&eta[d..], d).0;
+            if r.is_finite() { r } else { 1.0 }
+        })
+        .collect()
+}
+
+/// Saddle-free trust-region Newton ascent on the γ likelihood with exact
+/// Hessians: steps `(Q|Λ|Qᵀ)⁻¹ g` from the eigen-decomposition of `−H`
+/// (absolute values, floored), scaled to the trust radius in that metric,
+/// radius adapted by actual/predicted gain, and a guard rejecting steps
+/// that take an observation's trailing-pair ratio below half its current
+/// value once it is under 1e−2. Returns (coef, regular root reached,
+/// iterations, max|g|).
+fn newton_tr(
+    data: &RegressionData,
+    b0: &DMatrix<f64>,
+    iters: usize,
+) -> (DMatrix<f64>, bool, usize, f64) {
+    let (bd, pt) = (data.b_dim, data.p_total);
+    let k = bd * pt;
+    let mut b = b0.clone();
+    let mut radius = 10.0;
+    let mut ratios = pair_ratios(data, &b);
+    let mut gmax = f64::INFINITY;
+    for it in 0..iters {
+        let (f, g, h) = joint_loglik_grad_hess(data, &b, false);
+        gmax = g.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+        let neg = -DMatrix::from_column_slice(k, k, &h);
+        let neg = (&neg + neg.transpose()) * 0.5;
+        let eig = nalgebra::SymmetricEigen::new(neg.clone());
+        let lmax = eig.eigenvalues.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+        let nd = eig.eigenvalues.iter().all(|&v| v > 0.0);
+        if gmax < 1e-6 * f.abs().max(1.0) && nd {
+            return (b, true, it, gmax);
+        }
+        let floor = 1e-10 * lmax;
+        let gq = eig.eigenvectors.transpose() * DVector::from_column_slice(&g);
+        // step and its M-norm in eigen-coordinates
+        let mut sq = DVector::zeros(k);
+        let mut mnorm2 = 0.0;
+        for a in 0..k {
+            let l = eig.eigenvalues[a].abs().max(floor);
+            sq[a] = gq[a] / l;
+            mnorm2 += gq[a] * gq[a] / l;
+        }
+        let mnorm = mnorm2.sqrt();
+        let mut accepted = false;
+        for _ in 0..30 {
+            let scale = if mnorm > radius { radius / mnorm } else { 1.0 };
+            let s = &eig.eigenvectors * (&sq * scale);
+            let mut cand = b.clone();
+            for j in 0..pt {
+                for r in 0..bd {
+                    cand[(r, j)] += s[j * bd + r];
+                }
+            }
+            // predicted gain of the modified model
+            let pred = scale * mnorm2 - 0.5 * scale * scale * mnorm2;
+            let fc = joint_loglik_and_grad(data, &cand, false).0;
+            let new_ratios = pair_ratios(data, &cand);
+            let unsafe_step = ratios
+                .iter()
+                .zip(&new_ratios)
+                .any(|(&old, &new)| new < 1e-2 && new < 0.5 * old);
+            let gain = fc - f;
+            if fc.is_finite()
+                && !unsafe_step
+                && gain > 0.0
+                && gain >= 0.1 * pred.min(gain.abs() * 10.0)
+            {
+                if gain > 0.75 * pred && scale < 1.0 {
+                    radius *= 2.0;
+                }
+                b = cand;
+                ratios = new_ratios;
+                accepted = true;
+                break;
+            }
+            radius = (radius.min(mnorm * scale)) * 0.25;
+            if radius < 1e-12 {
+                break;
+            }
+        }
+        if !accepted {
+            return (b, false, it, gmax);
+        }
+    }
+    (b, false, iters, gmax)
+}
+
+/// Can a saddle-free trust-region Newton reach γ's regular root on hard
+/// data, from the truth and from the production fit? Env `D`, `N`, `R`,
+/// `STD=1`.
+/// `cargo test --release --lib gamma_newton_tr -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_newton_tr() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
+    let b = if std::env::var("STD").is_ok() {
+        standard_truth(d, 5)
+    } else {
+        hard_truth(d)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+    let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
+        .collect();
+    let verr = |c: &DMatrix<f64>| {
+        (0..200)
+            .map(|i| {
+                geodesic(
+                    &vtrue[i],
+                    &Esag::from_eta(&eta_at(c, i)).unwrap().covariance(),
+                )
+            })
+            .sum::<f64>()
+            / 200.0
+    };
+    let rows: Vec<String> = (880..880 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let cfg = config(d, Shape::Gamma);
+            let data = cfg.data(&x, &y).unwrap();
+            let t = Instant::now();
+            let prod = cfg.fit(&x, &y).unwrap();
+            let tp = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let (c1, r1, i1, _) = newton_tr(&data, &prod.coef, 100);
+            let t1 = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let (c2, r2, i2, _) = newton_tr(&data, &b, 100);
+            let t2 = t.elapsed().as_secs_f64();
+            let ll = |c: &DMatrix<f64>| joint_loglik_and_grad(&data, c, false).0;
+            format!(
+                "seed {seed}: production {} ll {:.2} V {:.3} ({tp:.2} s) | Newton from it: regular {} after {i1} its, ll {:+.2}, V {:.3} ({t1:.2} s) | Newton from truth: regular {} after {i2} its, ll {:+.2}, V {:.3} ({t2:.2} s)",
+                if prod.converged { "conv" } else { "trap" },
+                prod.log_likelihood,
+                verr(&prod.coef),
+                r1 as u8,
+                ll(&c1) - prod.log_likelihood,
+                verr(&c1),
+                r2 as u8,
+                ll(&c2) - prod.log_likelihood,
+                verr(&c2)
+            )
+        })
+        .collect();
+    println!(
+        "d={d} n={n} {} truth:",
+        if std::env::var("STD").is_ok() {
+            "standard"
+        } else {
+            "hard"
+        }
+    );
+    for r in rows {
+        println!("  {r}");
+    }
+}
+
+/// γ (and log-tangent) production fits at large d on the standard truth's γ
+/// data: convergence, iterations, one-core time, `V̂(x)` error. Env `DS`
+/// (default 8,9,10), `N`, `R`.
+/// `cargo test --release --lib gamma_big_d -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_big_d() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (n, reps) = (env("N", 2000), env("R", 6) as u64);
+    let ds: Vec<usize> = std::env::var("DS")
+        .unwrap_or_else(|_| "8,9,10".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for d in ds {
+        let b = if std::env::var("HARD").is_ok() {
+            hard_truth(d)
+        } else {
+            standard_truth(d, 5)
+        };
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+        let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+            (0..bd)
+                .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+                .collect()
+        };
+        let vtrue: Vec<DMatrix<f64>> = (0..200)
+            .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
+            .collect();
+        let rows: Vec<[(bool, usize, f64, f64); 2]> = (900..900 + reps)
+            .into_par_iter()
+            .map(|seed| {
+                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let mut out = [(false, 0, 0.0, 0.0); 2];
+                for (k, shape) in [Shape::Gamma, Shape::LogTangent].into_iter().enumerate() {
+                    let t = Instant::now();
+                    let f = EsagRegressor::new()
+                        .with_shape(shape)
+                        .with_parallel(false)
+                        .fit(&x, &y)
+                        .unwrap();
+                    let s = t.elapsed().as_secs_f64();
+                    let lt = f.lt_frame();
+                    let ve = (0..200)
+                        .map(|i| {
+                            geodesic(
+                                &vtrue[i],
+                                &f.distribution_at(&eta_at(&f.coef, i), lt.as_ref())
+                                    .unwrap()
+                                    .covariance(),
+                            )
+                        })
+                        .sum::<f64>()
+                        / 200.0;
+                    out[k] = (f.converged, f.n_iter, s, ve);
+                }
+                out
+            })
+            .collect();
+        for (k, name) in ["gamma", "log-tangent"].iter().enumerate() {
+            let mut t: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+            let mut ve: Vec<f64> = rows.iter().map(|r| r[k].3).collect();
+            let mut it: Vec<usize> = rows.iter().map(|r| r[k].1).collect();
+            t.sort_by(f64::total_cmp);
+            ve.sort_by(f64::total_cmp);
+            it.sort_unstable();
+            println!(
+                "d={d:>2} K={:>3} {} {name:<12} converged {}/{reps}, median {:>4} iterations, {:.2} s, V error {:.3}",
+                bd * pt,
+                if std::env::var("HARD").is_ok() {
+                    "hard    "
+                } else {
+                    "standard"
+                },
+                rows.iter().filter(|r| r[k].0).count(),
+                it[it.len() / 2],
+                t[t.len() / 2],
+                ve[ve.len() / 2]
+            );
+        }
+    }
+}
+
+/// Why do γ fits at d = 10 (standard truth) stop unconverged? Status,
+/// gradient, trapped/degenerate observations, and the truth's anisotropy.
+/// `cargo test --release --lib gamma_d10_diagnosis -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_d10_diagnosis() {
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let b = standard_truth(d, 5);
+    for seed in [900u64, 901, 902] {
+        let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+        let cfg = EsagRegressor::new().with_parallel(false);
+        let data = cfg.data(&x, &y).unwrap();
+        let f = cfg.fit(&x, &y).unwrap();
+        let tll = joint_loglik_and_grad(&data, &b, false).0;
+        let lams: Vec<f64> = {
+            let eta: Vec<f64> = (0..b.nrows()).map(|k| b[(k, 0)]).collect();
+            crate::frame::Frame::new(&eta[..d], &eta[d..]).lambda
+        };
+        let ratio = lams.iter().fold(0.0f64, |a, &v| a.max(v))
+            / lams.iter().fold(f64::INFINITY, |a, &v| a.min(v));
+        println!(
+            "seed {seed}: status {:?}, converged {}, iterations {}, evaluations {}, |g| {:.2e}, singular {}, degenerate {}, ll {:.2} (truth {:.2}); truth's eigenvalue ratio at x = 0: {ratio:.0}",
+            f.status,
+            f.converged,
+            f.n_iter,
+            f.n_fev,
+            f.grad_norm,
+            f.singular_obs.len(),
+            f.degenerate_obs.len(),
+            f.log_likelihood,
+            tll
+        );
+    }
+}
+
+/// From the truth, does the γ optimizer reach a regular root at large d
+/// (standard truth)? Warm fit and trust-region Newton from the truth,
+/// against the default fit. Env `D` (default 10), `R`.
+/// `cargo test --release --lib gamma_big_d_from_truth -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_big_d_from_truth() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps) = (env("D", 10), env("R", 4) as u64);
+    let b = standard_truth(d, 5);
+    let rows: Vec<String> = (900..900 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let tll = joint_loglik_and_grad(&data, &b, false).0;
+            let t = Instant::now();
+            let def = cfg.fit(&x, &y).unwrap();
+            let t0 = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let warm = cfg.fit_warm(&x, &y, &b).unwrap();
+            let t1 = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let (c, reg, its, _) = newton_tr(&data, &b, 60);
+            let t2 = t.elapsed().as_secs_f64();
+            let nll = joint_loglik_and_grad(&data, &c, false).0;
+            format!(
+                "seed {seed}: default {} ll-truth {:+.1} ({t0:.2} s) | warm from truth {} ll-truth {:+.1} ({t1:.2} s) | Newton from truth regular {} after {its} its, ll-truth {:+.1} ({t2:.2} s)",
+                if def.converged { "conv" } else { "stop" },
+                def.log_likelihood - tll,
+                if warm.converged { "conv" } else { "stop" },
+                warm.log_likelihood - tll,
+                reg as u8,
+                nll - tll
+            )
+        })
+        .collect();
+    println!(
+        "d={d} standard truth, n = 2000 (a regular root is about K/2 = {} above the truth):",
+        dims::eta_len(d) * 6 / 2
+    );
+    for r in rows {
+        println!("  {r}");
+    }
+}
+
+/// Staged start for γ: fit μ(x) with a constant shape (no traps: all
+/// observations share γ), then the full model warm from there; against the
+/// default fit. Log-likelihood relative to the truth (a regular root is
+/// about K/2 above it), convergence and one-core time. Env `DS`, `HARD=1`,
+/// `R`, `N`.
+/// `cargo test --release --lib gamma_staged_start -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_staged_start() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (n, reps) = (env("N", 2000), env("R", 8) as u64);
+    let ds: Vec<usize> = std::env::var("DS")
+        .unwrap_or_else(|_| "8,9,10".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let hard = std::env::var("HARD").is_ok();
+    for d in ds {
+        let b = if hard {
+            hard_truth(d)
+        } else {
+            standard_truth(d, 5)
+        };
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let rows: Vec<[(bool, f64, f64); 2]> = (920..920 + reps)
+            .into_par_iter()
+            .map(|seed| {
+                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let cfg = EsagRegressor::new().with_parallel(false);
+                let data = cfg.data(&x, &y).unwrap();
+                let tll = joint_loglik_and_grad(&data, &b, false).0;
+                let t = Instant::now();
+                let def = cfg.fit(&x, &y).unwrap();
+                let t0 = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let constant = DMatrix::from_fn(bd, pt, |k, j| k < d || j == 0);
+                let stage1 = cfg
+                    .clone()
+                    .with_mask(Some(constant))
+                    .with_hessian(false)
+                    .fit(&x, &y)
+                    .unwrap();
+                let full = cfg.fit_warm(&x, &y, &stage1.coef).unwrap();
+                let t1 = t.elapsed().as_secs_f64();
+                [
+                    (def.converged, def.log_likelihood - tll, t0),
+                    (full.converged, full.log_likelihood - tll, t1),
+                ]
+            })
+            .collect();
+        for (k, name) in ["default start", "staged start"].iter().enumerate() {
+            let mut t: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+            t.sort_by(f64::total_cmp);
+            let lls: Vec<String> = rows.iter().map(|r| format!("{:+.0}", r[k].1)).collect();
+            println!(
+                "d={d:>2} {} K={:>3} {name:<14} converged {}/{reps}, median {:.2} s, ll - truth [{}] (regular root ≈ +{})",
+                if hard { "hard    " } else { "standard" },
+                bd * pt,
+                rows.iter().filter(|r| r[k].0).count(),
+                t[t.len() / 2],
+                lls.join(" "),
+                bd * pt / 2
+            );
+        }
+    }
+}
+
+/// The moment start whitened by the exact information at the start (the
+/// log-tangent single start), for γ: converged and log-likelihood against
+/// the truth, beside the default race. Env `DS`, `HARD=1`, `R`.
+/// `cargo test --release --lib gamma_whitened_start -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_whitened_start() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let reps = env("R", 8) as u64;
+    let hard = std::env::var("HARD").is_ok();
+    let ds: Vec<usize> = std::env::var("DS")
+        .unwrap_or_else(|_| "10".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for d in ds {
+        let b = if hard {
+            hard_truth(d)
+        } else {
+            standard_truth(d, 5)
+        };
+        let rows: Vec<[(bool, f64, f64); 2]> = (920..920 + reps)
+            .into_par_iter()
+            .map(|seed| {
+                let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+                let cfg = EsagRegressor::new().with_parallel(false);
+                let data = cfg.data(&x, &y).unwrap();
+                let tll = joint_loglik_and_grad(&data, &b, false).0;
+                let t = Instant::now();
+                let def = cfg.fit(&x, &y).unwrap();
+                let t0 = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let mask = cfg.resolve_mask(&data).unwrap();
+                let free = free_params(&mask);
+                let b0 = cfg
+                    .clone()
+                    .with_init(Init::DataDriven)
+                    .initial_coef(&data)
+                    .unwrap();
+                let mut wc = cfg.clone();
+                wc.local_precondition = false;
+                wc.precondition = info_precondition(&data, &b0, &free, false);
+                let raw = wc.optimize(&data, &b0, &free, cfg.max_iter);
+                let t1 = t.elapsed().as_secs_f64();
+                [
+                    (def.converged, def.log_likelihood - tll, t0),
+                    (raw.converged, -raw.neg_ll - tll, t1),
+                ]
+            })
+            .collect();
+        for (k, name) in ["default race", "whitened moment start"].iter().enumerate() {
+            let lls: Vec<String> = rows.iter().map(|r| format!("{:+.0}", r[k].1)).collect();
+            let mut t: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+            t.sort_by(f64::total_cmp);
+            println!(
+                "d={d:>2} {} {name:<22} converged {}/{reps}, median {:.2} s, ll - truth [{}] (regular root ≈ +{})",
+                if hard { "hard    " } else { "standard" },
+                rows.iter().filter(|r| r[k].0).count(),
+                t[t.len() / 2],
+                lls.join(" "),
+                dims::eta_len(d) * 6 / 2
+            );
+        }
+    }
+}
+
+/// Is the γ regression's difficulty at large d the branch of the start?
+/// Starts with every slope at zero: the truth's intercept (in its own
+/// branch), and the canonical member of the same V (the branch the moment
+/// start would use). Env `D` (default 10), `R`, `HARD=1`.
+/// `cargo test --release --lib gamma_branch_start -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_branch_start() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let (d, reps) = (env("D", 10), env("R", 8) as u64);
+    let hard = std::env::var("HARD").is_ok();
+    let b = if hard {
+        hard_truth(d)
+    } else {
+        standard_truth(d, 5)
+    };
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let mu0: Vec<f64> = (0..d).map(|k| b[(k, 0)]).collect();
+    let g0: Vec<f64> = (d..bd).map(|k| b[(k, 0)]).collect();
+    let v0 = crate::frame::Frame::new(&mu0, &g0).cov_pow(1.0);
+    let canon = crate::param::gamma_from_covariance(&mu0, &v0);
+    let diff = g0
+        .iter()
+        .zip(&canon)
+        .map(|(a, c)| (a - c).abs())
+        .fold(0.0f64, f64::max);
+    println!(
+        "d={d} {}: truth intercept vs its canonical member: max |difference| {diff:.3}",
+        if hard { "hard" } else { "standard" }
+    );
+    let rows: Vec<[(bool, f64); 2]> = (920..920 + reps)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let tll = joint_loglik_and_grad(&data, &b, false).0;
+            let mut out = [(false, 0.0); 2];
+            for (k, g) in [&g0, &canon].into_iter().enumerate() {
+                let mut s = DMatrix::zeros(bd, pt);
+                for r in 0..d {
+                    s[(r, 0)] = mu0[r];
+                }
+                for (r, &v) in g.iter().enumerate() {
+                    s[(d + r, 0)] = v;
+                }
+                let f = cfg.fit_warm(&x, &y, &s).unwrap();
+                out[k] = (f.converged, f.log_likelihood - tll);
+            }
+            out
+        })
+        .collect();
+    for (k, name) in [
+        "truth's branch, zero slopes",
+        "canonical branch, zero slopes",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let lls: Vec<String> = rows.iter().map(|r| format!("{:+.0}", r[k].1)).collect();
+        println!(
+            "  {name:<30} converged {}/{reps}, ll - truth [{}] (regular root ≈ +{})",
+            rows.iter().filter(|r| r[k].0).count(),
+            lls.join(" "),
+            bd * pt / 2
+        );
+    }
+}
+
+/// Start the γ regression at the i.i.d. MLE (no covariates; one shared γ,
+/// so no traps) with zero slopes, against the default race. Env `DS`,
+/// `HARD=1`, `R`.
+/// `cargo test --release --lib gamma_iid_start -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_iid_start() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let reps = env("R", 8) as u64;
+    let hard = std::env::var("HARD").is_ok();
+    let ds: Vec<usize> = std::env::var("DS")
+        .unwrap_or_else(|_| "8,9,10".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for d in ds {
+        let b = if hard {
+            hard_truth(d)
+        } else {
+            standard_truth(d, 5)
+        };
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let rows: Vec<[(bool, f64, f64); 2]> = (920..920 + reps)
+            .into_par_iter()
+            .map(|seed| {
+                let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+                let cfg = EsagRegressor::new().with_parallel(false);
+                let data = cfg.data(&x, &y).unwrap();
+                let tll = joint_loglik_and_grad(&data, &b, false).0;
+                let t = Instant::now();
+                let def = cfg.fit(&x, &y).unwrap();
+                let t0 = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let iid = cfg
+                    .clone()
+                    .with_hessian(false)
+                    .fit(&DMatrix::zeros(x.nrows(), 0), &y)
+                    .unwrap();
+                let mut s = DMatrix::zeros(bd, pt);
+                for r in 0..bd {
+                    s[(r, 0)] = iid.coef[(r, 0)];
+                }
+                let f = cfg.fit_warm(&x, &y, &s).unwrap();
+                let t1 = t.elapsed().as_secs_f64();
+                [
+                    (def.converged, def.log_likelihood - tll, t0),
+                    (f.converged, f.log_likelihood - tll, t1),
+                ]
+            })
+            .collect();
+        for (k, name) in ["default race", "i.i.d. MLE start"].iter().enumerate() {
+            let lls: Vec<String> = rows.iter().map(|r| format!("{:+.0}", r[k].1)).collect();
+            let mut t: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+            t.sort_by(f64::total_cmp);
+            println!(
+                "d={d:>2} {} {name:<17} converged {}/{reps}, median {:.2} s, ll - truth [{}] (regular root ≈ +{})",
+                if hard { "hard    " } else { "standard" },
+                rows.iter().filter(|r| r[k].0).count(),
+                t[t.len() / 2],
+                lls.join(" "),
+                bd * pt / 2
+            );
+        }
+    }
+}
+
+/// The log-tangent-informed start for γ: the log-tangent fit's μ
+/// coefficients (the same mean model), the γ of its V̂(x = 0) as the shape
+/// intercept, zero shape slopes; then the γ fit warm from there. Against
+/// the default race. Env `DS`, `HARD=1`, `R`.
+/// `cargo test --release --lib gamma_lt_start -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_lt_start() {
+    use rayon::prelude::*;
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let reps = env("R", 8) as u64;
+    let hard = std::env::var("HARD").is_ok();
+    let ds: Vec<usize> = std::env::var("DS")
+        .unwrap_or_else(|_| "8,9,10".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    for d in ds {
+        let b = if hard {
+            hard_truth(d)
+        } else {
+            standard_truth(d, 5)
+        };
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+        let eta_at = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+            (0..bd)
+                .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+                .collect()
+        };
+        let vtrue: Vec<DMatrix<f64>> = (0..200)
+            .map(|i| Esag::from_eta(&eta_at(&b, i)).unwrap().covariance())
+            .collect();
+        let verr = |f: &EsagRegressorFit| {
+            let lt = f.lt_frame();
+            (0..200)
+                .map(|i| {
+                    geodesic(
+                        &vtrue[i],
+                        &f.distribution_at(&eta_at(&f.coef, i), lt.as_ref())
+                            .unwrap()
+                            .covariance(),
+                    )
+                })
+                .sum::<f64>()
+                / 200.0
+        };
+        let rows: Vec<[(bool, f64, f64, f64); 3]> = (920..920 + reps)
+            .into_par_iter()
+            .map(|seed| {
+                let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+                let cfg = EsagRegressor::new().with_parallel(false);
+                let data = cfg.data(&x, &y).unwrap();
+                let tll = joint_loglik_and_grad(&data, &b, false).0;
+                let t = Instant::now();
+                let def = cfg.fit(&x, &y).unwrap();
+                let t0 = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let lt = cfg
+                    .clone()
+                    .with_shape(Shape::LogTangent)
+                    .with_hessian(false)
+                    .fit(&x, &y)
+                    .unwrap();
+                let eta0: Vec<f64> = (0..bd).map(|k| lt.coef[(k, 0)]).collect();
+                let v0 = lt
+                    .distribution_at(&eta0, lt.lt_frame().as_ref())
+                    .unwrap()
+                    .covariance();
+                let vr: Vec<f64> = (0..d)
+                    .flat_map(|r| (0..d).map(move |c| (r, c)))
+                    .map(|(r, c)| v0[(r, c)])
+                    .collect();
+                let g0 = crate::param::gamma_from_covariance(&eta0[..d], &vr);
+                let mut s = DMatrix::zeros(bd, pt);
+                for j in 0..pt {
+                    for r in 0..d {
+                        s[(r, j)] = lt.coef[(r, j)];
+                    }
+                }
+                for (r, &v) in g0.iter().enumerate() {
+                    s[(d + r, 0)] = v;
+                }
+                let f = cfg.fit_warm(&x, &y, &s).unwrap();
+                let t1 = t.elapsed().as_secs_f64();
+                [
+                    (def.converged, def.log_likelihood - tll, t0, verr(&def)),
+                    (f.converged, f.log_likelihood - tll, t1, verr(&f)),
+                    (lt.converged, lt.log_likelihood - tll, 0.0, verr(&lt)),
+                ]
+            })
+            .collect();
+        for (k, name) in ["default race", "log-tangent start", "log-tangent fit"]
+            .iter()
+            .enumerate()
+        {
+            let lls: Vec<String> = rows.iter().map(|r| format!("{:+.0}", r[k].1)).collect();
+            let mut t: Vec<f64> = rows.iter().map(|r| r[k].2).collect();
+            let mut ve: Vec<f64> = rows.iter().map(|r| r[k].3).collect();
+            t.sort_by(f64::total_cmp);
+            ve.sort_by(f64::total_cmp);
+            println!(
+                "d={d:>2} {} {name:<18} converged {}/{reps}, median {:.2} s, V error {:.3}, ll - truth [{}] (regular root ≈ +{})",
+                if hard { "hard    " } else { "standard" },
+                rows.iter().filter(|r| r[k].0).count(),
+                t[t.len() / 2],
+                ve[ve.len() / 2],
+                lls.join(" "),
+                bd * pt / 2
+            );
+        }
+    }
+}
+
+/// The log-tangent-informed γ start at d = 10 (standard): status and
+/// gradient of the warm fit, and the trust-region Newton polish from it.
+/// `cargo test --release --lib gamma_lt_start_status -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_lt_start_status() {
+    use rayon::prelude::*;
+    let d = 10;
+    let b = standard_truth(d, 5);
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let rows: Vec<String> = (920u64..928)
+        .into_par_iter()
+        .map(|seed| {
+            let (x, y) = simulate(&b, 2000, seed, Shape::Gamma);
+            let cfg = EsagRegressor::new().with_parallel(false);
+            let data = cfg.data(&x, &y).unwrap();
+            let tll = joint_loglik_and_grad(&data, &b, false).0;
+            let lt = cfg.clone().with_shape(Shape::LogTangent).with_hessian(false).fit(&x, &y).unwrap();
+            let eta0: Vec<f64> = (0..bd).map(|k| lt.coef[(k, 0)]).collect();
+            let v0 = lt.distribution_at(&eta0, lt.lt_frame().as_ref()).unwrap().covariance();
+            let vr: Vec<f64> = (0..d).flat_map(|r| (0..d).map(move |c| (r, c))).map(|(r, c)| v0[(r, c)]).collect();
+            let g0 = crate::param::gamma_from_covariance(&eta0[..d], &vr);
+            let mut s = DMatrix::zeros(bd, pt);
+            for j in 0..pt {
+                for r in 0..d {
+                    s[(r, j)] = lt.coef[(r, j)];
+                }
+            }
+            for (r, &v) in g0.iter().enumerate() {
+                s[(d + r, 0)] = v;
+            }
+            let f = cfg.fit_warm(&x, &y, &s).unwrap();
+            let t = Instant::now();
+            let (c, reg, its, gm) = newton_tr(&data, &f.coef, 40);
+            let tn = t.elapsed().as_secs_f64();
+            let nll = joint_loglik_and_grad(&data, &c, false).0;
+            format!(
+                "seed {seed}: warm {:?} conv {} |g| {:.1e} singular {} ll-truth {:+.1} | Newton polish: regular {} after {its} its, |g| {gm:.1e}, ll-truth {:+.1} ({tn:.2} s)",
+                f.status,
+                f.converged,
+                f.grad_norm,
+                f.singular_obs.len(),
+                f.log_likelihood - tll,
+                reg as u8,
+                nll - tll
+            )
+        })
+        .collect();
+    for r in rows {
+        println!("{r}");
+    }
+}

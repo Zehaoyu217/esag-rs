@@ -372,6 +372,30 @@ impl EsagRegressor {
         } else {
             self.race(&data, &starts, &mask, self.max_iter)
         };
+        // Gamma with covariates whose race failed: the moment start's
+        // intercept assumes concentrated data and is far off when V is
+        // strongly anisotropic, so the race can be trapped far from the
+        // maximum (d = 10: 253–435 below the truth's log-likelihood). The
+        // log-tangent fit is never trapped and has the same mean model; its
+        // mu(x) and V̂(x = 0), with zero shape slopes, start gamma near the
+        // maximum (`gamma_lt_start` in `fit_profile.rs`: at d = 10, 6 of 8
+        // fits at the regular root's level against 1 of 8, V̂(x) error 0.60
+        // against 1.24). It replaces the race's result only if it is better.
+        if !best.converged
+            && data.lt.is_none()
+            && data.gt.is_none()
+            && data.p > 0
+            && data.d >= LT_START_MIN_D
+            && self.fit_intercept
+            && matches!(self.init, Init::Auto)
+            && self.n_restarts == 0
+            && let Some(s) = self.lt_informed_start(x, y, &data, &mask)
+        {
+            let alt = self.race(&data, &[s], &mask, self.max_iter);
+            if alt.beats(&best) {
+                best = alt;
+            }
+        }
         // Safety net: if no start passed the convergence check (typically an
         // observation pinned at a singular point of the gamma
         // parameterization, see `docs/MATH.md`), race waves of perturbed
@@ -417,6 +441,50 @@ impl EsagRegressor {
             best = self.exclusion_rounds(x, y, &data, best, &mask);
         }
         self.finalize(&data, best, mask)
+    }
+
+    /// A gamma start from the log-tangent fit of the same data: its mean
+    /// coefficients (the mean model is the same), the gamma of its fitted
+    /// `V` at `x = 0` as the shape intercept (any member of gamma's
+    /// equivalence class serves: `gamma_branch_start`), zero shape slopes.
+    /// `None` if the log-tangent fit fails.
+    fn lt_informed_start(
+        &self,
+        x: &DMatrix<f64>,
+        y: &DMatrix<f64>,
+        data: &RegressionData,
+        mask: &DMatrix<bool>,
+    ) -> Option<DMatrix<f64>> {
+        let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
+        let mut cfg = self.clone();
+        cfg.shape = Shape::LogTangent;
+        cfg.compute_hessian = false;
+        cfg.lt_reference = None;
+        let lt = cfg.fit(x, y).ok()?;
+        let eta0: Vec<f64> = (0..bd).map(|k| lt.coef[(k, 0)]).collect();
+        let v0 = lt
+            .distribution_at(&eta0, lt.lt_frame().as_ref())
+            .ok()?
+            .covariance();
+        let vr: Vec<f64> = (0..d)
+            .flat_map(|r| (0..d).map(move |c| (r, c)))
+            .map(|(r, c)| v0[(r, c)])
+            .collect();
+        let g0 = crate::param::gamma_from_covariance(&eta0[..d], &vr);
+        if !g0.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let mut s = DMatrix::zeros(bd, pt);
+        for j in 0..pt {
+            for r in 0..d {
+                s[(r, j)] = lt.coef[(r, j)];
+            }
+        }
+        for (r, &v) in g0.iter().enumerate() {
+            s[(d + r, 0)] = v;
+        }
+        zero_fixed(&mut s, mask);
+        Some(s)
     }
 
     /// Rescue of a trapped gamma fit. A trap is not a root of the score
@@ -1326,6 +1394,9 @@ const SINGULAR_DISTANCE: f64 = 1e-2;
 const EXCLUSION_ROUNDS: usize = 3;
 /// Largest `d` at which trapped gamma fits get exclusion rounds.
 const EXCLUSION_MAX_D: usize = 6;
+/// Smallest `d` at which a failed gamma race also tries the
+/// log-tangent-informed start.
+const LT_START_MIN_D: usize = 5;
 /// A mean direction with `√(μ̂_0² + μ̂_1²)` below this (about 17° from the
 /// pole set of `onb(μ)`) gets a summary note recommending
 /// [`Shape::GammaTransported`]. The slow cases measured sat at 0.12–0.19
@@ -2810,7 +2881,7 @@ impl EsagRegressorFit {
         if !self.singular_obs.is_empty() {
             let k = self.singular_obs.len();
             notes.push(format!(
-                "{k} observation{} ({}) {} at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The fit stopped in a\n    trap there: a local supremum of the likelihood that is not a regular\n    maximum, so this is not an MLE in the usual sense and the standard\n    errors are not meaningful (docs/MATH.md, section 2); restarts only find\n    other traps. The log-tangent shape (Shape::LogTangent;\n    shape=\"log-tangent\" in Python) describes the same distributions with a\n    smooth parameterization, which has no traps.",
+                "{k} observation{} ({}) {} at a singular set of the gamma\n    parameterization, where V(gamma) is discontinuous. The fit stopped in a\n    trap there: a local supremum of the likelihood that is not a regular\n    maximum, so the standard errors are not meaningful (docs/MATH.md,\n    section 2). A trap next to the maximum pins only these observations,\n    so the fitted V(x) is usually close to the regular maximum's. The\n    log-tangent shape (Shape::LogTangent; shape=\"log-tangent\" in Python)\n    has no traps but is a different regression model, much worse on\n    strongly anisotropic data from gamma: compare the two by log-likelihood\n    (AIC/BIC) before switching.",
                 if k == 1 { "" } else { "s" },
                 list(&self.singular_obs),
                 if k == 1 { "sits" } else { "sit" }

@@ -231,6 +231,31 @@ and for odd `j ≥ 3` it needs a parallelizable sphere, so `j ∈ {3, 7}`
 Only a parameterization that does not split `V` into gaps and directions
 avoids them, which is what the log-tangent shape does.
 
+**Large d: starts, not traps, at first.** On the standard scenario's γ
+data (moderate x-dependence, strong anisotropy) γ fits converge at d = 8
+and 9 (12 of 12, 0.14 and 0.31 s, `V̂` error 0.45 and 0.52, against
+log-tangent's 1.60 and 2.53). At d = 10 the default race ended 253–435
+log-likelihood units *below* the truth, trapped early. A regular root is
+about `K/2 = 162` above the truth, and fits started at the truth reach it
+(`gamma_big_d_from_truth`). The moment start's intercept is at fault, not
+its branch: the truth's intercept with zero slopes reaches the root's
+level from either member of its equivalence class (`gamma_branch_start`).
+The pooled i.i.d. MLE does not, being far from V at x = 0
+(`gamma_iid_start`). Neither does a constant-shape first stage
+(`gamma_staged_start`), nor the moment start whitened by the exact
+information (`gamma_whitened_start`). What works is log-tangent's
+regression: its μ(x) and V̂(x = 0), with zero shape slopes, start γ near
+the maximum (`gamma_lt_start`). So a failed γ race at d ≥ 5 with
+covariates also tries that start and keeps the better fit. At d = 10
+this brings 7 of 8 fits to the regular root's level and halves the `V̂`
+error (0.60 against 1.24; 0.62 over 12 other datasets). Most of those
+fits still end in a trap next to the root (2 of 12 pass the gradient
+check), but there a trap pins one or two observations and barely moves
+`V̂(x)`. Log-tangent itself is 3000 log-likelihood units below the truth
+there (`V̂` error 2.96). On the hard scenario the extra start changes
+little: 4 of 12 fits converge at d = 5 against 1–3, none at d = 8, at
+0.4–0.8 s.
+
 **A refined γ (`src/gamma_smooth.rs`, an experiment).** It keeps γ's
 coordinates, its eigenvalue ratios `K_j = 1 + ‖G_j‖` and the eigenvector
 each group places, which is continuous: `v_j = (1/‖G_j‖) Σ_k (−1)^k
