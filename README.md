@@ -668,7 +668,10 @@ it beats the log-tangent (0.45 vs 0.60 at d = 5, n = 2000), and with the
 adaptive group LASSO over its eigen groups (`Grouping::GammaGroups`,
 `Grouping::EigenParts`; Python `groups="gamma"` / `"eigen_parts"`) it is
 the most accurate model measured at d = 8 (0.49–0.53 against 0.59–0.68 for
-the log-tangent family, n = 2000). What remains: the model depends on the
+the log-tangent family, n = 2000). Bootstrap tests with B = 500 at
+n = 2000 and 5 covariates take 1.5 s (d = 3), 4.7 s (d = 5) and 23–39 s
+(d = 8) on one core, the log-tangent's times and 6–9× below γ's (score
+tests 1.1 / 2.5–3.3 / 7–15 s). What remains: the model depends on the
 axis ordering and basis stored with the fit (`rot_basis`, `lt_reference`),
 rotation slopes of nearly tied axes are weakly identified (regularize, as
 above), and its penalized paths take 10–15 s at d = 8 (the log-tangent's

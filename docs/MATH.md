@@ -370,6 +370,14 @@ fresh points; one core per fit; log-tangent in parentheses).**
   crossing for 17–78 % of the covariate values), `n = 2000`: `d = 5` 0.453
   (0.601), `d = 8` 0.720 (0.594); `n = 500`: `d = 5` 0.795 (0.761), `d = 8`
   1.965 (1.004).
+* **Bootstrap tests** (`examples/test_bench.rs`, `B = 500`, `n = 2000`,
+  5 covariates, one core, four anisotropic nulls): γ-rot full tests
+  1.5 s at `d = 3`, 4.6–4.8 s at `d = 5`, 23–39 s at `d = 8`, score tests
+  1.1 / 2.5–3.3 / 7–15 s; spectral 1.8–1.9 / 5.1–6.2 s and 1.1–1.3 /
+  2.4–3.3 s at `d = 3 / 5`. Same run, log-tangent: 4.5–8.3 s and 1.9–4.8 s
+  at `d = 5`, 19–30 s and 5–16 s at `d = 8`; γ: 27–43 s and 6–10 s at
+  `d = 5`, 83–287 s and 7.5–60 s at `d = 8`. The eigen charts' refits
+  converge as the log-tangent's do, so a test costs about the same.
 * **Ordering.** The γ-rot regression model depends on the basis `R_0`
   and, through the nesting, on which axis is "group j": the fitted model
   orders axes by ascending eigenvalue at the mean design row, the

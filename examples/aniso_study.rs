@@ -12,7 +12,7 @@
 //! nulls tested are the nulls simulated.
 //!
 //! `cargo run --release --example aniso_study -- truth|size|power`
-//! env: `D=3,5` `SHAPE=gamma|lt|gr` `R=300` `B=199` `C=0.2` `NULLS=mu,shape,x5,const`,
+//! env: `D=3,5` `SHAPE=gamma|lt|gr|sp` `R=300` `B=199` `C=0.2` `NULLS=mu,shape,x5,const`,
 //! `FAST=1` for the score test (LM and M only).
 #[path = "big_fit.rs"]
 #[allow(dead_code)]
@@ -196,6 +196,7 @@ fn main() {
         Ok("gamma") => vec![Shape::Gamma],
         Ok("lt") => vec![Shape::LogTangent],
         Ok("gr") | Ok("gamma-rot") => vec![Shape::GammaRot],
+        Ok("sp") | Ok("spectral") => vec![Shape::Spectral],
         _ => vec![Shape::Gamma, Shape::LogTangent],
     };
     let nulls: Vec<String> = std::env::var("NULLS")

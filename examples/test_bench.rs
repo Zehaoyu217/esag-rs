@@ -26,6 +26,7 @@ fn main() {
             Ok("gamma") => vec![Shape::Gamma],
             Ok("lt") => vec![Shape::LogTangent],
             Ok("gr") | Ok("gamma-rot") => vec![Shape::GammaRot],
+            Ok("sp") | Ok("spectral") => vec![Shape::Spectral],
             _ => vec![Shape::Gamma, Shape::LogTangent],
         };
         for shape in shapes {

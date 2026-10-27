@@ -11,7 +11,7 @@
 //! `center(d)`.
 //!
 //! `cargo run --release --example hard_scenario -- fit|tests|lasso|recovery`
-//! env: `D=3,5` `SHAPE=gamma|lt|gr` `NS=200,500,2000` `R` (replications) `B`
+//! env: `D=3,5` `SHAPE=gamma|lt|gr|sp` `NS=200,500,2000` `R` (replications) `B`
 //! (bootstrap) `FAST=1` (score tests only) `TRUTH=gamma|lt` (the shape the
 //! data come from in `fit`; default: the fitted shape).
 use esag::distribution::Esag;
@@ -57,6 +57,7 @@ fn shapes() -> Vec<Shape> {
         Ok("gamma") => vec![Shape::Gamma],
         Ok("lt") => vec![Shape::LogTangent],
         Ok("gr") | Ok("gamma-rot") => vec![Shape::GammaRot],
+        Ok("sp") | Ok("spectral") => vec![Shape::Spectral],
         _ => vec![Shape::LogTangent, Shape::Gamma],
     }
 }
