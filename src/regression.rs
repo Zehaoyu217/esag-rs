@@ -3776,8 +3776,11 @@ pub(crate) fn joint_loglik_grad_hess_with(
 
 /// The distribution of one linear predictor `eta = (mu, shape)` in the
 /// parameterization `shape`. `lt` is the tangent frame of
-/// [`Shape::LogTangent`] and [`Shape::GammaTransported`]; [`Shape::Gamma`]
-/// (and a missing frame) uses `onb(mu)`.
+/// [`Shape::LogTangent`], [`Shape::GammaTransported`], [`Shape::GammaRot`]
+/// and [`Shape::Spectral`] (for the last two with the identity basis
+/// rotation: a fitted model's own basis is applied by
+/// [`EsagRegressorFit::distribution_at`]); [`Shape::Gamma`] (and a missing
+/// frame) uses `onb(mu)`.
 pub fn shape_distribution(shape: Shape, lt: Option<&LtFrame>, eta: &[f64]) -> Result<Esag> {
     let d = dims::dim_from_eta_len(eta.len())
         .ok_or_else(|| EsagError::Shape(format!("eta of length {} fits no d", eta.len())))?;
@@ -3791,9 +3794,16 @@ pub fn shape_distribution(shape: Shape, lt: Option<&LtFrame>, eta: &[f64]) -> Re
             let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
             Esag::from_covariance(&eta[..d], &v)
         }
-        (Shape::GammaRot | Shape::Spectral, _) => Err(EsagError::Shape(
-            "a gamma-rot or spectral distribution needs its frame: use EsagRegressorFit::distribution_at"
-                .into(),
+        (Shape::GammaRot, Some(fr)) => {
+            let gr = crate::gamma_rot::GrFrame::stereo(fr.reference());
+            gamma_rot_distribution(&gr, eta)
+        }
+        (Shape::Spectral, Some(fr)) => {
+            let sp = crate::spectral::SpFrame::new(fr.reference());
+            spectral_distribution(&sp, eta)
+        }
+        (Shape::GammaRot | Shape::Spectral, None) => Err(EsagError::Shape(
+            "a gamma-rot or spectral distribution needs a frame (its reference direction)".into(),
         )),
         _ => Esag::from_eta(eta),
     }
