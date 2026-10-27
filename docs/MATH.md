@@ -401,13 +401,29 @@ fresh points; one core per fit; log-tangent in parentheses).**
   shape (0–3 active groups, `V̂` 0.75–0.83) while the full models overfit
   (1.7–2.0).
 * **Cost of the penalized paths.** Log-tangent paths take 0.3–0.5 s
-  (`d = 5`) and 1.2–2.7 s (`d = 8`); γ-rot paths 1.3–2.7 s and 53–67 s. The
-  proximal Newton converges in 1–8 iterations at the small `λ` but hits
-  its 200-iteration cap at the largest ones (KKT residual up to 0.5), and
-  each relaxed refit costs 0.9 s at `d = 8`; the expected information as
-  the metric (`ObsHessian::Opg`) gives the same solutions 1.4× slower.
-  BIC selects at moderate `λ`, where the solves converge, so the selected
-  fits are unaffected. The large-`λ` solves are the open item.
+  (`d = 5`) and 1.2–2.7 s (`d = 8`); γ-rot paths 1.3–2.7 s and, at `d = 8`,
+  10–15 s (53–75 s before the solver change below). The proximal Newton
+  of `src/optim/prox.rs` models the smooth part by a positive-definite
+  Hessian; the observed Hessian of an eigen chart is indefinite along a
+  path (at the largest `λ`, 38 of 210 eigenvalues negative, in the zeroed
+  shape-slope directions), and the old rule, adding `τI` until the Cholesky
+  factorization succeeds, inflated every direction by the most negative
+  eigenvalue, so that the Newton step became a short gradient step: the
+  solves crawled for 200 iterations (KKT residual up to 0.5) and each
+  relaxed refit cost 0.9 s. Now the coordinates the proximal step keeps at
+  zero get a diagonal model and the free block keeps its own curvature,
+  with its negative eigenvalues raised to a floor that the solve adapts
+  (down when the objective falls faster than the model predicts, up when
+  a step is cut): 1–8 iterations at small `λ`, 17–45 at large `λ` instead
+  of 200, relaxed refits 0.35 s. The log-tangent's Hessian is positive
+  definite, so its paths are unchanged; the Project 3 reproduction tests
+  (objectives at the R points, never below the R optimum) pass unchanged.
+  The expected information as the metric (`ObsHessian::Opg`) had been
+  measured first: the same solutions, 1.4× slower. What remains at the
+  mid-path `λ` is negative curvature of the smooth part along directions
+  where the penalty supplies the curvature, which a positive-definite
+  model of the smooth part cannot represent (45 iterations where a convex
+  problem takes 5).
 
 **The spectral chart (`src/spectral.rs`, `Shape::Spectral`): the
 eigen-decomposition itself, ordering-free.** `W = R diag(e^ℓ) Rᵀ` with
@@ -459,11 +475,13 @@ against 0.77); the penalties recover the eigen charts: at `d = 8`,
 `n = 2000` on spectral data the spectral adaptive LASSO is the most
 accurate model (0.449), then γ-rot's adaptive LASSO and eigen-part group
 LASSO (0.481, 0.487), then the log-tangent's (0.509). The spectral chart's
-two coarse eigen parts (all log-eigenvalues, the whole rotation) are too
-coarse a grouping (0.602 at `d = 8`, 0.552 at `d = 5`, `n = 500`, one
-active group): penalize its entries, or γ-rot's finer `(κ_j, ω_j)` groups
-(0.450 at `d = 5`, `n = 500`). Penalized eigen-chart paths at `d = 8` take
-one to two minutes for the reason given above.
+two eigen parts (all log-eigenvalues as one group, the whole rotation as
+another) are a coarse grouping: 0.552 at `d = 5`, `n = 500` with one
+active group, against γ-rot's finer `(κ_j, ω_j)` groups at 0.450; at
+`d = 8` on γ-rot data they select two groups and reach 0.493 with the
+solver change above (0.602 before it, when unconverged large-`λ` solves
+misled BIC). Penalizing the spectral chart's entries (adaptive LASSO) is
+the safer default for it.
 
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's

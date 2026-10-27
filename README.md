@@ -671,7 +671,11 @@ the most accurate model measured at d = 8 (0.49–0.53 against 0.59–0.68 for
 the log-tangent family, n = 2000). What remains: the model depends on the
 axis ordering and basis stored with the fit (`rot_basis`, `lt_reference`),
 rotation slopes of nearly tied axes are weakly identified (regularize, as
-above), and its penalized paths are slow at d = 8 (about a minute).
+above), and its penalized paths take 10–15 s at d = 8 (the log-tangent's
+1–3 s): the eigen charts' observed Hessian is indefinite along a path and
+the proximal Newton now models the free block with its own curvature,
+floored adaptively (`docs/MATH.md` §2), instead of inflating every
+direction.
 
 **`Shape::Spectral` (Python `shape="spectral"`) removes the ordering
 dependence.** It takes the eigen-decomposition itself as the parameters:

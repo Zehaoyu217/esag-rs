@@ -555,9 +555,13 @@ fn prox_newton_r<A: PenaltyAtoms>(
         _ => (f.value_grad_hess(&theta, &mut grad, &mut hess), 0usize),
     };
     let mut obj = fs + value(&theta);
-    // positive-definite model Hessian and its largest eigenvalue, recomputed
-    // only with the Hessian
-    let mut model_h: Option<(DMatrix<f64>, f64)> = None;
+    // positive-definite model Hessian, its largest eigenvalue and whether the
+    // curvature floor was applied; recomputed with the Hessian or when the
+    // floor changes
+    let mut model_h: Option<(DMatrix<f64>, f64, bool)> = None;
+    // the floor of the free block's eigenvalues (indefinite Hessians only),
+    // adapted to the agreement between the model and the objective
+    let mut floor = CURVATURE_FLOOR;
     let mut n_iter = 0;
     let mut kkt = f64::INFINITY;
     let mut converged = false;
@@ -583,12 +587,14 @@ fn prox_newton_r<A: PenaltyAtoms>(
         }
         n_iter += 1;
         if model_h.is_none() {
-            let h = positive_definite(&hess, n);
+            let inactive = inactive_coordinates(&theta, &gh, pen, &w, &hess, n);
+            let (h, floored) = positive_definite_masked(&hess, n, &inactive, floor);
             let l = largest_eigenvalue(&h);
-            model_h = Some((h, l));
+            model_h = Some((h, l, floored));
         }
-        let (h, l) = model_h.as_ref().unwrap();
-        let z = solve_model(&theta, &gh, h, *l, pen, &w, cfg.max_inner);
+        // (a copy: the floor adaptation below may rebuild the model)
+        let (h, l, floored) = model_h.clone().unwrap();
+        let z = solve_model(&theta, &gh, &h, l, pen, &w, cfg.max_inner);
         let delta: Vec<f64> = z.iter().zip(&theta).map(|(a, b)| a - b).collect();
         let pen_now = pen.lambda * weighted_atoms(&pen.atoms, &z, &w)
             - pen.lambda * weighted_atoms(&pen.atoms, &theta, &w);
@@ -626,6 +632,13 @@ fn prox_newton_r<A: PenaltyAtoms>(
             t *= 0.5;
         }
         if !accepted {
+            // a model too flat on the free block (floored curvature) may be
+            // the problem: raise the floor and retry with the same Hessian
+            if floored && floor < FLOOR_MAX {
+                floor = (floor * 10.0).min(FLOOR_MAX);
+                model_h = None;
+                continue;
+            }
             if since_hessian == 0 {
                 break;
             }
@@ -636,6 +649,57 @@ fn prox_newton_r<A: PenaltyAtoms>(
             continue;
         }
         let new_obj = f_cand + value(&cand);
+        // the model's predicted decrease against the actual one: on a floored
+        // model a decrease far above the prediction means the floor is too
+        // high along the step (the smooth part has negative curvature there),
+        // a cut step or a decrease far below it that it is too low
+        if floored {
+            let dv = DVector::from_column_slice(&delta);
+            let pred = -dd - 0.5 * t * dv.dot(&(&h * &dv));
+            let ratio = if pred > 0.0 {
+                (obj - new_obj) / (t * pred)
+            } else {
+                1.0
+            };
+            if (t < 1.0 || ratio < 0.5) && floor < FLOOR_MAX {
+                floor = (floor * 10.0).min(FLOOR_MAX);
+                model_h = None;
+            } else if t == 1.0 && ratio > 1.5 && floor > FLOOR_MIN {
+                floor = (floor * 0.1).max(FLOOR_MIN);
+                model_h = None;
+            }
+        }
+        if std::env::var_os("ESAG_PROX_DEBUG").is_some() {
+            let lmin = h
+                .clone()
+                .symmetric_eigenvalues()
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            let step = delta.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+            let active = {
+                let mut phi = vec![0.0; pen.atoms.len()];
+                pen.atoms.atoms(&cand, &mut phi);
+                phi.iter().filter(|v| **v > 1e-12).count()
+            };
+            // the raw (observed) Hessian: its smallest eigenvalue and the
+            // number of negative ones; the curvature along the step in the
+            // model and in the raw Hessian
+            let raw = {
+                let m = DMatrix::from_row_slice(n, n, &hess);
+                (&m + m.transpose()) * 0.5
+            };
+            let raw_eig = raw.clone().symmetric_eigenvalues();
+            let raw_min = raw_eig.iter().cloned().fold(f64::INFINITY, f64::min);
+            let raw_neg = raw_eig.iter().filter(|v| **v < 0.0).count();
+            let dv = DVector::from_column_slice(&delta);
+            let curv_model = dv.dot(&(&h * &dv));
+            let curv_raw = dv.dot(&(&raw * &dv));
+            eprintln!(
+                "    it {n_iter}: kkt {kkt:.2e} t {t:.3} dd {dd:.3e} decrease {:.3e} |step| {step:.2e} model eig [{lmin:.2e}, {l:.2e}] raw min {raw_min:.2e} ({raw_neg} neg) δᵀHδ model {curv_model:.2e} raw {curv_raw:.2e} floor {floor:.0e} stale {since_hessian} active {active}",
+                obj - new_obj
+            );
+        }
         // Stalled at the tolerance: steps that no longer decrease F beyond
         // rounding, with the residual already below √tol (an atom flipping
         // at its threshold). Without this the loop refreshes the Hessian
@@ -670,6 +734,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
         }
         obj = fs + value(&theta);
     }
+    let _ = floor;
     ProxResult {
         r: r_at(&theta),
         theta,
@@ -684,6 +749,12 @@ fn prox_newton_r<A: PenaltyAtoms>(
 
 /// Newton steps that may reuse one Hessian.
 const HESSIAN_REUSE: usize = 5;
+/// Initial floor of the model Hessian's eigenvalues on the free coordinates,
+/// as a fraction of the largest (an indefinite observed Hessian only); the
+/// solve adapts it within [`FLOOR_MIN`], [`FLOOR_MAX`].
+const CURVATURE_FLOOR: f64 = 1e-3;
+const FLOOR_MIN: f64 = 1e-7;
+const FLOOR_MAX: f64 = 1.0;
 /// A decrease of `F` below this relative size counts as rounding.
 const FLAT_DECREASE: f64 = 1e-13;
 /// Consecutive such steps after which a solve near the tolerance stops.
@@ -749,27 +820,119 @@ fn largest_eigenvalue(h: &DMatrix<f64>) -> f64 {
 
 /// Symmetrised `H`, shifted by `τ I` if needed so that it is positive
 /// definite (`τ` grows geometrically from `1e-8·max|H_ii|`).
-fn positive_definite(hess: &[f64], n: usize) -> DMatrix<f64> {
+/// The coordinates the proximal step keeps at zero from `theta`: those at
+/// zero whose proximal gradient step (any step size: the test does not
+/// depend on it for the norm atoms) returns zero. Their atoms are inactive
+/// at this iterate; the model Hessian treats them diagonally.
+fn inactive_coordinates<A: PenaltyAtoms>(
+    theta: &[f64],
+    g: &[f64],
+    pen: &Penalty<A>,
+    w: &[f64],
+    hess: &[f64],
+    n: usize,
+) -> Vec<bool> {
+    let scale = (0..n)
+        .map(|i| hess[i * n + i].abs())
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
+    let tau = 1.0 / scale;
+    let mut z: Vec<f64> = theta.iter().zip(g).map(|(t, gi)| t - tau * gi).collect();
+    let t: Vec<f64> = w.iter().map(|&wg| tau * pen.lambda * wg).collect();
+    pen.atoms.prox(&mut z, &t);
+    (0..n).map(|i| theta[i] == 0.0 && z[i] == 0.0).collect()
+}
+
+/// A positive-definite model Hessian. A Hessian that is already positive
+/// definite is used as it is. Otherwise the coordinates in `inactive` (kept
+/// at zero by the proximal step) get a diagonal model, `|H_ii|` floored, and
+/// the block of the other coordinates is made positive definite by the
+/// saddle-free rule (eigenvalues replaced by their absolute values, floored
+/// at `1e−8` of the largest), so that the step on the free coordinates is
+/// Newton's with their own curvature. The previous rule, adding `τI` to the
+/// whole Hessian until the Cholesky factorization succeeds, inflated every
+/// direction by the size of the most negative eigenvalue; the saddle-free
+/// rule on the whole Hessian still polluted the free block through the
+/// flipped eigenvectors' components there. With the eigen-chart
+/// likelihoods, whose observed Hessian has dozens of negative eigenvalues
+/// in the zeroed shape-slope directions at the large-`λ` points of a path,
+/// either turned the Newton step into a short gradient step and the solves
+/// crawled for 200 iterations (a minute per path at `d = 8`, against
+/// seconds for the log-tangent, whose Hessian is positive definite).
+fn positive_definite_masked(
+    hess: &[f64],
+    n: usize,
+    inactive: &[bool],
+    floor: f64,
+) -> (DMatrix<f64>, bool) {
     let mut h = DMatrix::from_row_slice(n, n, hess);
     h = (&h + h.transpose()) * 0.5;
     if h.clone().cholesky().is_some() {
-        return h;
+        return (h, false);
     }
     let scale = (0..n)
         .map(|i| h[(i, i)].abs())
         .fold(0.0f64, f64::max)
         .max(1e-12);
+    let free: Vec<usize> = (0..n).filter(|&i| !inactive[i]).collect();
+    let mut out = DMatrix::zeros(n, n);
+    for i in 0..n {
+        if inactive[i] {
+            out[(i, i)] = h[(i, i)].abs().max(1e-8 * scale);
+        }
+    }
+    let mut floored = false;
+    if !free.is_empty() {
+        let m = free.len();
+        let sub = DMatrix::from_fn(m, m, |a, b| h[(free[a], free[b])]);
+        let fixed = if sub.clone().cholesky().is_some() {
+            sub
+        } else {
+            floored = true;
+            saddle_free(&sub, floor)
+        };
+        for a in 0..m {
+            for b in 0..m {
+                out[(free[a], free[b])] = fixed[(a, b)];
+            }
+        }
+    }
+    if out.clone().cholesky().is_some() {
+        return (out, floored);
+    }
+    // rounding left it indefinite: the diagonal shift
     let mut tau = 1e-8 * scale;
     loop {
-        let mut ht = h.clone();
+        let mut ht = out.clone();
         for i in 0..n {
             ht[(i, i)] += tau;
         }
         if ht.clone().cholesky().is_some() {
-            return ht;
+            return (ht, floored);
         }
         tau *= 10.0;
     }
+}
+
+/// Negative and small eigenvalues raised to `floor` times the largest.
+/// Along a direction of negative curvature of the smooth part the model
+/// then prescribes a long step, which the line search cuts if the penalty
+/// does not make the objective rise; replacing the eigenvalue by its
+/// absolute value instead (the saddle-free rule) prescribes a short one and
+/// the solves crawl. The solve adapts `floor` to the agreement between the
+/// model's predicted decrease and the actual one.
+fn saddle_free(h: &DMatrix<f64>, floor: f64) -> DMatrix<f64> {
+    let eig = nalgebra::SymmetricEigen::new(h.clone());
+    let lmax = eig
+        .eigenvalues
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
+    let floor = floor * lmax;
+    let d = DMatrix::from_diagonal(&eig.eigenvalues.map(|v| v.max(floor)));
+    let fixed = &eig.eigenvectors * d * eig.eigenvectors.transpose();
+    (&fixed + fixed.transpose()) * 0.5
 }
 
 /// Minimise `gᵀ(z−θ) + ½(z−θ)ᵀH(z−θ) + λ Σ w_g φ_g(z)` by FISTA with
