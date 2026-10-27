@@ -458,7 +458,7 @@ truth's own data):
 | γ-rot ×3, 5, 2000 | 0.453 (gain −22; truth's basis 0.346, +43) | 0.379 (+6) | 0.601 |
 | γ-rot ×3, 8, 2000 | 0.720 (122; truth's basis 0.703) | 0.687 (136) | 0.594 |
 | spectral ×3, 5, 2000 | 0.373 (26) | 0.338 (52; truth's basis 0.363, 53; from the truth 0.327, 53) | 0.407 |
-| spectral ×3, 8, 2000 | 0.771 (181); agLASSO eigen parts 0.487, groups 0.538, aLASSO 0.481 | 0.767 (187; truth's basis 0.757, 186); aLASSO 0.449, agLASSO 0.602 | 0.536; aLASSO 0.509, agLASSO 0.536 |
+| spectral ×3, 8, 2000 | 0.771 (181); agLASSO eigen parts 0.481, groups 0.536, aLASSO 0.469 | 0.767 (187; truth's basis 0.757, 186); aLASSO 0.433, agLASSO 0.586 | 0.536; aLASSO 0.509, agLASSO 0.536 |
 | spectral ×3, 5, 500 | 0.773; agLASSO groups 0.450, eigen parts 0.475, aLASSO 0.535 | 0.832; agLASSO 0.552, aLASSO 0.496 | 0.633; aLASSO 0.587, agLASSO 0.688 |
 
 So the ordering problem is gone: on spectral data the default basis
@@ -473,8 +473,10 @@ is not solved by any eigen chart is the crossing regime at `d = 8`
 identifiable coordinates win the full-model comparison there (0.54
 against 0.77); the penalties recover the eigen charts: at `d = 8`,
 `n = 2000` on spectral data the spectral adaptive LASSO is the most
-accurate model (0.449), then γ-rot's adaptive LASSO and eigen-part group
-LASSO (0.481, 0.487), then the log-tangent's (0.509). The spectral chart's
+accurate model (0.433), then γ-rot's adaptive LASSO and eigen-part group
+LASSO (0.469, 0.481), then the log-tangent's (0.509); the penalized paths
+take 12–22 s (γ-rot) and 16–29 s (spectral) against the log-tangent's
+1.2–2.6 s. The spectral chart's
 two eigen parts (all log-eigenvalues as one group, the whole rotation as
 another) are a coarse grouping: 0.552 at `d = 5`, `n = 500` with one
 active group, against γ-rot's finer `(κ_j, ω_j)` groups at 0.450; at
