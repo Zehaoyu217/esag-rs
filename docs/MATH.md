@@ -409,6 +409,57 @@ fresh points; one core per fit; log-tangent in parentheses).**
   BIC selects at moderate `λ`, where the solves converge, so the selected
   fits are unaffected. The large-`λ` solves are the open item.
 
+**The spectral chart (`src/spectral.rs`, `Shape::Spectral`): the
+eigen-decomposition itself, ordering-free.** `W = R diag(e^ℓ) Rᵀ` with
+`ℓ` the log-eigenvalues (sum zero; `p − 1` Helmert coordinates `h`) and
+`R = (I − A/2)⁻¹(I + A/2)` the Cayley transform of a skew-symmetric `A`
+whose strict upper triangle is the remaining `p(p−1)/2` coordinates `a`,
+in the transported frame turned by the basis `R_0` from the pilot (as
+γ-rot). The coordinate vector has the same length as the other shapes'.
+Every axis enters alike: relabelling the frame's axes (`R_0 ↦ R_0 P`)
+permutes the rows of `ℓ` and conjugates `A`, both linear maps of the
+coordinates, so the regression model class is the same for every
+labelling, which γ-rot's is not. The map is `C^∞` with flat directions at
+exact ties (one per tied pair) and at isotropy (every `a`), no
+wrap-around (each plane turns by less than π), and the sign gauge of the
+axes resolved by the proper rotation of largest trace. Reverse-mode
+kernel: 54 / 115 / 224 / 339 ns per observation at `d = 3 / 5 / 8 / 10`
+(1.1–1.6× γ-rot's, 1.2–8× cheaper than the log-tangent's), bit-identical
+to the generic kernel, gradients agreeing with forward mode to 1e−15; the
+module's tests cover the ties, isotropy, the relabelling gauge, the Cayley
+angle and the serde round trip. Fits use the same pilot, basis, starts and
+`Grouping::EigenParts` (here: the log-eigenvalues as one group and the
+rotation generator as one, per covariate).
+
+Measured against γ-rot and the log-tangent (`gamma_rot_prod`, same cells
+as above; `V̂` error; "gain" the log-likelihood gain over the truth on the
+truth's own data):
+
+| data, d, n | γ-rot | spectral | log-tangent |
+|---|---|---|---|
+| γ, 5, 2000 | 0.285 | 0.281 | 0.277 |
+| γ, 8, 2000 | 0.577 | 0.577 | 0.482 |
+| γ-rot ×3, 5, 2000 | 0.453 (gain −22; truth's basis 0.346, +43) | 0.379 (+6) | 0.601 |
+| γ-rot ×3, 8, 2000 | 0.720 (122; truth's basis 0.703) | 0.687 (136) | 0.594 |
+| spectral ×3, 5, 2000 | 0.373 (26) | 0.338 (52; truth's basis 0.363, 53; from the truth 0.327, 53) | 0.407 |
+| spectral ×3, 8, 2000 | 0.771 (181) | 0.767 (187; truth's basis 0.757, 186) | 0.536 |
+| spectral ×3, 5, 500 | 0.773; agLASSO groups 0.450, eigen parts 0.475, aLASSO 0.535 | 0.832; agLASSO 0.552, aLASSO 0.496 | 0.633; aLASSO 0.587, agLASSO 0.688 |
+
+So the ordering problem is gone: on spectral data the default basis
+reaches the regular maximum (gain 52 against 53 from the truth's basis
+and 53 from the truth) where γ-rot's default sat 65 below the truth's
+basis on its own data; and on γ-rot's data the spectral fit, which knows
+neither the basis nor the order, is closer to the truth's-basis γ-rot
+fit than γ-rot's own default. The two eigen charts agree on γ data. What
+is not solved by any eigen chart is the crossing regime at `d = 8`
+(eigenvalues crossing for most of the covariate range): both overfit
+(gains 180 against `K/2 = 105`) and the log-tangent's smooth, first-order
+identifiable coordinates win the full-model comparison there (0.54
+against 0.77); the penalties recover the eigen charts (above, and the
+`d = 8` spectral cell in `gamma_rot_prod`). At `n = 500` the finer
+γ-rot grouping (each `(κ_j, ω_j)`) selects best (0.450) and the spectral
+chart's two coarse parts less well (0.552; its adaptive LASSO 0.496).
+
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
 mean direction, cannot move that set away from the data. With the mean

@@ -1025,14 +1025,16 @@ impl Prepared {
                     .collect()
             }
             Grouping::EigenParts => {
-                if cfg.shape != Shape::GammaRot {
+                if !matches!(cfg.shape, Shape::GammaRot | Shape::Spectral) {
                     return Err(EsagError::Data(
-                        "Grouping::EigenParts needs Shape::GammaRot".into(),
+                        "Grouping::EigenParts needs Shape::GammaRot or Shape::Spectral".into(),
                     ));
                 }
-                // per column: group 1 (Paine's pair) as one group; for each
-                // group j >= 2 its eigenvalue coordinate kappa_j alone and its
-                // rotation vector omega_j as one group
+                // gamma-rot, per column: group 1 (Paine's pair) as one group;
+                // for each group j >= 2 its eigenvalue coordinate kappa_j alone
+                // and its rotation vector omega_j as one group.
+                // spectral, per column: the log-eigenvalues (d − 2 Helmert
+                // coordinates) as one group and the rotation generator as one.
                 (0..pt)
                     .flat_map(|j| {
                         let tg = &target;
@@ -1041,6 +1043,10 @@ impl Prepared {
                                 .map(|k| idx(k, j))
                                 .collect::<Vec<usize>>()
                         };
+                        if cfg.shape == Shape::Spectral {
+                            let p = d - 1;
+                            return vec![pick(d..d + p - 1), pick(d + p - 1..bd)];
+                        }
                         let mut gs = vec![pick(d..d + 2)];
                         for jg in 2..=d - 2 {
                             let start = d + jg * (jg + 1) / 2 - 1;

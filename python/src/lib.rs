@@ -36,9 +36,10 @@ fn shape_of(s: &str) -> PyResult<Shape> {
         "gamma" => Ok(Shape::Gamma),
         "gamma-transported" | "gt" => Ok(Shape::GammaTransported),
         "gamma-rot" | "gammarot" | "gr" => Ok(Shape::GammaRot),
+        "spectral" | "spec" | "sp" => Ok(Shape::Spectral),
         "log-tangent" | "logtangent" | "lt" => Ok(Shape::LogTangent),
         other => Err(err(format!(
-            "unknown shape {other:?} (gamma, gamma-rot, gamma-transported, log-tangent)"
+            "unknown shape {other:?} (gamma, gamma-rot, spectral, gamma-transported, log-tangent)"
         ))),
     }
 }
@@ -239,15 +240,23 @@ fn param_rows(d: usize, shape: &str) -> PyResult<Vec<String>> {
     if d < 2 {
         return Err(err("d must be at least 2"));
     }
-    let tag = match shape_of(shape)? {
+    let shape = shape_of(shape)?;
+    let g = esag::dims::gamma_len(d);
+    let mu = (0..d).map(|k| format!("mu[{}]", k + 1));
+    if shape == Shape::Spectral {
+        // the log-eigenvalues' Helmert coordinates, then the rotation generator
+        let p = d - 1;
+        return Ok(mu
+            .chain((0..p - 1).map(|k| format!("h[{}]", k + 1)))
+            .chain((0..g - (p - 1)).map(|k| format!("a[{}]", k + 1)))
+            .collect());
+    }
+    let tag = match shape {
         Shape::Gamma | Shape::GammaTransported | Shape::GammaRot => "gamma",
         Shape::LogTangent => "s",
+        Shape::Spectral => unreachable!(),
     };
-    let g = esag::dims::gamma_len(d);
-    Ok((0..d)
-        .map(|k| format!("mu[{}]", k + 1))
-        .chain((0..g).map(|k| format!("{tag}[{}]", k + 1)))
-        .collect())
+    Ok(mu.chain((0..g).map(|k| format!("{tag}[{}]", k + 1))).collect())
 }
 
 /// Load a fitted model from JSON (as written by `Results.to_json`).
@@ -367,7 +376,12 @@ impl PyResults {
     /// the other shapes).
     #[getter]
     fn rot_basis(&self) -> Option<Vec<Vec<f64>>> {
-        self.inner.gr_frame().and_then(|f| f.basis()).map(|r0| {
+        let basis = self
+            .inner
+            .gr_frame()
+            .and_then(|f| f.basis())
+            .or_else(|| self.inner.sp_frame().and_then(|f| f.basis()));
+        basis.map(|r0| {
             (0..r0.nrows())
                 .map(|r| (0..r0.ncols()).map(|c| r0[(r, c)]).collect())
                 .collect()

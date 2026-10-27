@@ -77,6 +77,16 @@ pub enum Shape {
     /// everywhere: no cliffs, no non-regular suprema, and zero groups are
     /// ordinary points (`docs/MATH.md` §2).
     GammaRot,
+    /// The eigen-decomposition of the tangent covariance as the parameters
+    /// ([`crate::spectral`]): `W = R diag(e^ℓ) Rᵀ` with the log-eigenvalues
+    /// `ℓ` (sum zero, Helmert coordinates) and one rotation `R`, the Cayley
+    /// transform of a skew-symmetric generator, in the tangent frame
+    /// transported from a reference direction and turned by a basis
+    /// rotation from a pilot fit. Every axis enters alike, so unlike `gamma`
+    /// and `gamma-rot` the regression model does not depend on how the axes
+    /// are ordered; it is smooth everywhere, with flat directions at exact
+    /// ties and at isotropy (`docs/MATH.md` §2).
+    Spectral,
 }
 
 /// How the optimiser is initialised.
@@ -326,26 +336,41 @@ impl EsagRegressor {
                 Shape::GammaTransported => data.gt = Some(LtFrame::new(&m)),
                 Shape::GammaRot => {
                     let fr = crate::gamma_rot::GrFrame::new(&m, self.rot_link);
-                    let r0 = match &self.rot_basis {
-                        Some(r0) => {
-                            let p = data.d - 1;
-                            if r0.nrows() != p || r0.ncols() != p {
-                                return Err(EsagError::Shape(format!(
-                                    "rot_basis must be {p}×{p}, got {}×{}",
-                                    r0.nrows(),
-                                    r0.ncols()
-                                )));
-                            }
-                            r0.clone()
-                        }
-                        None => rot_basis_from_moments(&fr, &data),
-                    };
+                    let r0 = self.resolve_basis(&data, &|mu| fr.tangent_frame(mu))?;
                     data.gr = Some(fr.with_basis(&r0));
+                }
+                Shape::Spectral => {
+                    let fr = crate::spectral::SpFrame::new(&m);
+                    let r0 = self.resolve_basis(&data, &|mu| fr.tangent_frame(mu))?;
+                    data.sp = Some(fr.with_basis(&r0));
                 }
                 Shape::Gamma => {}
             }
         }
         Ok(data)
+    }
+
+    /// The basis rotation of an eigen chart: the configured one (checked),
+    /// or the eigenframe of the moment estimate in the frame `xi_at(μ̂)`.
+    fn resolve_basis(
+        &self,
+        data: &RegressionData,
+        xi_at: &dyn Fn(&[f64]) -> DMatrix<f64>,
+    ) -> Result<DMatrix<f64>> {
+        match &self.rot_basis {
+            Some(r0) => {
+                let p = data.d - 1;
+                if r0.nrows() != p || r0.ncols() != p {
+                    return Err(EsagError::Shape(format!(
+                        "rot_basis must be {p}×{p}, got {}×{}",
+                        r0.nrows(),
+                        r0.ncols()
+                    )));
+                }
+                Ok(r0.clone())
+            }
+            None => Ok(rot_basis_from_moments(xi_at, data)),
+        }
     }
 
     pub fn with_feature_names(mut self, names: Vec<String>) -> Self {
@@ -363,7 +388,10 @@ impl EsagRegressor {
         // Gamma-rot with covariates: a pilot log-tangent fit (smooth, one
         // start) gives the basis rotation, unless one is set, and a start
         // (`rot_informed_start`).
-        if self.shape == Shape::GammaRot && matches!(self.init, Init::Auto) && x.ncols() > 0 {
+        if matches!(self.shape, Shape::GammaRot | Shape::Spectral)
+            && matches!(self.init, Init::Auto)
+            && x.ncols() > 0
+        {
             let mut cfg = self.clone();
             cfg.shape = Shape::LogTangent;
             cfg.compute_hessian = false;
@@ -406,7 +434,7 @@ impl EsagRegressor {
         // (one of them converged there) and trapped in 10.
         let lt_start = (data.lt.is_none()
             && data.gt.is_none()
-            && data.gr.is_none()
+            && data.eigen_chart().is_none()
             && data.p > 0
             && matches!(self.init, Init::Auto))
         .then(|| self.lt_informed_start(x, y, &data, &mask))
@@ -417,7 +445,7 @@ impl EsagRegressor {
         // Gamma-rot with covariates: the least-squares start from the pilot
         // log-tangent fit's V̂(x_i), raced with the moment and R-style starts
         // (the likelihood has several regular maxima; `docs/MATH.md` §2)
-        if let (Some(p), Some(_)) = (pilot, &data.gr) {
+        if let (Some(p), Some(_)) = (pilot, data.eigen_chart()) {
             match self.rot_informed_start(p, &data, &mask) {
                 Some(s) => starts.push(s),
                 None => {
@@ -640,7 +668,7 @@ impl EsagRegressor {
         data: &RegressionData,
         mask: &DMatrix<bool>,
     ) -> Option<DMatrix<f64>> {
-        let fr = data.gr.as_ref()?;
+        let fr = data.eigen_chart()?;
         let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
         let p = d - 1;
         let g = bd - d;
@@ -848,7 +876,7 @@ impl EsagRegressor {
         best: &RawFit,
         mask: &DMatrix<bool>,
     ) -> Option<(RawFit, Vec<usize>)> {
-        if data.lt.is_some() || data.gt.is_some() || data.gr.is_some() {
+        if data.smooth() || data.gt.is_some() {
             return None;
         }
         let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
@@ -1508,17 +1536,17 @@ impl EsagRegressor {
             }
             Init::DataDriven | Init::Auto => {
                 let (mu0, gamma0) = moment_start(&data.y, data.n, d);
-                let shape0 = match (&data.lt, &data.gr) {
+                let shape0 = match (&data.lt, data.eigen_chart()) {
                     (None, None) => gamma0,
                     (Some(fr), _) => {
                         let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
                         let v = DMatrix::from_row_slice(d, d, &v);
                         crate::logtangent::s_from_covariance(fr, &mu0, &v)
                     }
-                    (None, Some(fr)) => {
+                    (None, Some(ch)) => {
                         let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
                         let v = DMatrix::from_row_slice(d, d, &v);
-                        fr.coords_from_covariance(&mu0, &v)
+                        ch.coords_from_covariance(&mu0, &v)
                     }
                 };
                 for k in 0..d {
@@ -2007,9 +2035,9 @@ impl EsagRegressor {
         if let Some(fr) = data.lt.as_ref().or(data.gt.as_ref()) {
             config.lt_reference = Some(fr.reference().to_vec());
         }
-        if let Some(fr) = &data.gr {
-            config.lt_reference = Some(fr.lt_frame().reference().to_vec());
-            config.rot_basis = fr.basis();
+        if let Some(ch) = data.eigen_chart() {
+            config.lt_reference = Some(ch.reference().to_vec());
+            config.rot_basis = ch.basis();
         }
         config.precondition = None;
         config.local_precondition = false;
@@ -2093,12 +2121,15 @@ fn mean_direction(y: &[f64], n: usize, d: usize) -> Vec<f64> {
 /// frame (eigenvalues ascending, determinant +1). In that basis the moment
 /// estimate has every axis at its pole (`ω_j = 0`), so the regression's
 /// rotation vectors describe turns away from the pooled shape.
-fn rot_basis_from_moments(fr: &crate::gamma_rot::GrFrame, data: &RegressionData) -> DMatrix<f64> {
+fn rot_basis_from_moments(
+    xi_at: &dyn Fn(&[f64]) -> DMatrix<f64>,
+    data: &RegressionData,
+) -> DMatrix<f64> {
     let (d, n) = (data.d, data.n);
     let (mu0, gamma0) = moment_start(&data.y, n, d);
     let v = Frame::new(&mu0, &gamma0).cov_pow(1.0);
     let v = DMatrix::from_row_slice(d, d, &v);
-    eigen_basis(fr, &mu0, &v)
+    eigen_basis(&xi_at(&mu0), &v)
 }
 
 /// The basis rotation of a [`Shape::GammaRot`] fit from a pilot log-tangent
@@ -2117,7 +2148,6 @@ fn rot_basis_from_pilot(
         Some(m) if m.len() == d => m.clone(),
         _ => mean_direction(&data.y, n, d),
     };
-    let fr = crate::gamma_rot::GrFrame::new(&m, cfg.rot_link);
     let xbar: Vec<f64> = (0..pt)
         .map(|c| (0..n).map(|i| data.x[i * pt + c]).sum::<f64>() / n as f64)
         .collect();
@@ -2126,15 +2156,16 @@ fn rot_basis_from_pilot(
         .collect();
     let lt = pilot.lt_frame();
     let v = pilot.distribution_at(&eta, lt.as_ref()).ok()?.covariance();
-    let r0 = eigen_basis(&fr, &eta[..d], &v);
+    // the frame without a basis rotation is the same for both eigen charts
+    let xi = crate::spectral::SpFrame::new(&m).tangent_frame(&eta[..d]);
+    let r0 = eigen_basis(&xi, &v);
     r0.iter().all(|v| v.is_finite()).then_some(r0)
 }
 
-/// The eigenvectors of `Ξ(μ̂)ᵀ V Ξ(μ̂)` (eigenvalues ascending, determinant
-/// +1), with `Ξ` the frame `fr` without its basis rotation.
-fn eigen_basis(fr: &crate::gamma_rot::GrFrame, mu: &[f64], v: &DMatrix<f64>) -> DMatrix<f64> {
-    let p = mu.len() - 1;
-    let xi = fr.tangent_frame(mu);
+/// The eigenvectors of `Ξᵀ V Ξ` (eigenvalues ascending, determinant +1),
+/// with `Ξ` a tangent frame without a basis rotation.
+fn eigen_basis(xi: &DMatrix<f64>, v: &DMatrix<f64>) -> DMatrix<f64> {
+    let p = xi.ncols();
     let w = xi.transpose() * v * xi;
     let eig = nalgebra::SymmetricEigen::new((&w + w.transpose()) * 0.5);
     let mut idx: Vec<usize> = (0..p).collect();
@@ -2682,12 +2713,69 @@ pub(crate) struct RegressionData {
     pub gt: Option<LtFrame>,
     /// The frame of [`Shape::GammaRot`] (`None`: another shape).
     pub gr: Option<crate::gamma_rot::GrFrame>,
+    /// The frame of [`Shape::Spectral`] (`None`: another shape).
+    pub sp: Option<crate::spectral::SpFrame>,
     /// Observation weights of the log-likelihood (`None`: all 1), for the
     /// weight homotopy of [`EsagRegressor::homotopy_rounds`].
     pub w: Option<Vec<f64>>,
 }
 
+/// The eigen charts (gamma-rot, spectral) behind one interface: the frame,
+/// the inverse map and the stored conventions.
+#[derive(Clone, Copy)]
+pub(crate) enum EigenChart<'a> {
+    Rot(&'a crate::gamma_rot::GrFrame),
+    Spec(&'a crate::spectral::SpFrame),
+}
+
+impl EigenChart<'_> {
+    /// `Ξ(μ̂) R_0`, `d × (d−1)`.
+    pub(crate) fn tangent_frame(&self, mu: &[f64]) -> DMatrix<f64> {
+        match self {
+            EigenChart::Rot(f) => f.tangent_frame(mu),
+            EigenChart::Spec(f) => f.tangent_frame(mu),
+        }
+    }
+    /// Canonical coordinates of `(mu, v)`.
+    pub(crate) fn coords_from_covariance(&self, mu: &[f64], v: &DMatrix<f64>) -> Vec<f64> {
+        match self {
+            EigenChart::Rot(f) => f.coords_from_covariance(mu, v),
+            EigenChart::Spec(f) => f.coords_from_covariance(mu, v),
+        }
+    }
+    /// Coordinates from labelled, signed eigen-axes.
+    pub(crate) fn coords_from_eigen_signed(&self, lam: &[f64], cur: DMatrix<f64>) -> Vec<f64> {
+        match self {
+            EigenChart::Rot(f) => f.coords_from_eigen_signed(lam, cur),
+            EigenChart::Spec(f) => f.coords_from_eigen_signed(lam, cur),
+        }
+    }
+    /// The reference direction `m`.
+    pub(crate) fn reference(&self) -> &[f64] {
+        match self {
+            EigenChart::Rot(f) => f.lt_frame().reference(),
+            EigenChart::Spec(f) => f.lt_frame().reference(),
+        }
+    }
+    /// The basis rotation `R_0`.
+    pub(crate) fn basis(&self) -> Option<DMatrix<f64>> {
+        match self {
+            EigenChart::Rot(f) => f.basis(),
+            EigenChart::Spec(f) => f.basis(),
+        }
+    }
+}
+
 impl RegressionData {
+    /// The eigen chart of the data's shape, if it has one.
+    pub(crate) fn eigen_chart(&self) -> Option<EigenChart<'_>> {
+        match (&self.gr, &self.sp) {
+            (Some(f), _) => Some(EigenChart::Rot(f)),
+            (None, Some(f)) => Some(EigenChart::Spec(f)),
+            (None, None) => None,
+        }
+    }
+
     /// Whether the likelihood's cliffs and traps are handled as such
     /// (restart waves skipped at trapped fits, empirical-information
     /// metric for refits): gamma shape, `d ≥ 5` and covariates. At `d = 4`
@@ -2701,7 +2789,7 @@ impl RegressionData {
     /// A shape whose map is smooth everywhere (log-tangent, gamma-rot): no
     /// singular sets, no traps, no canonical sign of group 1.
     pub(crate) fn smooth(&self) -> bool {
-        self.lt.is_some() || self.gr.is_some()
+        self.lt.is_some() || self.gr.is_some() || self.sp.is_some()
     }
 
     /// Yu & Huang's gamma map, in `onb(mu)` or in the transported frame:
@@ -2774,6 +2862,7 @@ impl RegressionData {
             lt: None,
             gt: None,
             gr: None,
+            sp: None,
             w: None,
         })
     }
@@ -3491,11 +3580,12 @@ fn small_grad_fixed<const BD: usize>(gm: &mut [f64], ge: &[f64], blk: &[f64], pt
 /// parameterization.
 #[inline]
 fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> f64 {
-    match (&data.lt, &data.gt, &data.gr) {
-        (Some(fr), _, _) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
-        (None, Some(fr), _) => crate::gamma_transported::loglik_gt_grad(fr, eta, y, g),
-        (None, None, Some(fr)) => crate::gamma_rot_adjoint::loglik_gr_grad_rev(fr, eta, y, g),
-        (None, None, None) => loglik::loglik_eta_grad(eta, y, g),
+    match (&data.lt, &data.gt, &data.gr, &data.sp) {
+        (Some(fr), _, _, _) => crate::logtangent::loglik_lt_grad(fr, eta, y, g),
+        (None, Some(fr), _, _) => crate::gamma_transported::loglik_gt_grad(fr, eta, y, g),
+        (None, None, Some(fr), _) => crate::gamma_rot_adjoint::loglik_gr_grad_rev(fr, eta, y, g),
+        (None, None, None, Some(fr)) => crate::spectral::loglik_sp_grad(fr, eta, y, g),
+        (None, None, None, None) => loglik::loglik_eta_grad(eta, y, g),
     }
 }
 
@@ -3553,6 +3643,9 @@ fn obs_hessian(
     }
     if let Some(fr) = &data.gr {
         return crate::gamma_rot_adjoint::loglik_gr_hess_fd_rev(fr, eta, y, g, h);
+    }
+    if let Some(fr) = &data.sp {
+        return crate::spectral::loglik_sp_hess_fd(fr, eta, y, g, h);
     }
     if kind == ObsHessian::Differences && data.d >= 4 {
         return crate::hdual::loglik_eta_hess_fd(eta, y, g, h);
@@ -3698,12 +3791,26 @@ pub fn shape_distribution(shape: Shape, lt: Option<&LtFrame>, eta: &[f64]) -> Re
             let v = DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
             Esag::from_covariance(&eta[..d], &v)
         }
-        (Shape::GammaRot, _) => Err(EsagError::Shape(
-            "a gamma-rot distribution needs its frame: use EsagRegressorFit::distribution_at"
+        (Shape::GammaRot | Shape::Spectral, _) => Err(EsagError::Shape(
+            "a gamma-rot or spectral distribution needs its frame: use EsagRegressorFit::distribution_at"
                 .into(),
         )),
         _ => Esag::from_eta(eta),
     }
+}
+
+/// The distribution of one linear predictor of a [`Shape::Spectral`] model
+/// with frame `fr`.
+pub fn spectral_distribution(fr: &crate::spectral::SpFrame, eta: &[f64]) -> Result<Esag> {
+    let d = fr.dim();
+    if eta.len() != dims::eta_len(d) {
+        return Err(EsagError::Shape(format!(
+            "eta has length {} but the frame has d = {d}",
+            eta.len()
+        )));
+    }
+    let v = fr.covariance(&eta[..d], &eta[d..]);
+    Esag::from_covariance(&eta[..d], &v)
 }
 
 /// The distribution of one linear predictor of a [`Shape::GammaRot`] model
@@ -3921,16 +4028,36 @@ impl EsagRegressorFit {
                 Some(fr) => Frame::gamma_rot(&fr, &eta[..d], &eta[d..]),
                 None => Frame::new(&eta[..d], &eta[d..]),
             },
+            (Shape::Spectral, _) => match self.sp_frame() {
+                Some(fr) => Frame::spectral(&fr, &eta[..d], &eta[d..]),
+                None => Frame::new(&eta[..d], &eta[d..]),
+            },
             _ => Frame::new(&eta[..d], &eta[d..]),
         }
     }
 
-    /// The tangent frame of a `Shape::LogTangent`, `Shape::GammaTransported`
-    /// or `Shape::GammaRot` fit (its reference direction).
+    /// The tangent frame of a `Shape::LogTangent`, `Shape::GammaTransported`,
+    /// `Shape::GammaRot` or `Shape::Spectral` fit (its reference direction).
     pub fn lt_frame(&self) -> Option<LtFrame> {
         match (self.config.shape, &self.config.lt_reference) {
-            (Shape::LogTangent | Shape::GammaTransported | Shape::GammaRot, Some(m)) => {
-                Some(LtFrame::new(m))
+            (
+                Shape::LogTangent | Shape::GammaTransported | Shape::GammaRot | Shape::Spectral,
+                Some(m),
+            ) => Some(LtFrame::new(m)),
+            _ => None,
+        }
+    }
+
+    /// The frame of a `Shape::Spectral` fit (reference direction and basis
+    /// rotation); `None` for the other shapes.
+    pub fn sp_frame(&self) -> Option<crate::spectral::SpFrame> {
+        match (self.config.shape, &self.config.lt_reference) {
+            (Shape::Spectral, Some(m)) => {
+                let fr = crate::spectral::SpFrame::new(m);
+                Some(match &self.config.rot_basis {
+                    Some(r0) => fr.with_basis(r0),
+                    None => fr,
+                })
             }
             _ => None,
         }
@@ -3995,6 +4122,12 @@ impl EsagRegressorFit {
                 None => Esag::from_eta(eta),
             };
         }
+        if self.config.shape == Shape::Spectral {
+            return match self.sp_frame() {
+                Some(fr) => spectral_distribution(&fr, eta),
+                None => Esag::from_eta(eta),
+            };
+        }
         shape_distribution(self.config.shape, lt, eta)
     }
 
@@ -4010,6 +4143,7 @@ impl EsagRegressorFit {
         let eta = self.linear_predictor(x)?;
         let lt = self.lt_frame();
         let gr = self.gr_frame();
+        let sp = self.sp_frame();
         let mut out = DVector::zeros(data.n);
         let mut e = vec![0.0; self.b_dim()];
         let mut grad = vec![0.0; self.b_dim()];
@@ -4018,12 +4152,13 @@ impl EsagRegressorFit {
                 e[k] = eta[(i, k)];
             }
             let yi = &data.y[i * self.d..(i + 1) * self.d];
-            out[i] = match (self.config.shape, &lt, &gr) {
-                (Shape::LogTangent, Some(fr), _) => crate::logtangent::loglik_lt(fr, &e, yi),
-                (Shape::GammaTransported, Some(fr), _) => {
+            out[i] = match (self.config.shape, &lt, &gr, &sp) {
+                (Shape::LogTangent, Some(fr), _, _) => crate::logtangent::loglik_lt(fr, &e, yi),
+                (Shape::GammaTransported, Some(fr), _, _) => {
                     crate::gamma_transported::loglik_gt_grad(fr, &e, yi, &mut grad)
                 }
-                (Shape::GammaRot, _, Some(fr)) => crate::gamma_rot::loglik_gr::<f64>(fr, &e, yi),
+                (Shape::GammaRot, _, Some(fr), _) => crate::gamma_rot::loglik_gr::<f64>(fr, &e, yi),
+                (Shape::Spectral, _, _, Some(fr)) => crate::spectral::loglik_sp::<f64>(fr, &e, yi),
                 _ => loglik::loglik_eta(&e, yi),
             };
         }
@@ -4211,6 +4346,7 @@ impl EsagRegressorFit {
             Shape::LogTangent => "log-tangent",
             Shape::GammaTransported => "gamma (transported)",
             Shape::GammaRot => "gamma-rot",
+            Shape::Spectral => "spectral",
         };
         let mut left = vec![
             ("Dep. Variable:".to_string(), dep),
@@ -4325,6 +4461,13 @@ impl EsagRegressorFit {
             let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
             notes.push(format!(
                 "Gamma-rot shape: group 1 is Paine's gamma, group j >= 2 is a log\n    eigenvalue ratio kappa_j (axis j+1 against the geometric mean of the\n    lower axes) and a rotation vector omega_j placing the axis, in the\n    tangent frame transported from m = ({}) and turned by the basis\n    rotation stored with the fit. With covariates the model depends on m\n    and on that basis: pass lt_reference and rot_basis to fit the same\n    model to other data.",
+                m.join(", ")
+            ));
+        }
+        if let (Shape::Spectral, Some(m)) = (self.config.shape, &self.config.lt_reference) {
+            let m: Vec<String> = m.iter().map(|v| format!("{v:.4}")).collect();
+            notes.push(format!(
+                "Spectral shape: the log-eigenvalues of V on the tangent space (h, Helmert\n    coordinates of the sum-zero vector) and one rotation of the eigen-axes\n    (a, the Cayley generator's upper triangle), in the tangent frame\n    transported from m = ({}) and turned by the basis rotation stored\n    with the fit. With covariates the model depends on m and on that\n    basis (not on the order of the axes): pass lt_reference and rot_basis\n    to fit the same model to other data.",
                 m.join(", ")
             ));
         }

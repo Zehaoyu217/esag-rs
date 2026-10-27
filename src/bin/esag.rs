@@ -91,6 +91,9 @@ enum ShapeKind {
     /// gamma made smooth: eigenvalue ratios and rotation vectors per group, in
     /// the transported frame (no singular set; at d = 3 Paine et al.'s gamma)
     GammaRot,
+    /// the eigen-decomposition itself: log-eigenvalues and one rotation of the
+    /// axes (ordering-free, smooth; see docs/MATH.md)
+    Spectral,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -392,6 +395,7 @@ fn run() -> Res<()> {
                     ShapeKind::LogTangent => Shape::LogTangent,
                     ShapeKind::GammaTransported => Shape::GammaTransported,
                     ShapeKind::GammaRot => Shape::GammaRot,
+                    ShapeKind::Spectral => Shape::Spectral,
                 })
                 .fit(&xm, &ym)?;
             outln!("{}", fit.summary());
@@ -548,6 +552,7 @@ fn run() -> Res<()> {
                         ShapeKind::LogTangent => Shape::LogTangent,
                         ShapeKind::GammaTransported => Shape::GammaTransported,
                         ShapeKind::GammaRot => Shape::GammaRot,
+                        ShapeKind::Spectral => Shape::Spectral,
                     })
                 }
             };

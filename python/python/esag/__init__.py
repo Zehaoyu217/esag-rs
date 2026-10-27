@@ -163,8 +163,15 @@ class ESAG:
     exog : (n, p) array-like or None
         Covariates (no constant needed; one is added). ``None`` fits an
         i.i.d. ESAG.
-    shape : {"auto", "gamma-rot", "gamma", "gamma-transported", "log-tangent"}
-        Shape parameterization. ``"gamma-rot"`` (what ``"auto"`` uses) is
+    shape : {"auto", "gamma-rot", "spectral", "gamma", "gamma-transported", "log-tangent"}
+        Shape parameterization. ``"spectral"`` takes the eigen-decomposition
+        of V on the tangent space as the parameters: the log-eigenvalues
+        (``h``, Helmert coordinates of the sum-zero vector) and one rotation
+        of the eigen-axes (``a``, the generator of a Cayley rotation), in the
+        transported frame turned by a basis rotation from a pilot fit. Every
+        axis enters alike, so unlike the gamma family the regression model
+        does not depend on how the axes are ordered; it is smooth
+        everywhere. ``"gamma-rot"`` (what ``"auto"`` uses) is
         Yu & Huang's gamma made smooth: the same groups, each read as a log
         eigenvalue ratio and a rotation vector placing the eigen-axis, in
         the tangent frame transported from the data's mean direction and

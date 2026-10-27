@@ -172,6 +172,36 @@ impl Frame<f64> {
             basis,
         }
     }
+
+    /// The frame of the spectral map ([`crate::spectral`]): the eigen-axes
+    /// are the columns of `Ξ(μ̂) R_0 R` with `R` the chart's rotation, the
+    /// eigenvalues `e^{ℓ}`; `μ̂` last. No eigen-decomposition is needed.
+    pub fn spectral(fr: &crate::spectral::SpFrame, mu: &[f64], gamma: &[f64]) -> Frame<f64> {
+        let d = mu.len();
+        let p = d - 1;
+        let xi = fr.tangent_frame(mu);
+        let u = &xi * fr.rotation(gamma);
+        let mut basis = vec![0.0; d * d];
+        for j in 0..p {
+            for r in 0..d {
+                basis[j * d + r] = u[(r, j)];
+            }
+        }
+        let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for r in 0..d {
+            basis[p * d + r] = if mu_norm > 0.0 {
+                mu[r] / mu_norm
+            } else {
+                fr.lt_frame().reference()[r]
+            };
+        }
+        Frame {
+            d,
+            mu_norm,
+            lambda: fr.eigenvalues(gamma),
+            basis,
+        }
+    }
 }
 
 #[cfg(test)]

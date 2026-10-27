@@ -262,6 +262,17 @@ def test_gamma_rot_fit_at_d4():
     a = esag.ESAG(y, shape="gamma").fit()
     b = esag.ESAG(y, shape="gamma-rot").fit()
     assert abs(a.llf - b.llf) < 1e-6
+    # the spectral shape: log-eigenvalue and rotation coordinates, its own
+    # frame, and the same distribution without covariates
+    s = esag.ESAG(y, x, shape="spectral").fit()
+    assert s.converged and "spectral" in str(s.summary())
+    assert list(s.params.columns) == ["mu[1]", "mu[2]", "mu[3]", "mu[4]", "h[1]", "h[2]", "a[1]", "a[2]", "a[3]"]
+    assert np.asarray(s.rot_basis).shape == (3, 3)
+    s0 = esag.ESAG(y, shape="spectral").fit()
+    assert abs(s0.llf - a.llf) < 1e-6
+    reg = esag.ESAG(y, x, shape="spectral").fit_regularized(
+        "adaptive_group_lasso", groups="eigen_parts", target="shape_slopes")
+    assert reg.params.shape == s.params.shape
 
 
 def test_gamma_transported():

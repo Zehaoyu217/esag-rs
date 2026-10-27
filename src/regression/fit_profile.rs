@@ -151,6 +151,11 @@ pub(crate) fn simulate_with(
                 let v = fr.covariance(&eta[..d], &eta[d..]);
                 Esag::from_covariance(&eta[..d], &v).unwrap()
             }
+            Shape::Spectral => {
+                let fr = crate::spectral::SpFrame::new(m);
+                let v = fr.covariance(&eta[..d], &eta[d..]);
+                Esag::from_covariance(&eta[..d], &v).unwrap()
+            }
         };
         dist.sample_one(&dist.frame(), &mut rng, &mut buf);
         for k in 0..d {
@@ -5179,7 +5184,9 @@ fn gamma_rot_prod() {
     };
     let (d, n, reps) = (env("D", 5), env("N", 2000), env("R", 8) as u64);
     let seed0 = env("SEED0", 1400) as u64;
-    let rot_data = std::env::var("DATA").as_deref() == Ok("rot");
+    let data_kind = std::env::var("DATA").unwrap_or_default();
+    let rot_data = data_kind == "rot";
+    let spec_data = data_kind == "spec";
     let pen = std::env::var("PEN").as_deref() != Ok("0");
     let scale: f64 = std::env::var("SCALE")
         .ok()
@@ -5190,7 +5197,7 @@ fn gamma_rot_prod() {
     } else {
         hard_truth(d)
     };
-    if rot_data && scale != 1.0 {
+    if (rot_data || spec_data) && scale != 1.0 {
         for k in d..b.nrows() {
             for j in 1..b.ncols() {
                 b[(k, j)] *= scale;
@@ -5198,9 +5205,10 @@ fn gamma_rot_prod() {
         }
     }
     let (bd, pt) = (b.nrows(), b.ncols());
-    // the γ-rot truth is read in the frame with reference center(d) and the
-    // identity basis
+    // the γ-rot and spectral truths are read in the frame with reference
+    // center(d) and the identity basis
     let tf = GrFrame::new(&center(d), RotLink::Stereo);
+    let tsf = crate::spectral::SpFrame::new(&center(d));
     let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
     let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
         (0..bd)
@@ -5212,6 +5220,8 @@ fn gamma_rot_prod() {
             let e = eta(&b, i);
             if rot_data {
                 tf.covariance(&e[..d], &e[d..])
+            } else if spec_data {
+                tsf.covariance(&e[..d], &e[d..])
             } else {
                 Esag::from_eta(&e).unwrap().covariance()
             }
@@ -5238,14 +5248,16 @@ fn gamma_rot_prod() {
         .map(|seed| {
             let (x, y) = if rot_data {
                 simulate_rot(&b, n, seed, &tf)
+            } else if spec_data {
+                simulate_with(&b, n, seed, Shape::Spectral, 0.5, &center(d))
             } else {
                 simulate(&b, n, seed, Shape::Gamma)
             };
             let mut cells: Vec<Cell> = vec![];
-            // the truth's log-likelihood on this dataset (γ-rot data): the
-            // fit of the true model gains about K/2 over it at a regular
-            // maximum
-            let ll_truth = if rot_data {
+            // the truth's log-likelihood on this dataset (γ-rot or spectral
+            // data): the fit of the true model gains about K/2 over it at a
+            // regular maximum
+            let ll_truth = if rot_data || spec_data {
                 (0..n)
                     .map(|i| {
                         let e: Vec<f64> = (0..bd)
@@ -5255,7 +5267,11 @@ fn gamma_rot_prod() {
                             })
                             .collect();
                         let yi: Vec<f64> = (0..d).map(|k| y[(i, k)]).collect();
-                        crate::gamma_rot::loglik_gr::<f64>(&tf, &e, &yi)
+                        if rot_data {
+                            crate::gamma_rot::loglik_gr::<f64>(&tf, &e, &yi)
+                        } else {
+                            crate::spectral::loglik_sp::<f64>(&tsf, &e, &yi)
+                        }
                     })
                     .sum::<f64>()
             } else {
@@ -5263,6 +5279,7 @@ fn gamma_rot_prod() {
             };
             for (name, shape) in [
                 ("gamma-rot", Shape::GammaRot),
+                ("spectral", Shape::Spectral),
                 ("log-tangent", Shape::LogTangent),
             ] {
                 let t = Instant::now();
@@ -5277,79 +5294,34 @@ fn gamma_rot_prod() {
                     gain,
                 ));
             }
-            if std::env::var("SPEC").is_ok() && d <= 8 {
-                // the spectral prototype (eigenvalues + one rotation e^A,
-                // forward-mode, whitened L-BFGS): the ordering-free eigen chart
-                let t = Instant::now();
-                let yv: Vec<f64> = (0..n)
-                    .flat_map(|i| (0..d).map(move |k| (i, k)))
-                    .map(|(i, k)| y[(i, k)])
-                    .collect();
-                let (mu0, g0) = moment_start(&yv, n, d);
-                let v0 = Esag::new(&mu0, &g0).unwrap().covariance();
-                let nm = mu0.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let m: Vec<f64> = mu0.iter().map(|v| v / nm).collect();
-                let lt = crate::logtangent::LtFrame::new(&m);
-                let p = d - 1;
-                let e = DMatrix::from_column_slice(d, p, lt.tangent_basis());
-                let tb = e.transpose() * &v0 * &e;
-                let eig = nalgebra::SymmetricEigen::new((&tb + tb.transpose()) * 0.5);
-                let mut w = eig.eigenvectors.clone();
-                if w.determinant() < 0.0 {
-                    for r in 0..p {
-                        w[(r, 0)] = -w[(r, 0)];
-                    }
-                }
-                let r0: Vec<f64> = (0..p)
-                    .flat_map(|r| (0..p).map(move |c| (r, c)))
-                    .map(|(r, c)| w[(r, c)])
-                    .collect();
-                let sfr = SpFrame { lt, r0 };
-                let ell: Vec<f64> = eig.eigenvalues.iter().map(|l| l.ln()).collect();
-                let mean = ell.iter().sum::<f64>() / p as f64;
-                let ell: Vec<f64> = ell.iter().map(|l| l - mean).collect();
-                let mut start = vec![0.0; bd * pt];
-                start[..d].copy_from_slice(&mu0);
-                for mm in 1..p {
-                    let h = 1.0 / ((mm * (mm + 1)) as f64).sqrt();
-                    start[d + mm - 1] =
-                        (0..mm).map(|k| ell[k] * h).sum::<f64>() - ell[mm] * mm as f64 * h;
-                }
-                let kg = |eta: &[f64], yi: &[f64], g: &mut [f64]| sp_grad(&sfr, eta, yi, g);
-                let (c, conv, _it) = fit_kernel(&kg, start, &x, &y);
-                let ms = t.elapsed().as_secs_f64() * 1e3;
-                let err = (0..200)
-                    .map(|i| geodesic(&vtrue[i], &sp_covariance(&sfr, &eta(&c, i))))
-                    .sum::<f64>()
-                    / 200.0;
-                cells.push((
-                    "spectral (prototype), full model".to_string(),
-                    conv,
-                    ms,
-                    err,
-                    f64::NAN,
-                ));
-            }
-            if rot_data {
+            if rot_data || spec_data {
                 // the same model class as the truth (its basis, the identity),
                 // from the default starts, and from the truth itself
+                let (shape, label) = if rot_data {
+                    (Shape::GammaRot, "gamma-rot")
+                } else {
+                    (Shape::Spectral, "spectral")
+                };
                 let eye = DMatrix::identity(d - 1, d - 1);
-                for (name, init) in [
-                    ("gamma-rot, full model, truth's basis", Init::Auto),
-                    (
-                        "gamma-rot, full model, from the truth",
-                        Init::Custom(b.clone()),
-                    ),
+                for (what, init) in [
+                    ("truth's basis", Init::Auto),
+                    ("from the truth", Init::Custom(b.clone())),
                 ] {
                     let t = Instant::now();
-                    let f = config(d, Shape::GammaRot)
+                    let f = config(d, shape)
                         .with_init(init)
                         .with_rot_basis(Some(eye.clone()))
                         .fit(&x, &y)
                         .unwrap();
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     let gain = f.log_likelihood - ll_truth;
-                    cells.push((name.to_string(), f.converged, ms, score(&f), gain));
+                    cells.push((
+                        format!("{label}, full model, {what}"),
+                        f.converged,
+                        ms,
+                        score(&f),
+                        gain,
+                    ));
                 }
             }
             if pen {
@@ -5369,6 +5341,16 @@ fn gamma_rot_prod() {
                     (
                         "gamma-rot, adaptive LASSO",
                         PenalizedEsag::adaptive_lasso().shape(Shape::GammaRot),
+                    ),
+                    (
+                        "spectral, adaptive group LASSO (eigen parts)",
+                        PenalizedEsag::adaptive_group_lasso()
+                            .grouping(Grouping::EigenParts)
+                            .shape(Shape::Spectral),
+                    ),
+                    (
+                        "spectral, adaptive LASSO",
+                        PenalizedEsag::adaptive_lasso().shape(Shape::Spectral),
                     ),
                     (
                         "log-tangent, adaptive LASSO",
@@ -5443,6 +5425,8 @@ fn gamma_rot_prod() {
         },
         if rot_data {
             format!("gamma-rot (shape slopes x{scale})")
+        } else if spec_data {
+            format!("spectral (shape slopes x{scale})")
         } else {
             "gamma".to_string()
         },

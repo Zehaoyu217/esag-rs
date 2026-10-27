@@ -672,7 +672,21 @@ the log-tangent family, n = 2000). What remains: the model depends on the
 axis ordering and basis stored with the fit (`rot_basis`, `lt_reference`),
 rotation slopes of nearly tied axes are weakly identified (regularize, as
 above), and its penalized paths are slow at d = 8 (about a minute).
-`docs/MATH.md` §2 has the map, the measurements and the open items.
+
+**`Shape::Spectral` (Python `shape="spectral"`) removes the ordering
+dependence.** It takes the eigen-decomposition itself as the parameters:
+the log-eigenvalues of V on the tangent space (Helmert coordinates `h`)
+and one rotation of the eigen-axes (the Cayley generator `a`), in the same
+transported frame and pilot basis. Every axis enters alike, so relabelling
+the axes is a linear change of coordinates and the regression model class
+is the same for every ordering; the map is smooth, with flat directions
+only at exact ties and at isotropy. Its kernel costs 1.1–1.6× γ-rot's. On
+its own data the default fit reaches the regular maximum (likelihood gain
+52 against 53 from the truth's basis), where γ-rot's default sat 65 below
+on its data; on γ data the two eigen charts agree (0.281 vs 0.285 at
+d = 5, 0.577 vs 0.577 at d = 8). `Grouping::EigenParts` penalizes its
+eigenvalue and rotation parts separately. `docs/MATH.md` §2 has the map,
+the measurements and the open items.
 
 `γ ↦ V` is discontinuous wherever a group `j ≥ 2`, or the last two entries
 of such a group, vanish while lower groups do not: approaching such a point
