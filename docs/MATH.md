@@ -442,7 +442,7 @@ truth's own data):
 | γ-rot ×3, 5, 2000 | 0.453 (gain −22; truth's basis 0.346, +43) | 0.379 (+6) | 0.601 |
 | γ-rot ×3, 8, 2000 | 0.720 (122; truth's basis 0.703) | 0.687 (136) | 0.594 |
 | spectral ×3, 5, 2000 | 0.373 (26) | 0.338 (52; truth's basis 0.363, 53; from the truth 0.327, 53) | 0.407 |
-| spectral ×3, 8, 2000 | 0.771 (181) | 0.767 (187; truth's basis 0.757, 186) | 0.536 |
+| spectral ×3, 8, 2000 | 0.771 (181); agLASSO eigen parts 0.487, groups 0.538, aLASSO 0.481 | 0.767 (187; truth's basis 0.757, 186); aLASSO 0.449, agLASSO 0.602 | 0.536; aLASSO 0.509, agLASSO 0.536 |
 | spectral ×3, 5, 500 | 0.773; agLASSO groups 0.450, eigen parts 0.475, aLASSO 0.535 | 0.832; agLASSO 0.552, aLASSO 0.496 | 0.633; aLASSO 0.587, agLASSO 0.688 |
 
 So the ordering problem is gone: on spectral data the default basis
@@ -455,10 +455,15 @@ is not solved by any eigen chart is the crossing regime at `d = 8`
 (eigenvalues crossing for most of the covariate range): both overfit
 (gains 180 against `K/2 = 105`) and the log-tangent's smooth, first-order
 identifiable coordinates win the full-model comparison there (0.54
-against 0.77); the penalties recover the eigen charts (above, and the
-`d = 8` spectral cell in `gamma_rot_prod`). At `n = 500` the finer
-γ-rot grouping (each `(κ_j, ω_j)`) selects best (0.450) and the spectral
-chart's two coarse parts less well (0.552; its adaptive LASSO 0.496).
+against 0.77); the penalties recover the eigen charts: at `d = 8`,
+`n = 2000` on spectral data the spectral adaptive LASSO is the most
+accurate model (0.449), then γ-rot's adaptive LASSO and eigen-part group
+LASSO (0.481, 0.487), then the log-tangent's (0.509). The spectral chart's
+two coarse eigen parts (all log-eigenvalues, the whole rotation) are too
+coarse a grouping (0.602 at `d = 8`, 0.552 at `d = 5`, `n = 500`, one
+active group): penalize its entries, or γ-rot's finer `(κ_j, ω_j)` groups
+(0.450 at `d = 5`, `n = 500`). Penalized eigen-chart paths at `d = 8` take
+one to two minutes for the reason given above.
 
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
