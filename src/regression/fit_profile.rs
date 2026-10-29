@@ -5455,3 +5455,573 @@ fn gamma_rot_prod() {
         );
     }
 }
+
+/// Single-core cost of full fits, stage by stage: the pilot log-tangent fit
+/// (eigen charts), the starts, the race, the rescue and `finalize`, with the
+/// numbers of joint gradient, Hessian and empirical-information
+/// evaluations, and their unit costs at the fitted coefficients.
+/// Env: `D` (list, default `3,5,8`), `N` (2000), `R` (seeds, 4), `SEED0`
+/// (1400), `DATA` = `gamma` (hard truth read as γ, default) | `std`
+/// (standard truth, γ) | `rot` | `spec` (hard truth read as γ-rot or
+/// spectral), `SHAPES` (list of `gr`, `sp`, `lt`, `gamma`, `gt`).
+/// `RAYON_NUM_THREADS=1 cargo test --release --lib fit_speed -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn fit_speed() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let list = |k: &str, v: &str| -> Vec<String> {
+        std::env::var(k)
+            .unwrap_or_else(|_| v.into())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    let ds: Vec<usize> = list("D", "3,5,8")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 4) as u64);
+    let seed0 = env("SEED0", 1400) as u64;
+    let data_kind = std::env::var("DATA").unwrap_or_else(|_| "gamma".into());
+    let shapes: Vec<Shape> = list("SHAPES", "gr,sp,lt,gamma")
+        .iter()
+        .map(|s| match s.as_str() {
+            "gr" => Shape::GammaRot,
+            "sp" => Shape::Spectral,
+            "lt" => Shape::LogTangent,
+            "gamma" => Shape::Gamma,
+            "gt" => Shape::GammaTransported,
+            o => panic!("unknown shape {o}"),
+        })
+        .collect();
+    println!(
+        "data {data_kind}, n = {n}, 5 covariates, seeds {seed0}..{}",
+        seed0 + reps
+    );
+    for &d in &ds {
+        let b = if data_kind == "std" {
+            standard_truth(d, 5)
+        } else {
+            hard_truth(d)
+        };
+        for &shape in &shapes {
+            let mut totals = vec![];
+            for seed in seed0..seed0 + reps {
+                let (x, y) = match data_kind.as_str() {
+                    "rot" => simulate_with(&b, n, seed, Shape::GammaRot, 0.5, &center(d)),
+                    "spec" => simulate_with(&b, n, seed, Shape::Spectral, 0.5, &center(d)),
+                    _ => simulate(&b, n, seed, Shape::Gamma),
+                };
+                let cfg = config(d, shape);
+                stage::take();
+                // `fit`, stage by stage
+                let t = Instant::now();
+                let pilot = if matches!(shape, Shape::GammaRot | Shape::Spectral) {
+                    let mut pc = cfg.clone();
+                    pc.shape = Shape::LogTangent;
+                    pc.compute_hessian = false;
+                    pc.rot_basis = None;
+                    pc.fit(&x, &y).ok()
+                } else {
+                    None
+                };
+                let t_pilot = t.elapsed().as_secs_f64() * 1e3;
+                let (_, cp) = stage::take();
+                let mut me = cfg.clone();
+                if let Some(p) = &pilot {
+                    me.rot_basis = rot_basis_from_pilot(&me, p, &x, &y);
+                }
+                let t = Instant::now();
+                let f = me.fit_with_pilot(&x, &y, pilot.as_ref()).unwrap();
+                let total = t.elapsed().as_secs_f64() * 1e3 + t_pilot;
+                let (st, c) = stage::take();
+                let data = me.data(&x, &y).unwrap();
+                let tg = median_ms(5, || {
+                    std::hint::black_box(joint_loglik_and_grad(&data, &f.coef, false));
+                });
+                let th = median_ms(3, || {
+                    std::hint::black_box(joint_loglik_grad_hess(&data, &f.coef, false));
+                });
+                stage::take();
+                let get = |name: &str| -> f64 {
+                    st.iter()
+                        .filter(|(s, _)| *s == name)
+                        .map(|(_, v)| v * 1e3)
+                        .sum()
+                };
+                println!(
+                    "d={d} {:<11} seed {seed}: total {:7.1} ms = pilot {:6.1} + starts {:6.1} + race {:7.1} + rescue {:6.1} + finalize {:6.1} | evals pilot g{} h{} o{}, fit g{} h{} o{} | unit grad {:.2} ms hess {:.2} ms | conv {} it {} ll {:.2}",
+                    format!("{shape:?}"),
+                    total,
+                    t_pilot,
+                    get("starts"),
+                    get("race"),
+                    get("rescue"),
+                    get("finalize"),
+                    cp[0],
+                    cp[1],
+                    cp[2],
+                    c[0],
+                    c[1],
+                    c[2],
+                    tg,
+                    th,
+                    f.converged,
+                    f.n_iter,
+                    f.log_likelihood,
+                );
+                totals.push(total);
+            }
+            totals.sort_by(f64::total_cmp);
+            println!(
+                "d={d} {:<11} median total {:.1} ms (min {:.1}, max {:.1})",
+                format!("{shape:?}"),
+                totals[totals.len() / 2],
+                totals[0],
+                totals[totals.len() - 1]
+            );
+        }
+    }
+}
+
+/// Per start of an eigen-chart fit (moment, R-style, pilot least squares):
+/// the objective at the start and after plain L-BFGS (as in the race), and
+/// after L-BFGS whitened with the exact information at the start (if
+/// positive definite) or with the empirical information there.
+/// Env as [`fit_speed`] (`SHAPES` of `gr`, `sp`).
+/// `RAYON_NUM_THREADS=1 cargo test --release --lib race_diag -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn race_diag() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let list = |k: &str, v: &str| -> Vec<String> {
+        std::env::var(k)
+            .unwrap_or_else(|_| v.into())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    let ds: Vec<usize> = list("D", "5,8")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 4) as u64);
+    let seed0 = env("SEED0", 1400) as u64;
+    let data_kind = std::env::var("DATA").unwrap_or_else(|_| "gamma".into());
+    for &d in &ds {
+        let b = if data_kind == "std" {
+            standard_truth(d, 5)
+        } else {
+            hard_truth(d)
+        };
+        for shape in list("SHAPES", "gr,sp").iter().map(|s| match s.as_str() {
+            "gr" => Shape::GammaRot,
+            "sp" => Shape::Spectral,
+            o => panic!("unknown shape {o}"),
+        }) {
+            for seed in seed0..seed0 + reps {
+                let (x, y) = match data_kind.as_str() {
+                    "rot" => simulate_with(&b, n, seed, Shape::GammaRot, 0.5, &center(d)),
+                    "spec" => simulate_with(&b, n, seed, Shape::Spectral, 0.5, &center(d)),
+                    _ => simulate(&b, n, seed, Shape::Gamma),
+                };
+                let cfg = config(d, shape);
+                let mut pc = cfg.clone();
+                pc.shape = Shape::LogTangent;
+                pc.compute_hessian = false;
+                pc.rot_basis = None;
+                let pilot = pc.fit(&x, &y).unwrap();
+                let mut me = cfg.clone();
+                me.rot_basis = rot_basis_from_pilot(&me, &pilot, &x, &y);
+                let data = me.data(&x, &y).unwrap();
+                let mask = me.resolve_mask(&data).unwrap();
+                let free = free_params(&mask);
+                let mut starts = vec![];
+                for init in [Init::DataDriven, Init::RStyle] {
+                    let mut b0 = me.clone().with_init(init).initial_coef(&data).unwrap();
+                    zero_fixed(&mut b0, &mask);
+                    starts.push(b0);
+                }
+                if let Some(s) = me.rot_informed_start(&pilot, &data, &mask) {
+                    starts.push(s);
+                }
+                let t = Instant::now();
+                let raced = me.race(&data, &starts, &mask, me.max_iter);
+                let t_race = t.elapsed().as_secs_f64() * 1e3;
+                println!(
+                    "d={d} {shape:?} seed {seed}: race -ll {:.3} it {} ({:.1} ms)",
+                    raced.neg_ll, raced.n_iter, t_race
+                );
+                for (k, s) in starts.iter().enumerate() {
+                    let (f0, _) = joint_loglik_and_grad(&data, s, false);
+                    stage::take();
+                    let t = Instant::now();
+                    let plain = me.optimize(&data, s, &free, me.max_iter);
+                    let t_plain = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, cplain) = stage::take();
+                    let t = Instant::now();
+                    let info = info_precondition(&data, s, &free, false);
+                    let pd = info.is_some();
+                    let metric = info.or_else(|| empirical_precondition(&data, s, &free));
+                    let mut wc = me.clone();
+                    wc.precondition = metric;
+                    let white = wc.optimize(&data, s, &free, me.max_iter);
+                    let t_white = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, cwhite) = stage::take();
+                    let t = Instant::now();
+                    let mut oc = me.clone();
+                    oc.precondition = empirical_precondition(&data, s, &free);
+                    let opg = oc.optimize(&data, s, &free, me.max_iter);
+                    let t_opg = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, copg) = stage::take();
+                    // the empirical information refreshed every METRIC_REFRESH
+                    // iterations
+                    let t = Instant::now();
+                    let mut lc = me.clone();
+                    lc.local_precondition = true;
+                    let loc = lc.optimize(&data, s, &free, me.max_iter);
+                    let t_loc = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, cloc) = stage::take();
+                    let cell = |r: &RawFit, g: usize, o: usize, ms: f64| {
+                        format!(
+                            "{:+8.3} g{:<3} o{:<2} {:6.1} ms{}",
+                            r.neg_ll - raced.neg_ll,
+                            g,
+                            o,
+                            ms,
+                            if r.converged { "" } else { " NO" }
+                        )
+                    };
+                    println!(
+                        "   start {k}: -ll0 {:+10.1} | plain {} | white({}) {} | opg {} | opg/{METRIC_REFRESH} {}",
+                        -f0 - raced.neg_ll,
+                        cell(&plain, cplain[0], cplain[2], t_plain),
+                        if pd { "info" } else { "opg" },
+                        cell(&white, cwhite[0], cwhite[2], t_white),
+                        cell(&opg, copg[0], copg[2], t_opg),
+                        cell(&loc, cloc[0], cloc[2], t_loc),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Race variants of the eigen charts on held-out seeds: per start, the
+/// maximum reached and its cost, with V̂ errors against the truth (mean
+/// geodesic distance over 200 test rows, the truth read as γ).
+/// A: pilot least squares, whitened (refreshed empirical information);
+/// B: moment start, whitened, capped by A; C: R-style, plain, capped;
+/// D: R-style whitened with the empirical information at A's maximum, capped.
+/// Env as [`fit_speed`].
+/// `RAYON_NUM_THREADS=1 cargo test --release --lib race_variants -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn race_variants() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let list = |k: &str, v: &str| -> Vec<String> {
+        std::env::var(k)
+            .unwrap_or_else(|_| v.into())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    let ds: Vec<usize> = list("D", "5,8")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 12) as u64);
+    let seed0 = env("SEED0", 1500) as u64;
+    for &d in &ds {
+        let b = hard_truth(d);
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+        let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+            (0..bd)
+                .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+                .collect()
+        };
+        let vtrue: Vec<DMatrix<f64>> = (0..200)
+            .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+            .collect();
+        for shape in list("SHAPES", "gr,sp").iter().map(|s| match s.as_str() {
+            "gr" => Shape::GammaRot,
+            "sp" => Shape::Spectral,
+            o => panic!("unknown shape {o}"),
+        }) {
+            for seed in seed0..seed0 + reps {
+                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let cfg = config(d, shape);
+                let mut pc = cfg.clone();
+                pc.shape = Shape::LogTangent;
+                pc.compute_hessian = false;
+                pc.rot_basis = None;
+                let pilot = pc.fit(&x, &y).unwrap();
+                let mut me = cfg.clone();
+                me.rot_basis = rot_basis_from_pilot(&me, &pilot, &x, &y);
+                let data = me.data(&x, &y).unwrap();
+                let mask = me.resolve_mask(&data).unwrap();
+                let free = free_params(&mask);
+                let mut s_mom = me
+                    .clone()
+                    .with_init(Init::DataDriven)
+                    .initial_coef(&data)
+                    .unwrap();
+                zero_fixed(&mut s_mom, &mask);
+                let mut s_r = me
+                    .clone()
+                    .with_init(Init::RStyle)
+                    .initial_coef(&data)
+                    .unwrap();
+                zero_fixed(&mut s_r, &mask);
+                let s_ls = me.rot_informed_start(&pilot, &data, &mask).unwrap();
+                // the V̂ error of coefficients c in this fit's frame
+                let fit_of = |c: &DMatrix<f64>| -> f64 {
+                    let raw = RawFit {
+                        coef: c.clone(),
+                        x: free.iter().map(|&(k, j)| c[(k, j)]).collect(),
+                        neg_ll: 0.0,
+                        grad: vec![0.0; free.len()],
+                        grad_norm_inf: 0.0,
+                        n_iter: 0,
+                        n_fev: 0,
+                        status: Status::GradientConverged,
+                        converged: true,
+                    };
+                    let mut nc = me.clone();
+                    nc.compute_hessian = false;
+                    let f = nc.finalize(&data, raw, mask.clone()).unwrap();
+                    let lt = f.lt_frame();
+                    (0..200)
+                        .map(|i| {
+                            geodesic(
+                                &vtrue[i],
+                                &f.distribution_at(&eta(&f.coef, i), lt.as_ref())
+                                    .unwrap()
+                                    .covariance(),
+                            )
+                        })
+                        .sum::<f64>()
+                        / 200.0
+                };
+                let old = me.race(
+                    &data,
+                    &[s_mom.clone(), s_r.clone(), s_ls.clone()],
+                    &mask,
+                    me.max_iter,
+                );
+                let mut lc = me.clone();
+                lc.local_precondition = true;
+                stage::take();
+                let a = lc.optimize(&data, &s_ls, &free, me.max_iter);
+                let (_, ca) = stage::take();
+                let cap = if a.converged {
+                    (2 * a.n_iter).max(a.n_iter + 50)
+                } else {
+                    me.max_iter
+                };
+                let capped = |c: &EsagRegressor, s: &DMatrix<f64>| -> (RawFit, [usize; 3]) {
+                    stage::take();
+                    let mut r = c.optimize(&data, s, &free, cap);
+                    if !r.converged && r.status == Status::MaxIterations && r.neg_ll < a.neg_ll {
+                        let more = c.optimize(&data, &r.coef, &free, me.max_iter - r.n_iter);
+                        r = RawFit {
+                            n_iter: r.n_iter + more.n_iter,
+                            ..more
+                        };
+                    }
+                    (r, stage::take().1)
+                };
+                let (bm, cb) = capped(&lc, &s_mom);
+                let (cr, cc) = capped(&me, &s_r);
+                let mut dc = me.clone();
+                dc.precondition = empirical_precondition(&data, &a.coef, &free);
+                let (dr, cd) = capped(&dc, &s_r);
+                let ref_ll = old.neg_ll;
+                let cell = |r: &RawFit, c: [usize; 3]| {
+                    format!(
+                        "{:+8.2} g{:<4} v{:.3}{}",
+                        ref_ll - r.neg_ll,
+                        c[0],
+                        fit_of(&r.coef),
+                        if r.converged { "" } else { " NO" }
+                    )
+                };
+                println!(
+                    "d={d} {shape:?} seed {seed}: old v{:.3} | A {} | B {} | C {} | D {}",
+                    fit_of(&old.coef),
+                    cell(&a, ca),
+                    cell(&bm, cb),
+                    cell(&cr, cc),
+                    cell(&dr, cd)
+                );
+            }
+        }
+    }
+}
+
+/// Where `finalize` spends its time at the maximum of an eigen-chart fit:
+/// the joint Hessian, its Cholesky factor, the covariance by LU inverse and
+/// by the Cholesky factor, and one joint gradient.
+/// `RAYON_NUM_THREADS=1 D=8 cargo test --release --lib finalize_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn finalize_cost() {
+    let d: usize = std::env::var("D")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    for shape in [Shape::GammaRot, Shape::Spectral, Shape::LogTangent] {
+        let b = hard_truth(d);
+        let (x, y) = simulate(&b, 2000, 1500, Shape::Gamma);
+        let cfg = config(d, shape);
+        let f = cfg.fit(&x, &y).unwrap();
+        let mut me = cfg.clone();
+        me.rot_basis = f.config.rot_basis.clone();
+        let data = me.data(&x, &y).unwrap();
+        let free = f.free.clone();
+        let nf = free.len();
+        let th = median_ms(3, || {
+            std::hint::black_box(joint_loglik_grad_hess_with(
+                &data,
+                &f.coef,
+                false,
+                ObsHessian::Exact,
+            ));
+        });
+        let (_, _, h) = joint_loglik_grad_hess_with(&data, &f.coef, false, ObsHessian::Exact);
+        let full = data.b_dim * data.p_total;
+        let hm = DMatrix::from_fn(nf, nf, |a, c| {
+            let (ka, ja) = free[a];
+            let (kc, jc) = free[c];
+            -h[(ja * data.b_dim + ka) * full + jc * data.b_dim + kc]
+        });
+        let tc = median_ms(5, || {
+            std::hint::black_box(hm.clone().cholesky());
+        });
+        let ti = median_ms(5, || {
+            std::hint::black_box(hm.clone().try_inverse());
+        });
+        let tci = median_ms(5, || {
+            std::hint::black_box(hm.clone().cholesky().map(|c| c.inverse()));
+        });
+        let tg = median_ms(5, || {
+            std::hint::black_box(joint_loglik_and_grad(&data, &f.coef, false));
+        });
+        let to = median_ms(5, || {
+            std::hint::black_box(score_info(&data, &f.coef, &free));
+        });
+        let tp = median_ms(5, || {
+            std::hint::black_box(empirical_precondition(&data, &f.coef, &free));
+        });
+        println!(
+            "d={d} {shape:?} K={nf}: hessian {th:.2} ms, cholesky {tc:.2}, LU inverse {ti:.2}, cholesky inverse {tci:.2}, gradient {tg:.2}, score_info {to:.2}, empirical metric {tp:.2}"
+        );
+    }
+}
+
+/// The pilot's stopping rule (`refit_decrement` of the pilot log-tangent
+/// fit): its cost, and the eigen-chart fit that follows (log-likelihood,
+/// V̂ error against the truth, iterations), per tolerance.
+/// `RAYON_NUM_THREADS=1 D=5,8 R=6 cargo test --release --lib pilot_tolerance -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn pilot_tolerance() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let ds: Vec<usize> = std::env::var("D")
+        .unwrap_or_else(|_| "5,8".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 6) as u64);
+    let seed0 = env("SEED0", 1500) as u64;
+    for &d in &ds {
+        let b = hard_truth(d);
+        let (bd, pt) = (b.nrows(), b.ncols());
+        let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
+        let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+            (0..bd)
+                .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+                .collect()
+        };
+        let vtrue: Vec<DMatrix<f64>> = (0..200)
+            .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+            .collect();
+        for shape in [Shape::GammaRot, Shape::Spectral] {
+            for seed in seed0..seed0 + reps {
+                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let cfg = config(d, shape);
+                let mut cells = vec![];
+                for tol in [1e-6, 1e-4, 1e-3, 1e-2] {
+                    let mut pc = cfg.clone();
+                    pc.shape = Shape::LogTangent;
+                    pc.compute_hessian = false;
+                    pc.rot_basis = None;
+                    pc.refit_decrement = Some(tol);
+                    stage::take();
+                    let t = Instant::now();
+                    let pilot = pc.fit(&x, &y).unwrap();
+                    let tp = t.elapsed().as_secs_f64() * 1e3;
+                    let (_, cp) = stage::take();
+                    let mut me = cfg.clone();
+                    me.rot_basis = rot_basis_from_pilot(&me, &pilot, &x, &y);
+                    let t = Instant::now();
+                    let f = me.fit_with_pilot(&x, &y, Some(&pilot)).unwrap();
+                    let tf = t.elapsed().as_secs_f64() * 1e3;
+                    let lt = f.lt_frame();
+                    let v = (0..200)
+                        .map(|i| {
+                            geodesic(
+                                &vtrue[i],
+                                &f.distribution_at(&eta(&f.coef, i), lt.as_ref())
+                                    .unwrap()
+                                    .covariance(),
+                            )
+                        })
+                        .sum::<f64>()
+                        / 200.0;
+                    cells.push(format!(
+                        "tol {tol:.0e}: pilot {tp:5.1} ms g{} | fit {tf:5.1} ms it {:3} ll {:.3} v {v:.4}",
+                        cp[0], f.n_iter, f.log_likelihood
+                    ));
+                }
+                println!("d={d} {shape:?} seed {seed}:\n   {}", cells.join("\n   "));
+            }
+        }
+    }
+}
+
+#[test]
+fn precondition_from_info_is_the_factor_of_the_inverse() {
+    let n = 7;
+    let a = DMatrix::from_fn(n, n, |i, j| ((i * 3 + j * 5) as f64 * 0.37).sin());
+    let info = &a * a.transpose() + DMatrix::identity(n, n) * 0.5;
+    let l = precondition_from_info(info.clone()).unwrap();
+    let want = precondition_from_cov(&info.clone().try_inverse().unwrap()).unwrap();
+    assert!((&*l - &*want).amax() < 1e-12, "{}", (&*l - &*want).amax());
+    for a in 0..n {
+        for b in a + 1..n {
+            assert_eq!(l[(a, b)], 0.0);
+        }
+    }
+}

@@ -396,6 +396,13 @@ impl EsagRegressor {
             cfg.shape = Shape::LogTangent;
             cfg.compute_hessian = false;
             cfg.rot_basis = None;
+            // The pilot only places the basis and the start: stopped at a
+            // predicted remaining gain of PILOT_DECREMENT (≈ 0.05 standard
+            // errors from its maximum), 2–3 fewer gradients at d = 8, and
+            // the fits that follow did not change (24 of 24 held-out
+            // datasets, d = 5 and 8: log-likelihood within 0.003, V̂ errors
+            // equal to 4 digits; `pilot_tolerance` in `fit_profile.rs`).
+            cfg.refit_decrement = Some(PILOT_DECREMENT);
             if let Ok(pilot) = cfg.fit(x, y) {
                 let mut me = self.clone();
                 if me.rot_basis.is_none() {
@@ -413,6 +420,8 @@ impl EsagRegressor {
         y: &DMatrix<f64>,
         pilot: Option<&EsagRegressorFit>,
     ) -> Result<EsagRegressorFit> {
+        #[cfg(test)]
+        let clock = std::time::Instant::now();
         let data = self.data(x, y)?;
         let mask = self.resolve_mask(&data)?;
         let inits: Vec<Init> = match &self.init {
@@ -498,7 +507,42 @@ impl EsagRegressor {
             && matches!(self.init, Init::Auto)
             && self.n_restarts == 0
             && starts.len() > 1;
-        let mut best = if single {
+        // The eigen charts: the likelihood has several regular maxima where
+        // eigenvalues of V(x) cross within the data, and the higher ones
+        // that a race of the starts finds are fitted to the noise: on 48
+        // held-out datasets (d = 5 and 8) the maximum from the pilot's
+        // least-squares start alone was as close to the true V(x) as the
+        // race's or closer (mean geodesic error 0.538 against 0.544 at
+        // d = 8 for gamma-rot, 0.540 against 0.551 for spectral) and its
+        // likelihood up to 10 lower, while the race's highest maxima missed
+        // V(x) by 0.56–0.59 (`docs/MATH.md` §2, "Starts"). So that start
+        // runs alone, whitened with the empirical information (refreshed),
+        // and the other starts are raced only if it fails the convergence
+        // check; `with_restarts` races every start.
+        let eigen = data.eigen_chart().is_some()
+            && matches!(self.init, Init::Auto)
+            && self.n_restarts == 0
+            && starts.len() > 1;
+        #[cfg(test)]
+        let clock = stage::lap("starts", clock);
+        let mut best = if eigen {
+            let first_at = if starts.len() > inits.len() {
+                inits.len()
+            } else {
+                0
+            };
+            let first = self.single_start(&data, &starts[first_at], &mask);
+            if first.converged || !degenerate_observations(&data, &first.coef).is_empty() {
+                first
+            } else {
+                let rest: Vec<DMatrix<f64>> = (0..starts.len())
+                    .filter(|&k| k != first_at)
+                    .map(|k| starts[k].clone())
+                    .collect();
+                let second = self.race(&data, &rest, &mask, self.max_iter);
+                if second.beats(&first) { second } else { first }
+            }
+        } else if single {
             // whitened with the exact information at the moment start, L-BFGS
             // needs 9–10 evaluations instead of 23–34 (an exact Hessian costs
             // 2–4 gradients)
@@ -551,6 +595,8 @@ impl EsagRegressor {
         } else {
             self.race(&data, &starts, &mask, self.max_iter)
         };
+        #[cfg(test)]
+        let clock = stage::lap("race", clock);
         // Safety net: if no start passed the convergence check (typically an
         // observation pinned at a singular point of the gamma
         // parameterization, see `docs/MATH.md`), race waves of perturbed
@@ -647,7 +693,62 @@ impl EsagRegressor {
                 }
             }
         }
-        self.finalize(&data, best, mask)
+        #[cfg(test)]
+        let clock = stage::lap("rescue", clock);
+        let fit = self.finalize(&data, best, mask);
+        #[cfg(test)]
+        stage::lap("finalize", clock);
+        fit
+    }
+
+    /// One L-BFGS run of an eigen chart from `b0`, whitened with the
+    /// empirical information at its start and refreshed every
+    /// [`METRIC_REFRESH`] iterations (`optimize` with `local_precondition`;
+    /// plain L-BFGS where that information is singular, as at isotropy,
+    /// where the rotation coordinates have no score). As in the
+    /// log-tangent's single start, a fit still running after
+    /// [`DIVERGENCE_CHECK`] iterations whose `V(x_i)` degenerates stops
+    /// there (an unbounded likelihood).
+    fn single_start(
+        &self,
+        data: &RegressionData,
+        b0: &DMatrix<f64>,
+        mask: &DMatrix<bool>,
+    ) -> RawFit {
+        let free = free_params(mask);
+        let mut cfg = self.clone();
+        cfg.local_precondition = true;
+        cfg.precondition = None;
+        let mut best = cfg.optimize(data, b0, &free, self.max_iter.min(DIVERGENCE_CHECK));
+        let (mut it, mut fev) = (best.n_iter, best.n_fev);
+        while !best.converged
+            && it < self.max_iter
+            && best.status == Status::MaxIterations
+            && degenerate_observations(data, &best.coef).is_empty()
+        {
+            let next = cfg.optimize(
+                data,
+                &best.coef,
+                &free,
+                (self.max_iter - it).min(DIVERGENCE_CHECK),
+            );
+            it += next.n_iter;
+            fev += next.n_fev;
+            if next.beats(&best) {
+                best = next;
+            } else {
+                break;
+            }
+        }
+        best.n_iter = it;
+        best.n_fev = fev;
+        if self.verbose {
+            eprintln!(
+                "single start: [{:?} it={} conv={} ll={:.3}]",
+                best.status, best.n_iter, best.converged, -best.neg_ll
+            );
+        }
+        best
     }
 
     /// A gamma-rot start from the pilot log-tangent fit: its mean
@@ -661,7 +762,15 @@ impl EsagRegressor {
     /// With the basis rotation from the same pilot
     /// ([`rot_basis_from_pilot`]) the axes at the mean design row are the
     /// frame's axes. Shape rows are regressed on their free columns only.
-    /// `None` if a covariance or the least squares fail.
+    /// `None` if the pilot is not a log-tangent fit in the chart's
+    /// transported frame (the same reference direction), or if the least
+    /// squares fail.
+    ///
+    /// The pilot's tangent covariance of observation `i` is `exp(S_i)` in
+    /// that frame, and the chart's axes are the frame's turned by the basis
+    /// `R_0`, so the chart's tangent covariance is `R_0ᵀ exp(S_i) R_0`: its
+    /// log-eigenvalues are the eigenvalues of `S_i` and its eigenvectors
+    /// `R_0ᵀ U_i`, from one `(d−1) × (d−1)` eigen-decomposition.
     fn rot_informed_start(
         &self,
         pilot: &EsagRegressorFit,
@@ -672,23 +781,35 @@ impl EsagRegressor {
         let (n, d, bd, pt) = (data.n, data.d, data.b_dim, data.p_total);
         let p = d - 1;
         let g = bd - d;
-        let lt = pilot.lt_frame();
+        let lt = pilot.lt_frame()?;
+        // (the stored reference is renormalized when the frame is rebuilt)
+        let same_reference = lt
+            .reference()
+            .iter()
+            .zip(fr.reference())
+            .all(|(a, b)| (a - b).abs() <= 1e-12);
+        if pilot.config.shape != Shape::LogTangent || !same_reference || pilot.coef.nrows() != bd {
+            return None;
+        }
+        let r0t = fr
+            .basis()
+            .map_or_else(|| DMatrix::identity(p, p), |r| r.transpose());
         let mut cs: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut eta = vec![0.0; bd];
         for i in 0..n {
             let xi = &data.x[i * pt..(i + 1) * pt];
-            let eta: Vec<f64> = (0..bd)
-                .map(|k| (0..pt).map(|c| pilot.coef[(k, c)] * xi[c]).sum())
-                .collect();
-            let v = pilot.distribution_at(&eta, lt.as_ref()).ok()?.covariance();
-            let frame = fr.tangent_frame(&eta[..d]);
-            let w = frame.transpose() * &v * &frame;
-            let eig = nalgebra::SymmetricEigen::new((&w + w.transpose()) * 0.5);
-            let logs: Vec<f64> = eig.eigenvalues.iter().map(|l| l.ln()).collect();
+            for (k, e) in eta.iter_mut().enumerate() {
+                *e = (0..pt).map(|c| pilot.coef[(k, c)] * xi[c]).sum();
+            }
+            let sm = crate::logtangent::s_to_matrix(&eta[d..], p);
+            let eig = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(p, p, &sm));
+            let vecs = &r0t * &eig.eigenvectors;
+            let logs = &eig.eigenvalues;
             let mean = logs.iter().sum::<f64>() / p as f64;
             // greedy matching of eigenvectors to the axes, largest |overlap| first
             let mut pairs: Vec<(f64, usize, usize)> = (0..p)
                 .flat_map(|j| (0..p).map(move |k| (j, k)))
-                .map(|(j, k)| (eig.eigenvectors[(k, j)].abs(), j, k))
+                .map(|(j, k)| (vecs[(k, j)].abs(), j, k))
                 .collect();
             pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
             let mut of_axis = vec![usize::MAX; p];
@@ -704,13 +825,9 @@ impl EsagRegressor {
             for k in 0..p {
                 let j = of_axis[k];
                 lam[k] = (logs[j] - mean).exp();
-                let sgn = if eig.eigenvectors[(k, j)] >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                };
+                let sgn = if vecs[(k, j)] >= 0.0 { 1.0 } else { -1.0 };
                 for r in 0..p {
-                    cur[(r, k)] = sgn * eig.eigenvectors[(r, j)];
+                    cur[(r, k)] = sgn * vecs[(r, j)];
                 }
             }
             let ci = fr.coords_from_eigen_signed(&lam, cur);
@@ -2729,13 +2846,6 @@ pub(crate) enum EigenChart<'a> {
 }
 
 impl EigenChart<'_> {
-    /// `Ξ(μ̂) R_0`, `d × (d−1)`.
-    pub(crate) fn tangent_frame(&self, mu: &[f64]) -> DMatrix<f64> {
-        match self {
-            EigenChart::Rot(f) => f.tangent_frame(mu),
-            EigenChart::Spec(f) => f.tangent_frame(mu),
-        }
-    }
     /// Canonical coordinates of `(mu, v)`.
     pub(crate) fn coords_from_covariance(&self, mu: &[f64], v: &DMatrix<f64>) -> Vec<f64> {
         match self {
@@ -3085,7 +3195,29 @@ fn empirical_precondition(
     free: &[(usize, usize)],
 ) -> Option<Arc<DMatrix<f64>>> {
     let (info, _) = score_info(data, b, free);
-    precondition_from_cov(&info.cholesky()?.inverse())
+    precondition_from_info(info)
+}
+
+/// The lower Cholesky factor `L` of the inverse of a positive definite
+/// information matrix (`L Lᵀ = info⁻¹`), without forming the inverse: with
+/// `J` the reversal permutation and `C` the Cholesky factor of `J info J`,
+/// `L = J C⁻ᵀ J`, one factorization and one triangular inverse (half the
+/// operations of the inverse and its factor; the empirical metric at 210
+/// coefficients took 3.0 ms instead of 3.9).
+fn precondition_from_info(info: DMatrix<f64>) -> Option<Arc<DMatrix<f64>>> {
+    let n = info.nrows();
+    let rev = DMatrix::from_fn(n, n, |a, b| info[(n - 1 - a, n - 1 - b)]);
+    let c = rev.cholesky()?.unpack();
+    let ci = c.solve_lower_triangular(&DMatrix::identity(n, n))?;
+    // L[a][b] = (C⁻ᵀ)[n−1−a][n−1−b] = C⁻¹[n−1−b][n−1−a]
+    let l = DMatrix::from_fn(n, n, |a, b| {
+        if b <= a {
+            ci[(n - 1 - b, n - 1 - a)]
+        } else {
+            0.0
+        }
+    });
+    l.iter().all(|v| v.is_finite()).then(|| Arc::new(l))
 }
 
 /// Index of the pair `(a, b)`, `a ≤ b < n`, in the order
@@ -3110,6 +3242,8 @@ fn score_info(
     free: &[(usize, usize)],
 ) -> (DMatrix<f64>, DVector<f64>) {
     const CHUNK: usize = 256;
+    #[cfg(test)]
+    stage::OPG.fetch_add(1, Ordering::Relaxed);
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     let (nx, nh) = (pt * (pt + 1) / 2, bd * (bd + 1) / 2);
     // c[(η pair, x pair)]; per observation the η products are one
@@ -3175,6 +3309,10 @@ pub(crate) fn precondition_from_cov(cov: &DMatrix<f64>) -> Option<Arc<DMatrix<f6
 /// a start pinned at a singular point of the gamma parameterization reaches
 /// 10⁴–10¹² and does not recover.
 const TRAP_RATIO: f64 = 1e5;
+/// Stopping rule of the eigen charts' pilot log-tangent fit (see
+/// [`EsagRegressor::fit`]); at 1e-2 two of 24 pilots failed the convergence
+/// check and raced their second start.
+const PILOT_DECREMENT: f64 = 1e-3;
 /// Stopping rule of whitened (bootstrap) refits: the predicted remaining
 /// log-likelihood gain `½‖g_z‖²` (whitened with the inverse information).
 /// At 1e-6 every coefficient is within ~0.0014 standard errors of the
@@ -3349,6 +3487,8 @@ fn joint_eval(
     ratio: bool,
     shared: bool,
 ) -> (f64, DMatrix<f64>, f64) {
+    #[cfg(test)]
+    stage::GRADS.fetch_add(1, Ordering::Relaxed);
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     // one eigen-decomposition of the common shape (the intercept column)
     let sh = match &data.lt {
@@ -3671,6 +3811,8 @@ pub(crate) fn joint_loglik_grad_hess_with(
     parallel: bool,
     kind: ObsHessian,
 ) -> (f64, Vec<f64>, Vec<f64>) {
+    #[cfg(test)]
+    stage::HESS.fetch_add(1, Ordering::Relaxed);
     let (d, bd, pt) = (data.d, data.b_dim, data.p_total);
     let full = bd * pt;
     // Unique products x_{j1} x_{j2} (j1 ≤ j2) and unique entries
@@ -4577,6 +4719,44 @@ pub fn gamma_restricted_mask(d: usize, p_total: usize, col: usize) -> DMatrix<bo
         m[(k, col)] = false;
     }
     m
+}
+
+/// Stage timings and evaluation counts of fits, for the speed studies
+/// (test builds only).
+#[cfg(test)]
+pub(crate) mod stage {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    static TIMES: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
+    /// Joint value-and-gradient evaluations.
+    pub(crate) static GRADS: AtomicUsize = AtomicUsize::new(0);
+    /// Joint Hessian evaluations.
+    pub(crate) static HESS: AtomicUsize = AtomicUsize::new(0);
+    /// Empirical-information (outer product of scores) evaluations.
+    pub(crate) static OPG: AtomicUsize = AtomicUsize::new(0);
+
+    /// Record the time since `since` under `name`; returns now.
+    pub(crate) fn lap(name: &'static str, since: Instant) -> Instant {
+        TIMES
+            .lock()
+            .unwrap()
+            .push((name, since.elapsed().as_secs_f64()));
+        Instant::now()
+    }
+
+    /// The recorded stages and the evaluation counts since the last call
+    /// (all reset).
+    pub(crate) fn take() -> (Vec<(&'static str, f64)>, [usize; 3]) {
+        let t = std::mem::take(&mut *TIMES.lock().unwrap());
+        let c = [
+            GRADS.swap(0, Ordering::Relaxed),
+            HESS.swap(0, Ordering::Relaxed),
+            OPG.swap(0, Ordering::Relaxed),
+        ];
+        (t, c)
+    }
 }
 
 #[cfg(test)]
