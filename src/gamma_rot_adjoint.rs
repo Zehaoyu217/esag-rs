@@ -89,10 +89,12 @@
 //! `s̄²` the reverse sweep's adjoint of `s²` and `A`, `B`, `C` vectors made
 //! of `ω`, `x`, `β` and `a′, b′, a″, b″`. The link's second derivatives
 //! are `2a/(4+s²)²` and `2b/(4+s²)²` for `Stereo`; for `Exp`
-//! `−(a + 6a′)/(4s²)` and `(a′/2 − 2b′)/s²` from `s² = 1` on and their
-//! Taylor series below it, where the closed forms cancel. The first
-//! derivatives are the gradient's, with its series branch below
-//! `s² = 10⁻¹⁰`. `log(S_gr e^{−κ_gr}) = Σ_{i≥gr} κ_i/(i+1) − κ_gr` and
+//! `−(a + 6a′)/(4s²)` and `(a′/2 − 2b′)/s²` from `s² = 1` on, and below it
+//! the Hessian takes `a, b, a′, b′, a″, b″` from their Taylor series: the
+//! closed forms cancel (just above the gradient's series branch at
+//! `s² = 10⁻¹⁰`, `b`, `a′` and `b′` lose up to six digits, harmless in the
+//! value and the gradient, which multiply them by `ω` or `s²`, but not in
+//! the group's own block). `log(S_gr e^{−κ_gr}) = Σ_{i≥gr} κ_i/(i+1) − κ_gr` and
 //! `log S_2` are linear in the `κ`, so `∂ō_r/∂κ_i = ō_r (1/(i+1) − δ_ri)`
 //! for `r ≤ i` (0 above): prefix sums over the rows of `∂o`.
 //!
@@ -554,54 +556,101 @@ fn link_derivs(link: RotLink, s2: f64, a: f64, b: f64) -> (f64, f64) {
     }
 }
 
-/// Terms of the series of `(d²a/d(s²)², d²b/d(s²)²)` for the `Exp` link
-/// below `s² = 1` (truncation below `1e−16` relative).
-const EXP_D2_TERMS: usize = 10;
+/// Terms of the series of the `Exp` link's coefficients below `s² = 1`
+/// (truncation below `1e−17` relative).
+const EXP_SERIES_TERMS: usize = 10;
 
-/// `(−1)ⁿ (n+2)(n+1)/(2n+5)!` and `(−1)ⁿ (n+2)(n+1)/(2n+6)!`: the series
-/// `a″(x) = Σ_n c_n xⁿ` of `a = sin √x/√x` and `b″` of `b = (1 − cos √x)/x`.
-const EXP_D2_COEF: [[f64; EXP_D2_TERMS]; 2] = {
-    let mut c = [[0.0; EXP_D2_TERMS]; 2];
+/// Coefficients `c_n` of the series `Σ_n c_n xⁿ` (`x = s²`) of `a`, `b`,
+/// `a′`, `b′`, `a″` and `b″` for `a = sin √x/√x = Σ_k (−1)ᵏ xᵏ/(2k+1)!` and
+/// `b = (1 − cos √x)/x = Σ_k (−1)ᵏ xᵏ/(2k+2)!`.
+const EXP_SERIES: [[f64; EXP_SERIES_TERMS]; 6] = {
+    let mut fact = [1.0; 2 * EXP_SERIES_TERMS + 5];
+    let mut m = 1;
+    while m < fact.len() {
+        fact[m] = fact[m - 1] * m as f64;
+        m += 1;
+    }
+    let mut c = [[0.0; EXP_SERIES_TERMS]; 6];
     let mut n = 0;
-    while n < EXP_D2_TERMS {
-        let mut fa = 1.0; // (2n+5)!
-        let mut k = 2;
-        while k <= 2 * n + 5 {
-            fa *= k as f64;
-            k += 1;
-        }
+    while n < EXP_SERIES_TERMS {
         let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
-        let num = ((n + 2) * (n + 1)) as f64;
-        c[0][n] = sign * num / fa;
-        c[1][n] = sign * num / (fa * (2 * n + 6) as f64);
+        let (n1, n2) = ((n + 1) as f64, ((n + 2) * (n + 1)) as f64);
+        c[0][n] = sign / fact[2 * n + 1];
+        c[1][n] = sign / fact[2 * n + 2];
+        c[2][n] = -sign * n1 / fact[2 * n + 3];
+        c[3][n] = -sign * n1 / fact[2 * n + 4];
+        c[4][n] = sign * n2 / fact[2 * n + 5];
+        c[5][n] = sign * n2 / fact[2 * n + 6];
         n += 1;
     }
     c
 };
 
-/// `(d²a/d(s²)², d²b/d(s²)²)` at `s²`, given `(a, b)` and their first
-/// derivatives `(da, db)` at `s²`. `Stereo`: `2a/(4+s²)²`, `2b/(4+s²)²`.
-/// `Exp`: `−(a + 6a′)/(4s²)` and `(a′/2 − 2b′)/s²` from `s² = 1` on,
-/// below that the series (the closed forms cancel catastrophically).
+/// The link coefficients and their derivatives in `s²`, as the Hessian
+/// uses them.
+#[derive(Clone, Copy)]
+struct LinkCurvature {
+    a: f64,
+    b: f64,
+    da: f64,
+    db: f64,
+    dda: f64,
+    ddb: f64,
+}
+
+/// `(a, b, a′, b′, a″, b″)` at `s²` for the Hessian, given the forward
+/// pass's `(a, b)`. `Stereo`: those, `−a/(4+s²)`, `−b/(4+s²)`,
+/// `2a/(4+s²)²` and `2b/(4+s²)²`. `Exp`: from `s² = 1` on the closed forms
+/// (those of [`link_derivs`], `a″ = −(a + 6a′)/(4s²)`,
+/// `b″ = (a′/2 − 2b′)/s²`), below that all six from their series. The
+/// closed forms cancel there: just above the gradient's series branch at
+/// `s² = 10⁻¹⁰`, `b` and `a′, b′` lose up to six digits. That is harmless
+/// in the value and the gradient, which multiply them by `ω` or `s²`, but
+/// not in the group's own second derivatives (`b′s² + b`, `2s̄²`).
 #[inline(always)]
-fn link_second(link: RotLink, s2: f64, a: f64, b: f64, da: f64, db: f64) -> (f64, f64) {
+fn link_curvature(link: RotLink, s2: f64, a: f64, b: f64) -> LinkCurvature {
     match link {
         RotLink::Stereo => {
+            let (da, db) = link_derivs(link, s2, a, b);
             let inv = 1.0 / (s2 + 4.0);
             let i2 = 2.0 * inv * inv;
-            (a * i2, b * i2)
+            LinkCurvature {
+                a,
+                b,
+                da,
+                db,
+                dda: a * i2,
+                ddb: b * i2,
+            }
         }
         RotLink::Exp => {
             if s2 < 1.0 {
-                let (mut sa, mut sb) = (0.0, 0.0);
-                for k in (0..EXP_D2_TERMS).rev() {
-                    sa = sa * s2 + EXP_D2_COEF[0][k];
-                    sb = sb * s2 + EXP_D2_COEF[1][k];
+                let mut v = [0.0; 6];
+                for k in (0..EXP_SERIES_TERMS).rev() {
+                    for (acc, c) in v.iter_mut().zip(&EXP_SERIES) {
+                        *acc = *acc * s2 + c[k];
+                    }
                 }
-                (sa, sb)
+                let [a, b, da, db, dda, ddb] = v;
+                LinkCurvature {
+                    a,
+                    b,
+                    da,
+                    db,
+                    dda,
+                    ddb,
+                }
             } else {
+                let (da, db) = link_derivs(link, s2, a, b);
                 let inv = 1.0 / s2;
-                (-0.25 * (a + 6.0 * da) * inv, (0.5 * da - 2.0 * db) * inv)
+                LinkCurvature {
+                    a,
+                    b,
+                    da,
+                    db,
+                    dda: -0.25 * (a + 6.0 * da) * inv,
+                    ddb: (0.5 * da - 2.0 * db) * inv,
+                }
             }
         }
     }
@@ -1069,11 +1118,15 @@ fn gr_hessian(f: &GrFwd<'_>, h: HessWork<'_>) {
     for gr in (2..=d - 2).rev() {
         let off = gr * (gr + 1) / 2 - 1;
         let om = &gamma[off + 1..off + gr + 1];
-        let Step {
-            s2, a, b, xb, dot, ..
-        } = steps[gr];
-        let (da, db) = link_derivs(link, s2, a, b);
-        let (dda, ddb) = link_second(link, s2, a, b, da, db);
+        let Step { s2, xb, dot, .. } = steps[gr];
+        let LinkCurvature {
+            a,
+            b,
+            da,
+            db,
+            dda,
+            ddb,
+        } = link_curvature(link, s2, steps[gr].a, steps[gr].b);
         let x = &f.tz[tape_off(gr)..tape_off(gr) + gr];
         let beta = &bt[beta_off(gr)..beta_off(gr) + gr + 1];
         let (bw, bg) = (frame_hess::dot(&beta[..gr], om), beta[gr]);
@@ -1112,7 +1165,7 @@ fn gr_hessian(f: &GrFwd<'_>, h: HessWork<'_>) {
         for (t, &dc) in tan[gr * nc..gr * nc + lc].iter_mut().zip(&*dl) {
             *t += a * dc - b * s2 * *t;
         }
-        // the group's own second derivatives (e0 is the reverse sweep's s̄²)
+        // the group's own second derivatives (e0 is s̄², the adjoint of s²)
         let phif = da * xb + db * dot;
         let e0 = -bw * phif + bg * (da * dot - psi1 * xb);
         let e1 = -bw * (dda * xb + ddb * dot) + bg * (dda * dot - psi2 * xb);
@@ -1750,8 +1803,8 @@ mod tests {
     /// The same at the special points: group 1 zero, a zero rotation
     /// vector, a zero `κ`, every rotation vector zero, `γ = 0`, equal
     /// eigenvalues (`κ = 0` and `G_1 = 0` with rotations), for `Exp` a
-    /// rotation by `π` and rotation vectors in each regime of the link's
-    /// series (`s² < 10⁻¹⁰`, `s² < 1`), and `μ̂` at and next to the
+    /// rotation by `π` and rotation vectors in each regime of the link
+    /// (`s² < 10⁻¹⁰`, just above it, `s² < 1`), and `μ̂` at and next to the
     /// reference direction.
     #[test]
     fn hessian_matches_differences_at_the_special_points() {
@@ -1808,6 +1861,9 @@ mod tests {
                             };
                             points.push(("rotation by pi", scaled(std::f64::consts::PI, &base)));
                             points.push(("s = 0.9", scaled(0.9, &base)));
+                            // s² just above the gradient's series branch,
+                            // where the closed forms of b, a′, b′ cancel
+                            points.push(("s = 1.2e-5", scaled(1.2e-5, &base)));
                             points.push(("s = 1e-6", scaled(1e-6, &base)));
                         }
                     }
