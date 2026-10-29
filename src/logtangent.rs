@@ -141,6 +141,9 @@
 //!   `∂²q/∂μ² = (PAP − (g⊥μ̂ᵀ + μ̂g⊥ᵀ + (g·μ̂) P))/‖μ‖²` with `g = ∂q/∂μ̂`,
 //!   `g⊥ = Pg`.
 //!
+//! The frame's terms, the chain through `μ̂` and the outer layer are shared
+//! with the eigen charts' exact Hessians (`crate::frame_hess`).
+//!
 //! The value returned by all three functions is bit-identical. They perform
 //! the same floating-point operations up to the log-density, and the
 //! gradients of [`loglik_lt_grad`] and [`loglik_lt_hess`] agree bit for bit.
@@ -149,6 +152,7 @@
 //! (smooth option)".
 
 use crate::dims;
+use crate::frame_hess::{self, FrameState, Outer};
 use crate::loglik::{log_m_p_derivs, log_m_p_value};
 use crate::onb::onb;
 use crate::stats::normal::LN_2PI;
@@ -1535,9 +1539,6 @@ fn lt_core<const GRAD: bool, const HESS: bool>(
     if HESS {
         // log f = Φ(q, ymu) − ‖μ‖²/2 with Φ = −(d/2) log q + ψ(alpha),
         // ψ(a) = a²/2 + log M_p(a), alpha = ymu q^{−1/2}
-        let (psi1, psi2) = (ab, 1.0 + d2lmp);
-        let (a_q, a_y) = (-0.5 * alpha / q, 1.0 / sq);
-        let (a_qq, a_qy) = (0.75 * alpha / (q * q), -0.5 / (q * sq));
         let fwd = Fwd {
             e,
             y,
@@ -1553,10 +1554,7 @@ fn lt_core<const GRAD: bool, const HESS: bool>(
             inv_n: rf.inv_n,
             mu_free: rf.mu_free,
             frame_free: rf.frame_free,
-            phi_q: qb,
-            phi_qq: 0.5 * d as f64 / (q * q) + psi2 * a_q * a_q + psi1 * a_qq,
-            phi_qy: psi2 * a_q * a_y + psi1 * a_qy,
-            phi_yy: psi2 * a_y * a_y,
+            outer: Outer::new(d, q, sq, alpha, ab, d2lmp, qb),
         };
         lt_hessian(&fwd, h);
     }
@@ -1583,10 +1581,7 @@ struct Fwd<'a> {
     mu_free: bool,
     frame_free: bool,
     /// `∂Φ/∂q` and the second derivatives of `Φ(q, ymu)`.
-    phi_q: f64,
-    phi_qq: f64,
-    phi_qy: f64,
-    phi_yy: f64,
+    outer: Outer,
 }
 
 /// The Hessian of the log-density (see the module documentation):
@@ -1797,30 +1792,24 @@ fn lt_hessian(f: &Fwd<'_>, h: HessWork<'_>) {
     for r in 0..d {
         hess[r * n..(r + 1) * n].fill(0.0);
     }
+    let fs = FrameState {
+        e: f.e,
+        y,
+        mu_hat,
+        v: f.v,
+        u: f.u,
+        kappa: f.kappa,
+        vv: f.vv,
+        inv_n: f.inv_n,
+        mu_free: f.mu_free,
+        frame_free: f.frame_free,
+    };
     if f.mu_free {
         // A = ∂²q/∂μ̂² (μ̂ free), from (μ̂·y)²: 2yyᵀ
-        for r in 0..d {
-            for c in r..d {
-                am[r * d + c] = 2.0 * y[r] * y[c];
-            }
-        }
+        frame_hess::init_mean(y, am);
         if f.frame_free {
             // K = Qᵀ ∂z/∂μ̂ with ∂z/∂μ̂ = Eᵀ(−κI − (2/(v·v)) v uᵀ)
-            for c in 0..p {
-                let kc = &mut kk[c * d..(c + 1) * d];
-                kc.fill(0.0);
-                for j in 0..p {
-                    let qjc = qm[j * p + c];
-                    let ej = &f.e[j * d..(j + 1) * d];
-                    for l in 0..d {
-                        kc[l] += qjc * ej[l];
-                    }
-                }
-                let cv = 2.0 * dot(kc, f.v) / f.vv;
-                for l in 0..d {
-                    kc[l] = -f.kappa * kc[l] - cv * f.u[l];
-                }
-            }
+            frame_hess::frame_jacobian(&fs, Some(qm), kk);
             // cross block: ∂²q/∂μ∂s_i = P(2Kᵀ t_i)/‖μ‖, P = I − μ̂μ̂ᵀ
             for i in 0..ns {
                 xv.fill(0.0);
@@ -1831,14 +1820,9 @@ fn lt_hessian(f: &Fwd<'_>, h: HessWork<'_>) {
                         xv[l] += t * kc[l];
                     }
                 }
-                let pr = dot(xv, mu_hat);
-                for l in 0..d {
-                    hess[l * n + d + i] = (xv[l] - pr * mu_hat[l]) * f.inv_n;
-                }
+                frame_hess::project_cross(&fs, xv, hess, n, d + i);
             }
-            // A += 2 Σ_c e^{−λ_c} K_c K_cᵀ (from ∂²q/∂z² = 2e^{−S}) + Σ_k ū_k ∇²u_k,
-            // Σ_k ū_k ∇²u_k = (2κ(ū·v)/(v·v)) I + (4(ū·v)/(v·v)²)(vuᵀ + uvᵀ)
-            //                − (2/(v·v))(uūᵀ + ūuᵀ)
+            // A += 2 Σ_c e^{−λ_c} K_c K_cᵀ (from ∂²q/∂z² = 2e^{−S}) + Σ_k ū_k ∇²u_k
             for c in 0..p {
                 let s2 = 2.0 * f.ex[c];
                 let kc = &kk[c * d..(c + 1) * d];
@@ -1849,72 +1833,13 @@ fn lt_hessian(f: &Fwd<'_>, h: HessWork<'_>) {
                     }
                 }
             }
-            let uv = dot(ubar, f.v);
-            let ci = 2.0 * f.kappa * uv / f.vv;
-            let cuv = 4.0 * uv / (f.vv * f.vv);
-            let cuu = 2.0 / f.vv;
-            let (u, v) = (f.u, f.v);
-            for r in 0..d {
-                for c in r..d {
-                    am[r * d + c] +=
-                        cuv * (v[r] * u[c] + u[r] * v[c]) - cuu * (u[r] * ubar[c] + ubar[r] * u[c]);
-                }
-                am[r * d + r] += ci;
-            }
+            frame_hess::add_frame_curvature(&fs, ubar, am);
         }
-        // ∂²q/∂μ² = (P A P − (g⊥μ̂ᵀ + μ̂g⊥ᵀ + γP))/‖μ‖², g = ∂q/∂μ̂, γ = g·μ̂,
-        // g⊥ = Pg
-        for r in 0..d {
-            let mut acc = 0.0;
-            for c in 0..d {
-                let arc = if c >= r { am[r * d + c] } else { am[c * d + r] };
-                acc += arc * mu_hat[c];
-            }
-            xv[r] = acc;
-        }
-        let mam = dot(mu_hat, xv);
-        let gam = dot(f.g, mu_hat);
-        let in2 = f.inv_n * f.inv_n;
-        for r in 0..d {
-            let gr = f.g[r] - gam * mu_hat[r];
-            for c in r..d {
-                let gc = f.g[c] - gam * mu_hat[c];
-                let pap = am[r * d + c] - mu_hat[r] * xv[c] - xv[r] * mu_hat[c]
-                    + mam * mu_hat[r] * mu_hat[c];
-                let prc = if r == c { 1.0 } else { 0.0 } - mu_hat[r] * mu_hat[c];
-                hess[r * n + c] = in2 * (pap - (gr * mu_hat[c] + mu_hat[r] * gc + gam * prc));
-            }
-        }
+        frame_hess::project_mean(&fs, f.g, am, xv, hess, n);
     }
 
     // ---- ∇² log f from ∇²q, ∇q and e = (y, 0); upper triangle, then mirror
-    let (fq_, fqq, fqy, fyy) = (f.phi_q, f.phi_qq, f.phi_qy, f.phi_yy);
-    for r in 0..n {
-        let dr = dq[r];
-        let (cqq, cqy) = (fqq * dr, fqy * dr);
-        if r < d {
-            let yr = y[r];
-            let (cyq, cyy) = (fqy * yr, fyy * yr);
-            for c in r..d {
-                let hv =
-                    fq_ * hess[r * n + c] + cqq * dq[c] + (cqy * y[c] + cyq * dq[c]) + cyy * y[c]
-                        - if c == r { 1.0 } else { 0.0 };
-                hess[r * n + c] = hv;
-                hess[c * n + r] = hv;
-            }
-            for c in d..n {
-                let hv = fq_ * hess[r * n + c] + cqq * dq[c] + cyq * dq[c];
-                hess[r * n + c] = hv;
-                hess[c * n + r] = hv;
-            }
-        } else {
-            for c in r..n {
-                let hv = fq_ * hess[r * n + c] + cqq * dq[c];
-                hess[r * n + c] = hv;
-                hess[c * n + r] = hv;
-            }
-        }
-    }
+    frame_hess::assemble(&f.outer, dq, y, hess, n);
 }
 
 /// Index of the unordered pair `{u, v}` of `0..p` in the row-major upper

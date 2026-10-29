@@ -78,7 +78,9 @@
 //! the data's centre.
 //!
 //! [`loglik_gr`] is the generic (forward-mode capable) kernel;
-//! [`loglik_gr_grad`] the gradient and [`loglik_gr_hess_fd`] the Hessian.
+//! [`loglik_gr_grad`] the gradient and [`loglik_gr_hess_fd`] the Hessian by
+//! differences, both in forward mode. The reverse-mode gradient and the
+//! exact Hessian are in [`crate::gamma_rot_adjoint`].
 
 use crate::dims;
 use crate::dual::{Dual, seed_array};

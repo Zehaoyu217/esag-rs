@@ -25,6 +25,7 @@ pub mod dual;
 pub mod error;
 pub mod estimator;
 pub mod frame;
+pub(crate) mod frame_hess;
 pub mod gamma_rot;
 pub mod gamma_rot_adjoint;
 pub mod gamma_smooth;
