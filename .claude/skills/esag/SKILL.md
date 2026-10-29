@@ -175,13 +175,13 @@ the shape explicitly for the eigen charts.
   coefficients as observations): use `fit_regularized`.
 - Eigen charts at d ≥ 8 with strong shape effects: the full model
   overfits (likelihood gain far above K/2); use the adaptive (group)
-  LASSO on the shape slopes with BIC; penalized paths take 10–30 s at
-  d = 8 (the log-tangent's 1–3 s).
+  LASSO on the shape slopes with BIC; penalized paths take 1.4–2.1 s at
+  d = 8 on one core (n = 2000, 5 covariates; full fits 64–67 ms).
 - Starts (eigen charts): a fit runs the least-squares start from the
   log-tangent pilot alone and races the moment and R-style starts only if
-  it fails to converge. That maximum is the closest to the true V(x) in
-  21 of 24 measured settings; the race's higher maxima overfit where
-  eigenvalues cross. For the highest maximum (e.g. likelihood-ratio
+  it fails to converge. That maximum was as close to the true V(x) as the
+  race's, or closer, in 21 of 24 measured settings; the race's higher
+  maxima overfit where eigenvalues cross. For the highest maximum (e.g. likelihood-ratio
   comparisons that need it), race every start: Python
   `fit(restarts=k)`, Rust `with_restarts(k, seed)`, CLI `--restarts k`.
 - Frames: refitting the same gamma-rot/spectral/log-tangent model on other
@@ -200,6 +200,9 @@ the shape explicitly for the eigen charts.
   `D=3,5` `SHAPE=gamma|lt|gr` `NS=200,500,2000` `R` `B`: the hard scenario (mu and V(x) strongly x-dependent).
 - `cargo run --release --example test_bench` (`D=3,5`, `SHAPE=gamma|lt|gr|sp`): B = 500 bootstrap tests at n = 2000.
 - `cargo run --release --example aniso_study -- truth|size|power` (`SHAPE`, `R`, `B`, `C`, `NULLS`, `FAST=1`).
+- `RAYON_NUM_THREADS=1 cargo run --release --example fit_bench` (`D=3,5,8` `R` `SHAPES=gr,sp,lt[,gamma]`
+  `PEN=1` `DUMP=<cell>`): one-core fits and penalized paths through the public API only, so the same
+  file times any version on the same data (copy it into an older checkout to compare).
 - `cargo run --release --example v_recovery`, `big_fit`, `perf_suite [--quick]`, `bench_vs_r`,
   `project3_paper`, `p3_corrected`.
 - Ignored studies in `src/regression/fit_profile.rs` (run with
@@ -207,6 +210,11 @@ the shape explicitly for the eigen charts.
   `gamma_rot_prod` (production comparison of gamma-rot, spectral, log-tangent, full and penalized;
   `D N R SEED0 DATA=gamma|rot|spec SCALE PEN STD PRESET TRACE`), `gamma_rot_fits`, `gamma_big_d`,
   `gamma_trap_anatomy`, `gamma_smooth_fits`, `spectral_fits`, `gamma_transported_fits`, and others.
+  Speed: `fit_speed` (stage times and evaluation counts of a fit; test builds record them in
+  `regression::stage`), `penalized_speed` (path stages, inner iterations), `race_variants` (start
+  policies against the old race, V̂ errors; `DATA=gamma|std|rot|spec ONLY_A=1`), `race_diag`,
+  `pilot_tolerance`, `pilot_metric`, `finalize_cost`, `start_cost`; kernel benches
+  `hessian_cost` (`--test-threads 1`).
 - Debug env vars: `ESAG_P3_DEBUG=1` (penalized path timings), `ESAG_PROX_DEBUG=1`
   (proximal Newton iterations), `ESAG_DEBUG_START=1` (gamma-rot starts), `ESAG_DEBUG_STRATUM=1`,
   `ESAG_DEBUG_HOMOTOPY=1` (gamma trap resolution).

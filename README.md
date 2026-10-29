@@ -498,6 +498,22 @@ refitted and reduced to four numbers one at a time.
   starts reached the same maximum in 192 of 192 simulated datasets). Fits
   with SEs at n = 2000, 5 covariates: 2.8 / 12 / 50 ms at d = 3 / 5 / 8,
   2.4–2.9× faster than before.
+* **The eigen charts: one anchored start, exact curvature.** A γ-rot or
+  spectral fit runs the start read from its log-tangent pilot alone,
+  whitened with the empirical information, instead of racing three plain
+  L-BFGS starts (its maximum was as close to the true V(x) as the race's,
+  or closer, in 21 of 24 measured settings; the race's higher maxima
+  overfit where eigenvalues cross; `fit(restarts=k)` races every start), and
+  both charts have exact Hessians (1.1–1.7 µs per observation at d = 8,
+  against 13–16 µs by differences). Fits with SEs at n = 2000, 5
+  covariates: γ-rot 4.8 / 13.6 / 64 ms at d = 3 / 5 / 8 (2.9–3.7× faster),
+  spectral 4.1 / 14.6 / 67 ms (3.3–4.8×).
+* **Coordinate descent inside proximal Newton.** The model of each
+  penalized Newton step is solved by block coordinate descent (group-norm
+  blocks exactly) instead of FISTA, 1/30 of the time, and the λ grid is
+  refined where it would skip a better model. Penalized paths of the eigen
+  charts at d = 8: 1.4–2.1 s, from 6.2–11.5 s (4.3–5.5×); 0.20–0.32 s at
+  d = 5 (3.5–3.8×).
 * **Structure of the restricted models.** Under the shape-constant null
   every observation has the same shape S, so one eigen-decomposition per
   pass serves them all (restricted refits 4–9× faster at d = 5–8). The
@@ -671,14 +687,13 @@ the most accurate model measured at d = 8 (0.49–0.53 against 0.59–0.68 for
 the log-tangent family, n = 2000). Bootstrap tests with B = 500 at
 n = 2000 and 5 covariates take 1.5 s (d = 3), 4.7 s (d = 5) and 23–39 s
 (d = 8) on one core, the log-tangent's times and 6–9× below γ's (score
-tests 1.1 / 2.5–3.3 / 7–15 s). What remains: the model depends on the
-axis ordering and basis stored with the fit (`rot_basis`, `lt_reference`),
-rotation slopes of nearly tied axes are weakly identified (regularize, as
-above), and its penalized paths take 10–15 s at d = 8 (the log-tangent's
-1–3 s): the eigen charts' observed Hessian is indefinite along a path and
-the proximal Newton now models the free block with its own curvature,
-floored adaptively (`docs/MATH.md` §2), instead of inflating every
-direction.
+tests 1.1 / 2.5–3.3 / 7–15 s). A full fit takes 64 ms at d = 8 on one
+core and an adaptive (group) LASSO path 1.4–1.6 s (the eigen charts'
+exact Hessians, one anchored start and coordinate descent in the
+proximal Newton; `docs/MATH.md` §2, "Fit cost"). What remains: the model
+depends on the axis ordering and basis stored with the fit (`rot_basis`,
+`lt_reference`), and rotation slopes of nearly tied axes are weakly
+identified (regularize, as above).
 
 **`Shape::Spectral` (Python `shape="spectral"`) removes the ordering
 dependence.** It takes the eigen-decomposition itself as the parameters:

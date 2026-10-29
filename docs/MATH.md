@@ -408,7 +408,10 @@ fresh points; one core per fit; log-tangent in parentheses).**
   `n = 500` every penalized variant of either shape ends near a constant
   shape (0–3 active groups, `V̂` 0.75–0.83) while the full models overfit
   (1.7–2.0).
-* **Cost of the penalized paths.** Log-tangent paths take 0.3–0.5 s
+* **Cost of the penalized paths.** (Measured when written; the current
+  costs, after the exact Hessians and block coordinate descent, are in
+  "Fit cost" below: at `d = 8` 1.4–2.1 s for the eigen charts.)
+  Log-tangent paths take 0.3–0.5 s
   (`d = 5`) and 1.2–2.7 s (`d = 8`); γ-rot paths 1.3–2.7 s and, at `d = 8`,
   10–15 s (53–75 s before the solver change below). The proximal Newton
   of `src/optim/prox.rs` models the smooth part by a positive-definite
@@ -483,8 +486,8 @@ against 0.77); the penalties recover the eigen charts: at `d = 8`,
 `n = 2000` on spectral data the spectral adaptive LASSO is the most
 accurate model (0.433), then γ-rot's adaptive LASSO and eigen-part group
 LASSO (0.469, 0.481), then the log-tangent's (0.509); the penalized paths
-take 12–22 s (γ-rot) and 16–29 s (spectral) against the log-tangent's
-1.2–2.6 s. The spectral chart's
+took 12–22 s (γ-rot) and 16–29 s (spectral) against the log-tangent's
+1.2–2.6 s when measured (now 1.4–2.1 s, "Fit cost" below). The spectral chart's
 two eigen parts (all log-eigenvalues as one group, the whole rotation as
 another) are a coarse grouping: 0.552 at `d = 5`, `n = 500` with one
 active group, against γ-rot's finer `(κ_j, ω_j)` groups at 0.450; at
@@ -543,6 +546,51 @@ reads each observation's eigen-decomposition directly from the pilot's
 `S_i`: the chart's tangent covariance is `R_0ᵀ exp(S_i) R_0`, so one
 `(d−1)×(d−1)` eigen-decomposition replaces building and projecting
 `V̂(x_i)`.
+
+**Fit cost: exact Hessians.** Both eigen charts have exact Hessians
+(`gamma_rot_adjoint::loglik_gr_hess`, `spectral::loglik_sp_hess`; the
+module documentation has the derivations): one forward sweep with
+tangents along `μ̂` and the rotation coordinates for γ-rot, closed-form
+Cayley derivatives for spectral, on the frame curvature shared with the
+log-tangent's (`src/frame_hess.rs`). Value and gradient are the reverse
+kernels' bit for bit; the Hessians agree with fourth-order differences to
+the differences' own error. Per observation (value, gradient and Hessian):
+
+| d | γ-rot exact | γ-rot differences | spectral exact | spectral differences | log-tangent exact |
+|---|---|---|---|---|---|
+| 3 | 0.10 µs | 0.43 | 0.10 | 0.52 | 0.12 |
+| 5 | 0.36 | 1.8 | 0.30 | 3.1 | 0.67 |
+| 8 | 1.7 | 12.6 | 1.1 | 15.6 | 3.2 |
+| 10 | 3.3 | 26.5 | 2.3 | 36.1 | 15.0 |
+
+so the joint Hessian at `n = 2000` with 5 covariates (the assembly
+included) takes 5.4 / 4.3 ms at `d = 8` instead of 29 / 36, below the
+log-tangent's 8.4. With the start policy above, fits and penalized paths
+(one core, `n = 2000`, 5 covariates, the hard scenario's γ data; medians
+over 6 datasets for fits and 2 for paths, the paths penalizing the shape
+slopes with BIC at relaxed refits; `examples/fit_bench.rs`, the same
+datasets for both versions):
+
+| | d | before | now | |
+|---|---|---|---|---|
+| γ-rot fit | 3 / 5 / 8 | 13.7 / 46.9 / 235 ms | 4.8 / 13.6 / 63.6 ms | 2.9 / 3.4 / 3.7× |
+| spectral fit | 3 / 5 / 8 | 13.5 / 65.1 / 320 ms | 4.1 / 14.6 / 67.3 ms | 3.3 / 4.5 / 4.8× |
+| log-tangent fit | 3 / 5 / 8 | 2.0 / 11.0 / 53.1 ms | 2.1 / 10.6 / 52.3 ms | 1.0× |
+| γ-rot adaptive LASSO | 3 / 5 / 8 | 0.11 / 0.86 / 6.2 s | 0.05 / 0.24 / 1.43 s | 2.5 / 3.6 / 4.3× |
+| γ-rot adaptive group LASSO, eigen parts | 3 / 5 / 8 | 0.10 / 0.89 / 7.8 s | 0.04 / 0.25 / 1.64 s | 2.3 / 3.5 / 4.8× |
+| spectral adaptive LASSO | 3 / 5 / 8 | 0.12 / 1.17 / 7.9 s | 0.05 / 0.32 / 1.56 s | 2.5 / 3.6 / 5.0× |
+| spectral adaptive group LASSO, eigen parts | 3 / 5 / 8 | 0.12 / 0.77 / 11.5 s | 0.05 / 0.20 / 2.08 s | 2.5 / 3.8 / 5.5× |
+| log-tangent adaptive LASSO | 3 / 5 / 8 | 0.06 / 0.45 / 2.5 s | 0.05 / 0.40 / 2.2 s | 1.1–1.2× |
+
+An eigen-chart fit at `d = 8` now spends about 32 ms in the pilot
+(log-tangent, whose 7×7 Jacobi eigen-decompositions make its gradient 5×
+γ-rot's), 6 ms in the pilot's start, 15–22 ms in the whitened L-BFGS
+(45 ms in one spectral fit that took 73 gradients) and 7–9 ms in
+`finalize` (the Hessian, the covariance and Newton polish; `fit_speed`). The
+log-tangent's fits already had one start and exact Hessians and are
+unchanged; its paths gain from the solver (§8) about what the grid
+refinement (§8) spends. The bootstrap tests are unchanged (their
+replicates refit from the full fit with whitened L-BFGS and no Hessian).
 
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
@@ -1407,6 +1455,25 @@ dense products each), and no path's selection changed (20 of 20,
 `penalized_speed`). Steps are accepted by backtracking on the true
 objective; stationarity is certified by the gradient mapping. Zeros and
 ties are exact, never thresholded.
+
+**Grid refinement.** The automatic grid (31 geometric values below
+`λ_max`, and 0) can step over models: a path may add or drop several
+atoms between neighbouring values, and which models the grid lands on
+depends on `λ_max`, so on the initial fit. On a `d = 8` spectral
+eigen-part group LASSO path the best model by BIC (3 groups, 105 below the
+next) sat in one grid interval and was skipped when the initial fit moved
+to a nearby maximum. With BIC or AIC selection the path is therefore
+refined: between neighbours whose active sets differ in two atoms or
+more, the geometric midpoint is fitted (warm from the smaller `λ`, up to
+three halvings), wherever a model in between could still beat the best
+criterion so far, with its relaxed log-likelihood bounded by the larger
+of the neighbours' and its df by the smaller (`Prepared::refine`). On 30
+paths (`fit_bench`, `d = 3, 5, 8`, five presets, two datasets) against the
+previous release the selected BIC was lower in 9 (by 0.7–9.4), equal in
+19 and higher in 2 (+9.6, +18.1: the one dataset whose unpenalized fit
+moved to a lower maximum under the start policy of §2); refinement cost
+10–45% of a path. Custom grids, the paper's grid and cross-validation are
+not refined.
 
 **Selection.** BIC (default) or AIC at the *relaxed* refit, the
 unpenalized maximum over the selected model, with the model dimension as

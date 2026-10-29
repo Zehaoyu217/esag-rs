@@ -5526,6 +5526,7 @@ fn fit_speed() {
                     pc.shape = Shape::LogTangent;
                     pc.compute_hessian = false;
                     pc.rot_basis = None;
+                    pc.refit_decrement = Some(PILOT_DECREMENT);
                     pc.fit(&x, &y).ok()
                 } else {
                     None
@@ -5640,6 +5641,7 @@ fn race_diag() {
                 pc.shape = Shape::LogTangent;
                 pc.compute_hessian = false;
                 pc.rot_basis = None;
+                pc.refit_decrement = Some(PILOT_DECREMENT);
                 let pilot = pc.fit(&x, &y).unwrap();
                 let mut me = cfg.clone();
                 me.rot_basis = rot_basis_from_pilot(&me, &pilot, &x, &y);
@@ -5790,6 +5792,7 @@ fn race_variants() {
                 pc.shape = Shape::LogTangent;
                 pc.compute_hessian = false;
                 pc.rot_basis = None;
+                pc.refit_decrement = Some(PILOT_DECREMENT);
                 let pilot = pc.fit(&x, &y).unwrap();
                 let mut me = cfg.clone();
                 me.rot_basis = rot_basis_from_pilot(&me, &pilot, &x, &y);
