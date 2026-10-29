@@ -4736,6 +4736,8 @@ pub(crate) mod stage {
     pub(crate) static HESS: AtomicUsize = AtomicUsize::new(0);
     /// Empirical-information (outer product of scores) evaluations.
     pub(crate) static OPG: AtomicUsize = AtomicUsize::new(0);
+    /// Inner (model) iterations of the proximal Newton solver.
+    pub(crate) static INNER: AtomicUsize = AtomicUsize::new(0);
 
     /// Record the time since `since` under `name`; returns now.
     pub(crate) fn lap(name: &'static str, since: Instant) -> Instant {

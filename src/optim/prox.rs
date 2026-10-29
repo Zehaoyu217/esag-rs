@@ -62,6 +62,24 @@ pub trait PenaltyAtoms: Sync + Send + std::fmt::Debug {
     fn prox(&self, v: &mut [f64], t: &[f64]);
     /// Indices of the parameters the penalty acts on.
     fn support(&self) -> Vec<usize>;
+    /// Disjoint blocks of parameters, each with the atoms that act on it
+    /// and on nothing else (`(parameters, atoms)`), or `None` if the atoms
+    /// do not separate this way. With blocks, the model of each proximal
+    /// Newton step is solved by block coordinate descent
+    /// ([`PenaltyAtoms::prox_block`]); without, by FISTA.
+    fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        None
+    }
+    /// [`PenaltyAtoms::prox`] on the parameters of block `b` of
+    /// [`PenaltyAtoms::blocks`] only (`t` indexed by atom, as in `prox`).
+    fn prox_block(&self, _b: usize, _v: &mut [f64], _t: &[f64]) {
+        unreachable!("prox_block without blocks")
+    }
+    /// Whether the only atom of block `b` is the Euclidean norm of its
+    /// parameters (the model is then minimized over the block exactly).
+    fn block_is_norm(&self, _b: usize) -> bool {
+        false
+    }
 }
 
 /// `φ_g = ‖θ_{G_g}‖₂` over disjoint groups of indices.
@@ -90,6 +108,26 @@ impl PenaltyAtoms for GroupNorms {
     }
     fn support(&self) -> Vec<usize> {
         self.groups.iter().flatten().copied().collect()
+    }
+    fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        Some(
+            self.groups
+                .iter()
+                .enumerate()
+                .map(|(b, g)| (g.clone(), vec![b]))
+                .collect(),
+        )
+    }
+    fn prox_block(&self, b: usize, v: &mut [f64], t: &[f64]) {
+        let g = &self.groups[b];
+        let nrm = g.iter().map(|&i| v[i] * v[i]).sum::<f64>().sqrt();
+        let scale = if !(t[b] < nrm) { 0.0 } else { 1.0 - t[b] / nrm };
+        for &i in g {
+            v[i] *= scale;
+        }
+    }
+    fn block_is_norm(&self, _b: usize) -> bool {
+        true
     }
 }
 
@@ -147,6 +185,38 @@ impl PenaltyAtoms for SparseGroupNorms {
     }
     fn support(&self) -> Vec<usize> {
         self.groups.iter().flatten().copied().collect()
+    }
+    fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        let mut e = self.n_groups();
+        Some(
+            self.groups
+                .iter()
+                .enumerate()
+                .map(|(b, g)| {
+                    let mut atoms = vec![b];
+                    atoms.extend(e..e + g.len());
+                    e += g.len();
+                    (g.clone(), atoms)
+                })
+                .collect(),
+        )
+    }
+    fn prox_block(&self, b: usize, v: &mut [f64], t: &[f64]) {
+        let e0 = self.n_groups() + self.groups[..b].iter().map(Vec::len).sum::<usize>();
+        let g = &self.groups[b];
+        for (k, &i) in g.iter().enumerate() {
+            let te = t[e0 + k];
+            v[i] = if !(te < v[i].abs()) {
+                0.0
+            } else {
+                v[i] - te.copysign(v[i])
+            };
+        }
+        let nrm = g.iter().map(|&i| v[i] * v[i]).sum::<f64>().sqrt();
+        let scale = if !(t[b] < nrm) { 0.0 } else { 1.0 - t[b] / nrm };
+        for &i in g {
+            v[i] *= scale;
+        }
     }
 }
 
@@ -587,14 +657,24 @@ fn prox_newton_r<A: PenaltyAtoms>(
         }
         n_iter += 1;
         if model_h.is_none() {
+            #[cfg(test)]
+            let clock = std::time::Instant::now();
             let inactive = inactive_coordinates(&theta, &gh, pen, &w, &hess, n);
             let (h, floored) = positive_definite_masked(&hess, n, &inactive, floor);
+            #[cfg(test)]
+            let clock = crate::regression::stage::lap("prox_model", clock);
             let l = largest_eigenvalue(&h);
+            #[cfg(test)]
+            crate::regression::stage::lap("prox_lmax", clock);
             model_h = Some((h, l, floored));
         }
         // (a copy: the floor adaptation below may rebuild the model)
         let (h, l, floored) = model_h.clone().unwrap();
+        #[cfg(test)]
+        let clock = std::time::Instant::now();
         let z = solve_model(&theta, &gh, &h, l, pen, &w, cfg.max_inner);
+        #[cfg(test)]
+        crate::regression::stage::lap("prox_inner", clock);
         let delta: Vec<f64> = z.iter().zip(&theta).map(|(a, b)| a - b).collect();
         let pen_now = pen.lambda * weighted_atoms(&pen.atoms, &z, &w)
             - pen.lambda * weighted_atoms(&pen.atoms, &theta, &w);
@@ -935,9 +1015,236 @@ fn saddle_free(h: &DMatrix<f64>, floor: f64) -> DMatrix<f64> {
     (&fixed + fixed.transpose()) * 0.5
 }
 
-/// Minimise `gᵀ(z−θ) + ½(z−θ)ᵀH(z−θ) + λ Σ w_g φ_g(z)` by FISTA with
-/// adaptive restarts (O'Donoghue & Candès).
+/// `u = argmin ½uᵀHu − cᵀu + τ‖u‖₂` for symmetric positive definite `H`
+/// (eigen-decomposition `eig`), written into `z` at `coords`: `u = 0` if
+/// `‖c‖ ≤ τ`, else `u = (H + sI)⁻¹c` with `s > 0` the root of
+/// `s ‖(H + sI)⁻¹c‖ = τ` (increasing in `s`), by Newton's method safeguarded
+/// by bisection.
+fn group_block_min(
+    eig: &SymmetricEigen<f64, nalgebra::Dyn>,
+    c: &[f64],
+    tau: f64,
+    coords: &[usize],
+    z: &mut [f64],
+) {
+    let cn = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !(cn > tau) {
+        for &i in coords {
+            z[i] = 0.0;
+        }
+        return;
+    }
+    let (v, e) = (&eig.eigenvectors, &eig.eigenvalues);
+    let m = coords.len();
+    // c in the eigenbasis
+    let ce: Vec<f64> = (0..m)
+        .map(|k| (0..m).map(|a| v[(a, k)] * c[a]).sum())
+        .collect();
+    // ψ(s) = s ‖(H + sI)⁻¹ c‖ − τ and ψ'(s)
+    let psi = |s: f64| -> (f64, f64) {
+        let mut q = 0.0;
+        let mut dq = 0.0;
+        for k in 0..m {
+            let f = s / (e[k] + s);
+            q += ce[k] * ce[k] * f * f;
+            dq += ce[k] * ce[k] * f * e[k] / ((e[k] + s) * (e[k] + s));
+        }
+        let nq = q.sqrt();
+        (nq - tau, if nq > 0.0 { dq / nq } else { 0.0 })
+    };
+    // bracket: ψ(0) = −τ < 0, ψ(s) → ‖c‖ − τ > 0; s ≥ τ e_max/(‖c‖ − τ) suffices
+    let emax = e.iter().fold(0.0f64, |a, &b| a.max(b));
+    let (mut lo, mut hi) = (0.0, tau * emax.max(1e-300) / (cn - tau) + tau);
+    while psi(hi).0 < 0.0 {
+        hi *= 2.0;
+    }
+    let mut s = 0.5 * (lo + hi);
+    for _ in 0..100 {
+        let (f, df) = psi(s);
+        if f > 0.0 {
+            hi = s;
+        } else {
+            lo = s;
+        }
+        let next = if df > 0.0 { s - f / df } else { f64::NAN };
+        let next = if next > lo && next < hi {
+            next
+        } else {
+            0.5 * (lo + hi)
+        };
+        if (next - s).abs() <= 1e-15 * s.max(1e-300) {
+            s = next;
+            break;
+        }
+        s = next;
+    }
+    for (a, &i) in coords.iter().enumerate() {
+        z[i] = (0..m).map(|k| v[(a, k)] * ce[k] / (e[k] + s)).sum();
+    }
+}
+
+/// The model of [`solve_model`] by block coordinate descent, for atoms on
+/// disjoint blocks ([`PenaltyAtoms::blocks`]). The coordinates no positive
+/// finite weight penalizes (outside every block, or in blocks whose atoms
+/// all have weight 0) are minimized exactly together, by the Cholesky
+/// factor of their block of `H`; each penalized block `B` takes the
+/// proximal step of the majorizer `L_B I ⪰ H_BB` (`L_B` the largest
+/// eigenvalue of `H_BB`), so every step lowers the model; blocks pinned at
+/// zero (weight ∞) stay there. After a sweep of every block, the blocks
+/// away from zero are swept until they settle, then every block again,
+/// until a full sweep moves no coordinate by more than `1e-12 (1 + max|z|)`
+/// (glmnet's active-set cycles). The model is strictly convex, so the limit
+/// is FISTA's. At d = 8 with 210 coefficients a path's model solves took
+/// about 1/20 of FISTA's operations (`penalized_speed` in
+/// `regression/fit_profile.rs`).
+fn solve_model_blocks<A: PenaltyAtoms>(
+    theta: &[f64],
+    g: &[f64],
+    h: &DMatrix<f64>,
+    pen: &Penalty<A>,
+    w: &[f64],
+    blocks: &[(Vec<usize>, Vec<usize>)],
+    max_sweeps: usize,
+) -> Vec<f64> {
+    let n = theta.len();
+    let mut z = theta.to_vec();
+    let mut in_block = vec![false; n];
+    // per atom, the threshold of its block's proximal step
+    let mut t = vec![0.0; pen.atoms.len()];
+    // per penalized block: L_B, and for a norm atom on several parameters
+    // the eigen-decomposition of H_BB (the exact block minimizer)
+    let mut penalized: Vec<(usize, f64)> = vec![];
+    let mut exact: Vec<Option<(SymmetricEigen<f64, nalgebra::Dyn>, f64)>> = vec![];
+    for (b, (coords, atoms)) in blocks.iter().enumerate() {
+        if atoms.iter().all(|&a| w[a] == 0.0) {
+            continue;
+        }
+        for &i in coords {
+            in_block[i] = true;
+        }
+        if atoms.iter().all(|&a| w[a].is_infinite()) {
+            for &i in coords {
+                z[i] = 0.0;
+            }
+            continue;
+        }
+        let (lb, eig) = if coords.len() == 1 {
+            (h[(coords[0], coords[0])], None)
+        } else {
+            let sub =
+                DMatrix::from_fn(coords.len(), coords.len(), |a, c| h[(coords[a], coords[c])]);
+            let eig = SymmetricEigen::new(sub);
+            (eig.eigenvalues.max(), Some(eig))
+        };
+        let lb = lb.max(1e-300);
+        for &a in atoms {
+            t[a] = pen.lambda * w[a] / lb;
+        }
+        let norm = atoms.len() == 1 && pen.atoms.block_is_norm(b) && w[atoms[0]].is_finite();
+        exact.push(eig.filter(|_| norm).map(|e| (e, pen.lambda * w[atoms[0]])));
+        penalized.push((b, lb));
+    }
+    let free: Vec<usize> = (0..n).filter(|&i| !in_block[i]).collect();
+    let chol_free = (!free.is_empty())
+        .then(|| DMatrix::from_fn(free.len(), free.len(), |a, c| h[(free[a], free[c])]).cholesky())
+        .flatten();
+    // r = g + H (z − θ), the model's smooth gradient at z
+    let dz = DVector::from_iterator(n, z.iter().zip(theta).map(|(a, b)| a - b));
+    let mut r: Vec<f64> = (DVector::from_column_slice(g) + h * dz)
+        .iter()
+        .copied()
+        .collect();
+    let hs = h.as_slice();
+    let add_col = |r: &mut [f64], j: usize, delta: f64| {
+        for (ri, hij) in r.iter_mut().zip(&hs[j * n..(j + 1) * n]) {
+            *ri += hij * delta;
+        }
+    };
+    let mut old = vec![0.0; n];
+    let mut sweeps = 0;
+    let mut full = true;
+    let mut active: Vec<bool> = vec![true; penalized.len()];
+    while sweeps < max_sweeps {
+        sweeps += 1;
+        #[cfg(test)]
+        crate::regression::stage::INNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut moved = 0.0f64;
+        if let Some(ch) = &chol_free {
+            let rf = DVector::from_iterator(free.len(), free.iter().map(|&i| r[i]));
+            let step = ch.solve(&rf);
+            for (a, &i) in free.iter().enumerate() {
+                let delta = -step[a];
+                z[i] += delta;
+                moved = moved.max(delta.abs());
+                add_col(&mut r, i, delta);
+            }
+        }
+        for (k, &(b, lb)) in penalized.iter().enumerate() {
+            if !full && !active[k] {
+                continue;
+            }
+            let coords = &blocks[b].0;
+            for &i in coords {
+                old[i] = z[i];
+            }
+            if let Some((eig, tau)) = &exact[k] {
+                // argmin_u ½uᵀH_BB u − cᵀu + τ‖u‖ with c = H_BB z_B − r_B
+                let c: Vec<f64> = coords
+                    .iter()
+                    .map(|&i| coords.iter().map(|&j| h[(i, j)] * old[j]).sum::<f64>() - r[i])
+                    .collect();
+                group_block_min(eig, &c, *tau, coords, &mut z);
+            } else {
+                for &i in coords {
+                    z[i] -= r[i] / lb;
+                }
+                pen.atoms.prox_block(b, &mut z, &t);
+            }
+            let mut nonzero = false;
+            for &i in coords {
+                let delta = z[i] - old[i];
+                if delta != 0.0 {
+                    moved = moved.max(delta.abs());
+                    add_col(&mut r, i, delta);
+                }
+                nonzero |= z[i] != 0.0;
+            }
+            active[k] = nonzero;
+        }
+        let settled = moved <= 1e-12 * (1.0 + z.iter().fold(0.0f64, |m, v| m.max(v.abs())));
+        if settled {
+            if full {
+                break;
+            }
+            full = true;
+        } else if full {
+            full = false;
+        }
+    }
+    z
+}
+
+/// Minimise `gᵀ(z−θ) + ½(z−θ)ᵀH(z−θ) + λ Σ w_g φ_g(z)`: by block
+/// coordinate descent where the atoms act on disjoint blocks
+/// ([`solve_model_blocks`]), else by FISTA ([`solve_model_fista`]).
 fn solve_model<A: PenaltyAtoms>(
+    theta: &[f64],
+    g: &[f64],
+    h: &DMatrix<f64>,
+    l: f64,
+    pen: &Penalty<A>,
+    w: &[f64],
+    max_inner: usize,
+) -> Vec<f64> {
+    match pen.atoms.blocks() {
+        Some(blocks) => solve_model_blocks(theta, g, h, pen, w, &blocks, max_inner),
+        None => solve_model_fista(theta, g, h, l, pen, w, max_inner),
+    }
+}
+
+/// [`solve_model`] by FISTA with step `1/l` and adaptive restarts
+/// (O'Donoghue & Candès).
+fn solve_model_fista<A: PenaltyAtoms>(
     theta: &[f64],
     g: &[f64],
     h: &DMatrix<f64>,
@@ -963,6 +1270,8 @@ fn solve_model<A: PenaltyAtoms>(
     let mut tk = 1.0f64;
     let mut m_prev = model(&z);
     for it in 0..max_inner {
+        #[cfg(test)]
+        crate::regression::stage::INNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grad_y = &gv + h * (&y - &th);
         let mut z_new = &y - grad_y * step;
         prox(&mut z_new);
@@ -988,6 +1297,111 @@ fn solve_model<A: PenaltyAtoms>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Block coordinate descent and FISTA reach the same minimizer of the
+    /// model (the same model value; the same coordinates where `H` is well
+    /// conditioned), for group and sparse-group atoms, with free (weight 0),
+    /// pinned (∞) and unpenalized coordinates.
+    #[test]
+    fn block_descent_matches_fista() {
+        let n = 23;
+        let a = DMatrix::from_fn(n + 7, n, |i, j| ((i * 7 + j * 13) as f64 * 0.61).sin());
+        let theta: Vec<f64> = (0..n).map(|i| ((i * 5) as f64 * 0.9).cos()).collect();
+        let g: Vec<f64> = (0..n).map(|i| ((i * 3) as f64 * 1.7).sin() * 4.0).collect();
+        let groups: Vec<Vec<usize>> = vec![
+            vec![0],
+            vec![1, 2],
+            vec![3, 4, 5],
+            vec![7],
+            vec![8, 9],
+            vec![10, 11, 12, 13],
+            vec![15],
+            vec![16, 17],
+            vec![19, 20, 21],
+        ];
+        #[allow(clippy::too_many_arguments)]
+        fn check<A: PenaltyAtoms>(
+            theta: &[f64],
+            g: &[f64],
+            pen: &Penalty<A>,
+            w: &[f64],
+            h: &DMatrix<f64>,
+            coords: bool,
+            what: &str,
+        ) {
+            let n = theta.len();
+            let l = SymmetricEigen::new(h.clone()).eigenvalues.max() * 1.02;
+            let blocks = pen.atoms.blocks().unwrap();
+            let zb = solve_model_blocks(theta, g, h, pen, w, &blocks, 100_000);
+            let zf = solve_model_fista(theta, g, h, l, pen, w, 200_000);
+            let model = |z: &[f64]| {
+                let dz = DVector::from_iterator(n, z.iter().zip(theta).map(|(a, b)| a - b));
+                DVector::from_column_slice(g).dot(&dz)
+                    + 0.5 * dz.dot(&(h * &dz))
+                    + pen.lambda * weighted_atoms(&pen.atoms, z, w)
+            };
+            let (mb, mf) = (model(&zb), model(&zf));
+            assert!(
+                mb <= mf + 1e-10 * mf.abs(),
+                "{what}: model {mb:e} vs FISTA {mf:e}"
+            );
+            if coords {
+                let diff = zb
+                    .iter()
+                    .zip(&zf)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                // (FISTA's own stopping rule leaves ~1e-7)
+                assert!(diff < 1e-6, "{what}: {diff:e}");
+            }
+        }
+        for (ridge, coords) in [(0.05, false), (2.0, true)] {
+            let h = a.transpose() * &a + DMatrix::identity(n, n) * ridge;
+            for lambda in [0.3, 3.0, 30.0] {
+                let gn = Penalty {
+                    atoms: GroupNorms {
+                        groups: groups.clone(),
+                    },
+                    base: vec![],
+                    exponent: Exponent::Fixed(1.0),
+                    lambda,
+                };
+                let mut w = vec![1.0; groups.len()];
+                w[1] = 0.0;
+                w[4] = f64::INFINITY;
+                w[6] = 2.5;
+                check(
+                    &theta,
+                    &g,
+                    &gn,
+                    &w,
+                    &h,
+                    coords,
+                    &format!("groups, ridge {ridge}, λ = {lambda}"),
+                );
+                let sg = Penalty {
+                    atoms: SparseGroupNorms {
+                        groups: groups.clone(),
+                    },
+                    base: vec![],
+                    exponent: Exponent::Fixed(1.0),
+                    lambda,
+                };
+                let mut w = vec![0.7; sg.atoms.len()];
+                w[2] = f64::INFINITY;
+                w[groups.len() + 4] = 0.0;
+                check(
+                    &theta,
+                    &g,
+                    &sg,
+                    &w,
+                    &h,
+                    coords,
+                    &format!("sparse groups, ridge {ridge}, λ = {lambda}"),
+                );
+            }
+        }
+    }
 
     /// f(θ) = ½‖Aθ − b‖²
     struct LeastSquares {

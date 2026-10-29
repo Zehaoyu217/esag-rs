@@ -482,8 +482,14 @@ impl PenalizedEsag {
     /// Fit the λ path to `(x, y)` (`x` may have zero columns: i.i.d.) and
     /// select λ.
     pub fn fit(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<PenalizedPath> {
+        #[cfg(test)]
+        let clock = std::time::Instant::now();
         let prep = Prepared::new(self, x, y)?;
+        #[cfg(test)]
+        let clock = crate::regression::stage::lap("pen_prepare", clock);
         let mut points = prep.path(self)?;
+        #[cfg(test)]
+        let clock = crate::regression::stage::lap("pen_path", clock);
         let criterion: Vec<f64> = match self.selection {
             Selection::Bic => points.iter().map(|p| p.bic).collect(),
             Selection::Aic => points.iter().map(|p| p.aic).collect(),
@@ -521,6 +527,8 @@ impl PenalizedEsag {
         } else {
             prep.relaxed_fit(&points[selected]).ok()
         };
+        #[cfg(test)]
+        crate::regression::stage::lap("pen_refit", clock);
         Ok(PenalizedPath {
             config: self.clone(),
             initial: prep.initial,
@@ -1431,6 +1439,8 @@ impl Prepared {
                     } else {
                         let t0 = std::time::Instant::now();
                         let rl = self.relaxed_loglik(&theta, &active)?;
+                        #[cfg(test)]
+                        crate::regression::stage::lap("pen_relaxed", t0);
                         if std::env::var_os("ESAG_P3_DEBUG").is_some() {
                             eprintln!("  relaxed refit {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
                         }
@@ -1818,6 +1828,27 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.support(),
             Atoms::SparseGroups(g) => g.support(),
             Atoms::Gaps(g) => g.support(),
+        }
+    }
+    fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        match self {
+            Atoms::Groups(g) => g.blocks(),
+            Atoms::SparseGroups(g) => g.blocks(),
+            Atoms::Gaps(g) => g.blocks(),
+        }
+    }
+    fn prox_block(&self, b: usize, v: &mut [f64], t: &[f64]) {
+        match self {
+            Atoms::Groups(g) => g.prox_block(b, v, t),
+            Atoms::SparseGroups(g) => g.prox_block(b, v, t),
+            Atoms::Gaps(g) => g.prox_block(b, v, t),
+        }
+    }
+    fn block_is_norm(&self, b: usize) -> bool {
+        match self {
+            Atoms::Groups(g) => g.block_is_norm(b),
+            Atoms::SparseGroups(g) => g.block_is_norm(b),
+            Atoms::Gaps(g) => g.block_is_norm(b),
         }
     }
 }

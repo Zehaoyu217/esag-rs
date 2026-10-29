@@ -6025,3 +6025,164 @@ fn precondition_from_info_is_the_factor_of_the_inverse() {
         }
     }
 }
+
+/// Single-core cost of penalized paths (penalties on the shape slopes, BIC
+/// at relaxed refits): the initial fit, the path (proximal Newton solves
+/// and relaxed refits), the final refit, and the joint gradient / Hessian
+/// counts. Env: `D` (`5,8`), `N` (2000), `R` (2), `SEED0` (1500), `PRESET`
+/// (substring filter of the preset names).
+/// `RAYON_NUM_THREADS=1 cargo test --release --lib penalized_speed -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn penalized_speed() {
+    use crate::penalized::{Grouping, PenalizedEsag, Target};
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let ds: Vec<usize> = std::env::var("D")
+        .unwrap_or_else(|_| "5,8".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 2) as u64);
+    let seed0 = env("SEED0", 1500) as u64;
+    for &d in &ds {
+        let b = hard_truth(d);
+        let presets: Vec<(&str, PenalizedEsag)> = vec![
+            (
+                "gamma-rot aLASSO",
+                PenalizedEsag::adaptive_lasso().shape(Shape::GammaRot),
+            ),
+            (
+                "gamma-rot agLASSO eigen parts",
+                PenalizedEsag::adaptive_group_lasso()
+                    .grouping(Grouping::EigenParts)
+                    .shape(Shape::GammaRot),
+            ),
+            (
+                "spectral aLASSO",
+                PenalizedEsag::adaptive_lasso().shape(Shape::Spectral),
+            ),
+            (
+                "spectral agLASSO eigen parts",
+                PenalizedEsag::adaptive_group_lasso()
+                    .grouping(Grouping::EigenParts)
+                    .shape(Shape::Spectral),
+            ),
+            (
+                "log-tangent aLASSO",
+                PenalizedEsag::adaptive_lasso().shape(Shape::LogTangent),
+            ),
+        ];
+        for (name, pe) in presets {
+            if let Ok(f) = std::env::var("PRESET")
+                && !name.contains(f.as_str())
+            {
+                continue;
+            }
+            for seed in seed0..seed0 + reps {
+                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let pe = pe
+                    .clone()
+                    .target(Target::ShapeSlopes)
+                    .lt_reference(center(d))
+                    .bic()
+                    .with_parallel(false);
+                stage::take();
+                let t = Instant::now();
+                let path = pe.fit(&x, &y).unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let (st, c) = stage::take();
+                let get = |nm: &str| -> f64 {
+                    st.iter()
+                        .filter(|(s, _)| *s == nm)
+                        .map(|(_, v)| v * 1e3)
+                        .sum()
+                };
+                let iters: usize = path.points.iter().map(|p| p.n_iter).sum();
+                let inner = stage::INNER.swap(0, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "d={d} {name:<30} seed {seed}: total {ms:8.1} ms = prepare {:7.1} + path {:8.1} (relaxed {:7.1}) + refit {:6.1} | model {:6.1} lmax {:6.1} inner {:7.1} ms ({inner} its) | {} lambdas, {iters} prox iters | evals g{} h{} o{} | active {}",
+                    get("pen_prepare"),
+                    get("pen_path"),
+                    get("pen_relaxed"),
+                    get("pen_refit"),
+                    get("prox_model"),
+                    get("prox_lmax"),
+                    get("prox_inner"),
+                    path.points.len(),
+                    c[0],
+                    c[1],
+                    c[2],
+                    path.best().active.iter().filter(|a| **a).count(),
+                );
+            }
+        }
+    }
+}
+
+/// The log-tangent pilot whitened with the exact information at the moment
+/// start (as `fit` does) or with the empirical information there: gradients,
+/// time and the maximum reached.
+/// `RAYON_NUM_THREADS=1 D=5,8 R=6 cargo test --release --lib pilot_metric -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn pilot_metric() {
+    let env = |k: &str, v: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(v)
+    };
+    let ds: Vec<usize> = std::env::var("D")
+        .unwrap_or_else(|_| "5,8".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let (n, reps) = (env("N", 2000), env("R", 6) as u64);
+    let seed0 = env("SEED0", 1500) as u64;
+    for &d in &ds {
+        let b = hard_truth(d);
+        for seed in seed0..seed0 + reps {
+            let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+            let mut cfg = config(d, Shape::LogTangent);
+            cfg.compute_hessian = false;
+            cfg.refit_decrement = Some(PILOT_DECREMENT);
+            let data = cfg.data(&x, &y).unwrap();
+            let mask = cfg.resolve_mask(&data).unwrap();
+            let free = free_params(&mask);
+            let mut b0 = cfg
+                .clone()
+                .with_init(Init::DataDriven)
+                .initial_coef(&data)
+                .unwrap();
+            zero_fixed(&mut b0, &mask);
+            let mut cells = vec![];
+            for (name, which) in [("info", 0), ("opg", 1)] {
+                stage::take();
+                let t = Instant::now();
+                let mut c = cfg.clone();
+                c.precondition = if which == 0 {
+                    info_precondition(&data, &b0, &free, false)
+                } else {
+                    empirical_precondition(&data, &b0, &free)
+                };
+                let r = c.optimize(&data, &b0, &free, cfg.max_iter);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let (_, k) = stage::take();
+                cells.push(format!(
+                    "{name}: {ms:5.1} ms g{} h{} o{} -ll {:.4} {}",
+                    k[0],
+                    k[1],
+                    k[2],
+                    r.neg_ll,
+                    if r.converged { "conv" } else { "NO" }
+                ));
+            }
+            println!("d={d} seed {seed}: {}", cells.join(" | "));
+        }
+    }
+}
