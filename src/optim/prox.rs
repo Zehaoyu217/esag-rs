@@ -625,6 +625,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
         _ => (f.value_grad_hess(&theta, &mut grad, &mut hess), 0usize),
     };
     let mut obj = fs + value(&theta);
+    let blocks = pen.atoms.blocks().is_some();
     // positive-definite model Hessian, its largest eigenvalue and whether the
     // curvature floor was applied; recomputed with the Hessian or when the
     // floor changes
@@ -663,7 +664,8 @@ fn prox_newton_r<A: PenaltyAtoms>(
             let (h, floored) = positive_definite_masked(&hess, n, &inactive, floor);
             #[cfg(test)]
             let clock = crate::regression::stage::lap("prox_model", clock);
-            let l = largest_eigenvalue(&h);
+            // (FISTA's step; block descent needs none)
+            let l = if blocks { 0.0 } else { largest_eigenvalue(&h) };
             #[cfg(test)]
             crate::regression::stage::lap("prox_lmax", clock);
             model_h = Some((h, l, floored));

@@ -493,6 +493,57 @@ solver change above (0.602 before it, when unconverged large-`λ` solves
 misled BIC). Penalizing the spectral chart's entries (adaptive LASSO) is
 the safer default for it.
 
+**Starts of the eigen charts: the pilot's start alone.** Where eigenvalues
+of `V(x)` cross within the data the eigen charts' likelihood has several
+regular maxima, and the race of three starts (moment, R-style, the
+pilot's least squares; plain L-BFGS, the highest maximum wins) kept the
+highest. Those higher maxima are fitted to the noise. Against the race,
+the maximum reached from the pilot's least-squares start alone
+(`race_variants`; V̂ error as above; 8–12 held-out datasets per cell,
+`n = 2000` unless noted, 5 covariates):
+
+| data (seeds) | d | γ-rot: race → pilot start | spectral: race → pilot start |
+|---|---|---|---|
+| γ, hard (1500–1511) | 5 | 0.280 → 0.275 | 0.277 → 0.277 |
+| | 8 | 0.544 → 0.538 | 0.551 → 0.540 |
+| γ, hard (1600–1607) | 5 | 0.312 → 0.308 | 0.306 → 0.306 |
+| | 8 | 0.566 → 0.551 | 0.582 → 0.580 |
+| γ, hard, `n = 500` | 5 | 0.814 → 0.796 | 0.882 → 0.877 |
+| | 8 | 1.713 → 1.587 | 1.791 → 1.611 |
+| γ-rot, hard | 5 | 0.283 → 0.281 | 0.285 → 0.285 |
+| | 8 | 0.773 → 0.737 | 0.744 → 0.742 |
+| spectral, hard | 5 | 0.331 → 0.320 | 0.367 → 0.352 |
+| | 8 | 0.772 → 0.752 | 0.778 → 0.770 |
+| γ, standard | 5 | 0.393 → 0.393 | 0.433 → 0.438 |
+| | 8 | 0.921 → 0.934 | 1.083 → 1.091 |
+
+The pilot's start is as close to the true `V(x)` or closer in 21 of the
+24 cells and 0.005–0.013 farther in the 3 cells of the standard scenario
+(a concentrated mean, `‖μ‖ ≈ 4`, where both are far from the γ truth),
+while its log-likelihood is lower on average (by 0–2 at `d = 5`, 1–15 at
+`d = 8`). Racing the moment start against it (whitened, as below) finds
+higher maxima still (+2 and +10 on average at `d = 8`) that miss `V(x)`
+by more (0.555 and 0.587 against 0.538 and 0.540). The log-tangent pilot's
+likelihood has one maximum in practice (§3, "Starts"), and the eigen-chart
+maximum reached from its fitted `V̂(x_i)` is its continuation into the
+eigen coordinates. So fits run that start alone and race the other starts
+only if it fails the convergence check (every fit above converged);
+`EsagRegressor::with_restarts(k, seed)` (Python `fit(restarts=k)`) races
+every start and `k` perturbed ones, for the highest maximum.
+
+That start runs L-BFGS whitened by the empirical information at its start
+(refreshed every 50 iterations; plain L-BFGS where that information is
+singular, as at isotropy, where the rotation coordinates have no score):
+11–71 gradients at `n = 2000` (`d = 5–8`) against 128–294 for the plain
+race, and 2–4× fewer than plain L-BFGS from the same start
+(`race_diag`). The pilot stops at a predicted remaining gain of `10⁻³`
+instead of `10⁻⁶` (24 of 24 fits that follow unchanged: log-likelihood
+within 0.003, V̂ equal to 4 digits; `pilot_tolerance`), and the start
+reads each observation's eigen-decomposition directly from the pilot's
+`S_i`: the chart's tangent covariance is `R_0ᵀ exp(S_i) R_0`, so one
+`(d−1)×(d−1)` eigen-decomposition replaces building and projecting
+`V̂(x_i)`.
+
 **The pole of `onb(μ)`.** The frame is singular where `μ_0 = μ_1 = 0`, and
 the γ model, unlike the log-tangent model with its reference at the data's
 mean direction, cannot move that set away from the data. With the mean
@@ -1337,10 +1388,23 @@ update; default) or jointly as in the paper (its `μ`-gradient
 **Solver.** Proximal Newton (`optim::prox`): the model
 `∇h·Δ + ½ΔᵀHΔ + λΣ w_g φ_g` with the exact Hessian (reused while full
 steps match the predicted decrease, and carried along the λ path) is
-minimised by FISTA with restarts using the exact prox of the atoms: block
-soft-thresholding for group norms; eigen-decomposition plus weighted
-isotonic regression (PAVA) for the gaps (exact for any weights, with exact
-ties for infinite weights). Steps are accepted by backtracking on the true
+minimised, for atoms on disjoint blocks of coefficients (group and
+sparse-group norms, the LASSO as singleton groups), by block coordinate
+descent: the coordinates no positive weight penalizes jointly, by the
+Cholesky factor of their block of `H`; each group-norm block exactly,
+`argmin_u ½uᵀH_BB u − cᵀu + τ‖u‖₂` being `0` if `‖c‖ ≤ τ` and otherwise
+`(H_BB + sI)⁻¹c` with `s > 0` the root of the increasing
+`s ‖(H_BB + sI)⁻¹c‖ − τ` (safeguarded Newton on the eigen-decomposition of
+`H_BB`); each sparse-group block by the proximal step of its majorizer
+`L_B I ⪰ H_BB`; with glmnet's active-set cycles. For the eigen gaps the
+model is minimised by FISTA with restarts using the exact prox of the
+atoms (eigen-decomposition plus weighted isotonic regression (PAVA), exact
+for any weights, with exact ties for infinite weights). Block descent
+reaches FISTA's minimizer (`block_descent_matches_fista`) at a fraction
+of its cost: on a `d = 8` γ-rot path the model solves took 68 ms against
+1953 ms for FISTA (188 044 iterations, about 470 per Newton step, two
+dense products each), and no path's selection changed (20 of 20,
+`penalized_speed`). Steps are accepted by backtracking on the true
 objective; stationarity is certified by the gradient mapping. Zeros and
 ties are exact, never thresholded.
 

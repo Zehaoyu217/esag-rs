@@ -5747,8 +5747,14 @@ fn race_variants() {
         .collect();
     let (n, reps) = (env("N", 2000), env("R", 12) as u64);
     let seed0 = env("SEED0", 1500) as u64;
+    let data_kind = std::env::var("DATA").unwrap_or_else(|_| "gamma".into());
+    let only_a = std::env::var("ONLY_A").is_ok();
     for &d in &ds {
-        let b = hard_truth(d);
+        let b = if data_kind == "std" {
+            standard_truth(d, 5)
+        } else {
+            hard_truth(d)
+        };
         let (bd, pt) = (b.nrows(), b.ncols());
         let (xt, _) = simulate(&b, 200, 99, Shape::Gamma);
         let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
@@ -5756,8 +5762,17 @@ fn race_variants() {
                 .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
                 .collect()
         };
+        let tf = crate::gamma_rot::GrFrame::stereo(&center(d));
+        let tsf = crate::spectral::SpFrame::new(&center(d));
         let vtrue: Vec<DMatrix<f64>> = (0..200)
-            .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+            .map(|i| {
+                let e = eta(&b, i);
+                match data_kind.as_str() {
+                    "rot" => tf.covariance(&e[..d], &e[d..]),
+                    "spec" => tsf.covariance(&e[..d], &e[d..]),
+                    _ => Esag::from_eta(&e).unwrap().covariance(),
+                }
+            })
             .collect();
         for shape in list("SHAPES", "gr,sp").iter().map(|s| match s.as_str() {
             "gr" => Shape::GammaRot,
@@ -5765,7 +5780,11 @@ fn race_variants() {
             o => panic!("unknown shape {o}"),
         }) {
             for seed in seed0..seed0 + reps {
-                let (x, y) = simulate(&b, n, seed, Shape::Gamma);
+                let (x, y) = match data_kind.as_str() {
+                    "rot" => simulate_with(&b, n, seed, Shape::GammaRot, 0.5, &center(d)),
+                    "spec" => simulate_with(&b, n, seed, Shape::Spectral, 0.5, &center(d)),
+                    _ => simulate(&b, n, seed, Shape::Gamma),
+                };
                 let cfg = config(d, shape);
                 let mut pc = cfg.clone();
                 pc.shape = Shape::LogTangent;
@@ -5847,6 +5866,18 @@ fn race_variants() {
                     }
                     (r, stage::take().1)
                 };
+                if only_a {
+                    println!(
+                        "d={d} {shape:?} seed {seed}: old v{:.3}{} | A {:+8.2} g{:<4} v{:.3}{}",
+                        fit_of(&old.coef),
+                        if old.converged { "" } else { " NO" },
+                        old.neg_ll - a.neg_ll,
+                        ca[0],
+                        fit_of(&a.coef),
+                        if a.converged { "" } else { " NO" }
+                    );
+                    continue;
+                }
                 let (bm, cb) = capped(&lc, &s_mom);
                 let (cr, cc) = capped(&me, &s_r);
                 let mut dc = me.clone();
@@ -6104,6 +6135,7 @@ fn penalized_speed() {
                 };
                 let iters: usize = path.points.iter().map(|p| p.n_iter).sum();
                 let inner = stage::INNER.swap(0, std::sync::atomic::Ordering::Relaxed);
+
                 println!(
                     "d={d} {name:<30} seed {seed}: total {ms:8.1} ms = prepare {:7.1} + path {:8.1} (relaxed {:7.1}) + refit {:6.1} | model {:6.1} lmax {:6.1} inner {:7.1} ms ({inner} its) | {} lambdas, {iters} prox iters | evals g{} h{} o{} | active {}",
                     get("pen_prepare"),
@@ -6184,5 +6216,52 @@ fn pilot_metric() {
             }
             println!("d={d} seed {seed}: {}", cells.join(" | "));
         }
+    }
+}
+
+/// Cost of the pieces of `rot_informed_start` per observation: the
+/// `(d−1)×(d−1)` eigen-decomposition of `S_i` and the chart coordinates.
+/// `cargo test --release --lib start_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn start_cost() {
+    for d in [5usize, 8] {
+        let p = d - 1;
+        let g = dims::gamma_len(d);
+        let ss: Vec<Vec<f64>> = (0..256)
+            .map(|k| {
+                (0..g)
+                    .map(|i| 0.4 * ((i * 7 + k * 3) as f64 * 0.77).sin())
+                    .collect()
+            })
+            .collect();
+        let fr = crate::gamma_rot::GrFrame::stereo(&center(d));
+        let sp = crate::spectral::SpFrame::new(&center(d));
+        let reps = 20_000;
+        let t = Instant::now();
+        let mut acc = 0.0;
+        for r in 0..reps {
+            let sm = crate::logtangent::s_to_matrix(&ss[r % 256], p);
+            let e = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(p, p, &sm));
+            acc += e.eigenvalues[0];
+        }
+        let te = t.elapsed().as_secs_f64() * 1e9 / reps as f64;
+        let sm = crate::logtangent::s_to_matrix(&ss[0], p);
+        let e = nalgebra::SymmetricEigen::new(DMatrix::from_row_slice(p, p, &sm));
+        let lam: Vec<f64> = e.eigenvalues.iter().map(|v| v.exp()).collect();
+        let t = Instant::now();
+        for _ in 0..reps {
+            acc += fr.coords_from_eigen_signed(&lam, e.eigenvectors.clone())[0];
+        }
+        let tg = t.elapsed().as_secs_f64() * 1e9 / reps as f64;
+        let t = Instant::now();
+        for _ in 0..reps {
+            acc += sp.coords_from_eigen_signed(&lam, e.eigenvectors.clone())[0];
+        }
+        let ts = t.elapsed().as_secs_f64() * 1e9 / reps as f64;
+        std::hint::black_box(acc);
+        println!(
+            "d={d}: eigen {te:.0} ns, gamma-rot coords {tg:.0} ns, spectral coords {ts:.0} ns"
+        );
     }
 }

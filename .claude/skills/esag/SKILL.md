@@ -177,6 +177,13 @@ the shape explicitly for the eigen charts.
   overfits (likelihood gain far above K/2); use the adaptive (group)
   LASSO on the shape slopes with BIC; penalized paths take 10–30 s at
   d = 8 (the log-tangent's 1–3 s).
+- Starts (eigen charts): a fit runs the least-squares start from the
+  log-tangent pilot alone and races the moment and R-style starts only if
+  it fails to converge. That maximum is the closest to the true V(x) in
+  21 of 24 measured settings; the race's higher maxima overfit where
+  eigenvalues cross. For the highest maximum (e.g. likelihood-ratio
+  comparisons that need it), race every start: Python
+  `fit(restarts=k)`, Rust `with_restarts(k, seed)`, CLI `--restarts k`.
 - Frames: refitting the same gamma-rot/spectral/log-tangent model on other
   data needs the stored `lt_reference` (and `rot_basis`); simulation truths
   defined in another frame are misspecified otherwise.
