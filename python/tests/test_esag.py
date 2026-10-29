@@ -367,3 +367,16 @@ def test_lt_reference_is_respected():
     assert a.lt_reference is not None and esag.ESAG(y, x, shape="gamma").fit().lt_reference is None
     c = esag.ESAG(y[:150], x[:150], shape="log-tangent", lt_reference=b.lt_reference).fit()
     np.testing.assert_allclose(c.lt_reference, b.lt_reference)
+
+
+def test_paper_methods_use_gamma_under_any_shape():
+    """The Project 3 methods fit Yu & Huang's gamma whatever the model's
+    shape, and their coefficients are labelled as gamma."""
+    d = esag.Distribution(mu=[1.0, -0.5, 2.0, 0.7], gamma=[0.6, -0.3, 0.0, 0.5, 0.2])
+    Y = d.sample(300, seed=3)
+    ref = esag.ESAG(Y, shape="gamma").fit_regularized(paper="aGLASSO").params
+    for shape in ["auto", "gamma-rot", "spectral", "log-tangent"]:
+        got = esag.ESAG(Y, shape=shape).fit_regularized(paper="aGLASSO").params
+        assert list(got.columns) == list(ref.columns)
+        assert np.allclose(got.values, ref.values)
+

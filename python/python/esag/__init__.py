@@ -352,7 +352,9 @@ class ESAG:
         if alpha is not None:
             a = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
             lambdas = [float(v) * self.nobs for v in a]
-        shape = self.shape
+        # the paper's methods are defined on Yu & Huang's gamma whatever the
+        # model's shape (the fit itself always uses it), so label them so
+        shape = "gamma" if paper is not None else self.shape
         native = self._native.fit_regularized(
             penalty=penalty,
             target=target,
