@@ -172,6 +172,11 @@ fn main() {
                 ));
             }
             for (pname, pe) in presets {
+                if let Ok(filter) = std::env::var("DUMP")
+                    && !format!("{name} {pname}").contains(filter.as_str())
+                {
+                    continue;
+                }
                 let mut ms = vec![];
                 for (k, (x, y)) in data.iter().enumerate().take(reps.min(2) as usize) {
                     let pe = pe
@@ -185,6 +190,21 @@ fn main() {
                     let path = pe.fit(x, y).unwrap();
                     let dt = t.elapsed().as_secs_f64() * 1e3;
                     let best = path.best();
+                    if std::env::var("DUMP").is_ok() {
+                        println!("    initial fit ll {:.3}", path.initial.log_likelihood);
+                        for p in &path.points {
+                            println!(
+                                "    lambda/n {:.5}: active {:3} df {:5.1} relaxed ll {:10.3} bic {:10.3} kkt {:.1e} conv {}",
+                                p.lambda_n,
+                                p.active.iter().filter(|a| **a).count(),
+                                p.df,
+                                p.criterion_loglik,
+                                p.bic,
+                                p.kkt,
+                                p.converged
+                            );
+                        }
+                    }
                     println!(
                         "pen d={d} {name:<12} {pname:<20} seed {}: {dt:8.1} ms  active {}  bic {:.3}",
                         seed0 + k as u64,

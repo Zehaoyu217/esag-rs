@@ -848,6 +848,10 @@ impl Atoms {
     }
 }
 
+/// Halvings of a log-λ grid interval in [`Prepared::refine`] (up to 7 points
+/// inserted per interval).
+const REFINE_DEPTH: usize = 3;
+
 impl Prepared {
     fn new(cfg: &PenalizedEsag, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<Self> {
         let d = y.ncols();
@@ -1323,7 +1327,9 @@ impl Prepared {
     }
 
     /// Penalized fits along the grid (ascending λ, warm starts unless a
-    /// fixed start is given).
+    /// fixed start is given). On the automatic grid, with BIC or AIC
+    /// selection, the grid is then refined where it skips models
+    /// ([`Prepared::refine`]).
     fn path(&self, cfg: &PenalizedEsag) -> Result<Vec<PathPoint>> {
         let mut order: Vec<usize> = (0..self.lambdas.len()).collect();
         order.sort_by(|&a, &b| self.lambdas[a].total_cmp(&self.lambdas[b]));
@@ -1346,7 +1352,7 @@ impl Prepared {
             order.reverse();
             theta = self.null_theta()?;
         }
-        let mut out: Vec<Option<PathPoint>> = vec![None; self.lambdas.len()];
+        let mut out: Vec<Option<(PathPoint, Vec<f64>)>> = vec![None; self.lambdas.len()];
         let mut relaxed_cache: Vec<(Vec<bool>, f64, f64)> = vec![];
         let mut prev_solution: Option<Vec<f64>> = None;
         let mut last_hessian: Option<Vec<f64>> = None;
@@ -1355,7 +1361,7 @@ impl Prepared {
             if let Some(s) = &start {
                 theta = s.clone();
             }
-            let (th, objective, r, kkt, converged, n_iter) = if cfg.is_paper() {
+            let pt = if cfg.is_paper() {
                 let mut starts = vec![theta.clone()];
                 if theta != self.theta_init {
                     starts.push(self.theta_init.clone());
@@ -1365,104 +1371,230 @@ impl Prepared {
                 {
                     starts.push(prev.clone());
                 }
-                self.solve_paper(&obj, lambda, &starts)?
+                let (th, objective, r, kkt, converged, n_iter) =
+                    self.solve_paper(&obj, lambda, &starts)?;
+                theta = th;
+                self.paper_point(&obj, lambda, &theta, objective, r, kkt, converged, n_iter)
             } else {
-                let pen = self.penalty(lambda);
-                let t0 = std::time::Instant::now();
-                let res = solve_warm(&obj, &pen, &theta, cfg.tol, last_hessian.as_deref())?;
-                last_hessian = Some(res.hessian.clone());
-                if std::env::var_os("ESAG_P3_DEBUG").is_some() {
-                    eprintln!(
-                        "  λ={lambda:.3}: solve {:.1} ms, {} iters, kkt {:.1e}",
-                        t0.elapsed().as_secs_f64() * 1e3,
-                        res.n_iter,
-                        res.kkt
-                    );
-                }
-                (
-                    res.theta,
-                    res.objective,
-                    res.r,
-                    res.kkt,
-                    res.converged,
-                    res.n_iter,
-                )
+                let (pt, th, hess) = self.grid_point(
+                    cfg,
+                    &obj,
+                    lambda,
+                    &theta,
+                    last_hessian.as_deref(),
+                    &mut relaxed_cache,
+                )?;
+                theta = th;
+                last_hessian = Some(hess);
+                pt
             };
-            theta = th;
             prev_solution = Some(theta.clone());
-            let mut g = vec![0.0; theta.len()];
-            let ll = -obj.value_grad(&theta, &mut g);
-            let phi = self.atoms.atoms(&theta);
-            let active: Vec<bool> = phi.iter().map(|&v| v > 1e-12).collect();
-            let n = self.data.n as f64;
-            let coef = self.to_original(&theta);
-            let mut pt = PathPoint {
-                lambda,
-                lambda_n: lambda / n,
-                coef,
-                log_likelihood: ll,
-                objective,
-                r,
-                active: active.clone(),
-                df: 0.0,
-                criterion_loglik: ll,
-                bic: 0.0,
-                aic: 0.0,
-                cv: None,
-                kkt,
-                converged,
-                n_iter,
-                coef_thresholded: None,
-                loglik_thresholded: None,
-                sbic: None,
-            };
-            if cfg.is_paper() {
-                // the R code's rule: threshold every entry, df = nonzeros incl. mu
-                let thr: Vec<f64> = theta
-                    .iter()
-                    .map(|&v| if v.abs() < 0.01 { 0.0 } else { v })
-                    .collect();
-                let llt = -obj.value_grad(&thr, &mut g);
-                let df = thr.iter().filter(|&&v| v != 0.0).count() as f64;
-                pt.df = df;
-                pt.criterion_loglik = llt;
-                pt.bic = -2.0 * llt + n.ln() * df;
-                pt.aic = -2.0 * llt + 2.0 * df;
-                pt.sbic = Some(-2.0 * llt + ((n + 2.0) / 24.0).ln() * df);
-                pt.loglik_thresholded = Some(llt);
-                pt.coef_thresholded = Some(self.to_original(&thr));
-            } else {
-                let df = self.model_df(&theta, &active);
-                let ll_c = if cfg.relax {
-                    if let Some(c) = relaxed_cache.iter().find(|c| c.0 == active) {
-                        c.1
-                    } else {
-                        let t0 = std::time::Instant::now();
-                        let rl = self.relaxed_loglik(&theta, &active)?;
-                        #[cfg(test)]
-                        crate::regression::stage::lap("pen_relaxed", t0);
-                        if std::env::var_os("ESAG_P3_DEBUG").is_some() {
-                            eprintln!("  relaxed refit {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
-                        }
-                        relaxed_cache.push((active.clone(), rl, df));
-                        rl
-                    }
-                } else if self.degenerate(&theta) {
-                    f64::NEG_INFINITY
-                } else {
-                    ll
-                };
-                pt.df = df;
-                pt.criterion_loglik = ll_c;
-                pt.bic = -2.0 * ll_c + n.ln() * df;
-                pt.aic = -2.0 * ll_c + 2.0 * df;
-            }
-            out[k] = Some(pt);
+            out[k] = Some((pt, theta.clone()));
         }
-        Ok(out
+        let points: Vec<(PathPoint, Vec<f64>)> = out
             .into_iter()
             .map(|p| p.expect("every lambda fitted"))
-            .collect())
+            .collect();
+        let refine = matches!(cfg.grid, LambdaGrid::Auto { .. })
+            && !cfg.is_paper()
+            && start.is_none()
+            && !matches!(cfg.selection, Selection::CrossValidation { .. });
+        if refine {
+            return self.refine(cfg, &obj, points, &mut relaxed_cache);
+        }
+        Ok(points.into_iter().map(|(p, _)| p).collect())
+    }
+
+    /// The automatic grid is geometric, and a path can drop or add several
+    /// atoms between neighbouring grid values: the models it passes in
+    /// between are never offered to BIC or AIC, and which of them the grid
+    /// lands on depends on `λ_max`, so on the initial fit. (On a `d = 8`
+    /// spectral group LASSO path the 3-group model, the best by BIC by 105
+    /// over the next, sat in one grid interval and was skipped when a
+    /// slightly different initial fit moved the grid.) So between
+    /// neighbours (ascending λ) whose active sets differ in two atoms or
+    /// more, the geometric midpoint is fitted, warm from the smaller λ, up
+    /// to [`REFINE_DEPTH`] halvings of the log-λ interval, wherever a model
+    /// in between could still beat the best criterion so far: its relaxed
+    /// log-likelihood is taken to be at most the larger of the neighbours'
+    /// and its df at least the smaller, a bound that rules out most of a
+    /// LASSO path's intervals. Returns the points in ascending λ.
+    fn refine(
+        &self,
+        cfg: &PenalizedEsag,
+        obj: &SmoothNegLogLik<'_>,
+        mut points: Vec<(PathPoint, Vec<f64>)>,
+        relaxed_cache: &mut Vec<(Vec<bool>, f64, f64)>,
+    ) -> Result<Vec<PathPoint>> {
+        let differ = |a: &PathPoint, b: &PathPoint| {
+            a.active
+                .iter()
+                .zip(&b.active)
+                .filter(|(x, y)| x != y)
+                .count()
+        };
+        let aic = matches!(cfg.selection, Selection::Aic);
+        let n = self.data.n as f64;
+        let per_df = if aic { 2.0 } else { n.ln() };
+        let crit = |p: &PathPoint| if aic { p.aic } else { p.bic };
+        // the criterion of the best model that could lie between a and b
+        let bound = |a: &PathPoint, b: &PathPoint| {
+            -2.0 * a.criterion_loglik.max(b.criterion_loglik) + per_df * a.df.min(b.df)
+        };
+        for _ in 0..REFINE_DEPTH {
+            let mut best = points
+                .iter()
+                .map(|(p, _)| crit(p))
+                .fold(f64::INFINITY, f64::min);
+            let mut next = Vec::with_capacity(points.len());
+            let mut added = false;
+            let mut iter = points.into_iter().peekable();
+            while let Some((pa, ta)) = iter.next() {
+                let gap = iter
+                    .peek()
+                    .filter(|(pb, _)| {
+                        differ(&pa, pb) >= 2 && pb.lambda > pa.lambda && bound(&pa, pb) < best
+                    })
+                    .map(|(pb, _)| pb.lambda);
+                next.push((pa.clone(), ta.clone()));
+                if let Some(lb) = gap {
+                    let mid = if pa.lambda > 0.0 {
+                        (pa.lambda * lb).sqrt()
+                    } else {
+                        0.5 * lb
+                    };
+                    let (pt, th, _) = self.grid_point(cfg, obj, mid, &ta, None, relaxed_cache)?;
+                    best = best.min(crit(&pt));
+                    next.push((pt, th));
+                    added = true;
+                }
+            }
+            points = next;
+            if !added {
+                break;
+            }
+        }
+        Ok(points.into_iter().map(|(p, _)| p).collect())
+    }
+
+    /// One penalized fit of the path at `lambda` from `theta0` (warm, with
+    /// the previous solve's Hessian `hess0` if any), with its relaxed refit
+    /// for the criteria (cached by active set). Returns the point, the
+    /// solution and its Hessian.
+    fn grid_point(
+        &self,
+        cfg: &PenalizedEsag,
+        obj: &SmoothNegLogLik<'_>,
+        lambda: f64,
+        theta0: &[f64],
+        hess0: Option<&[f64]>,
+        relaxed_cache: &mut Vec<(Vec<bool>, f64, f64)>,
+    ) -> Result<(PathPoint, Vec<f64>, Vec<f64>)> {
+        let pen = self.penalty(lambda);
+        let t0 = std::time::Instant::now();
+        let res = solve_warm(obj, &pen, theta0, cfg.tol, hess0)?;
+        if std::env::var_os("ESAG_P3_DEBUG").is_some() {
+            eprintln!(
+                "  λ={lambda:.3}: solve {:.1} ms, {} iters, kkt {:.1e}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                res.n_iter,
+                res.kkt
+            );
+        }
+        let theta = res.theta;
+        let mut g = vec![0.0; theta.len()];
+        let ll = -obj.value_grad(&theta, &mut g);
+        let phi = self.atoms.atoms(&theta);
+        let active: Vec<bool> = phi.iter().map(|&v| v > 1e-12).collect();
+        let n = self.data.n as f64;
+        let df = self.model_df(&theta, &active);
+        let ll_c = if cfg.relax {
+            if let Some(c) = relaxed_cache.iter().find(|c| c.0 == active) {
+                c.1
+            } else {
+                let t0 = std::time::Instant::now();
+                let rl = self.relaxed_loglik(&theta, &active)?;
+                #[cfg(test)]
+                crate::regression::stage::lap("pen_relaxed", t0);
+                if std::env::var_os("ESAG_P3_DEBUG").is_some() {
+                    eprintln!("  relaxed refit {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+                }
+                relaxed_cache.push((active.clone(), rl, df));
+                rl
+            }
+        } else if self.degenerate(&theta) {
+            f64::NEG_INFINITY
+        } else {
+            ll
+        };
+        let pt = PathPoint {
+            lambda,
+            lambda_n: lambda / n,
+            coef: self.to_original(&theta),
+            log_likelihood: ll,
+            objective: res.objective,
+            r: res.r,
+            active,
+            df,
+            criterion_loglik: ll_c,
+            bic: -2.0 * ll_c + n.ln() * df,
+            aic: -2.0 * ll_c + 2.0 * df,
+            cv: None,
+            kkt: res.kkt,
+            converged: res.converged,
+            n_iter: res.n_iter,
+            coef_thresholded: None,
+            loglik_thresholded: None,
+            sbic: None,
+        };
+        Ok((pt, theta, res.hessian))
+    }
+
+    /// A path point of the paper's method at `lambda` with solution `theta`:
+    /// the R code's rule, every entry thresholded at 0.01, df the nonzeros
+    /// including `μ`.
+    #[allow(clippy::too_many_arguments)]
+    fn paper_point(
+        &self,
+        obj: &SmoothNegLogLik<'_>,
+        lambda: f64,
+        theta: &[f64],
+        objective: f64,
+        r: f64,
+        kkt: f64,
+        converged: bool,
+        n_iter: usize,
+    ) -> PathPoint {
+        let mut g = vec![0.0; theta.len()];
+        let ll = -obj.value_grad(theta, &mut g);
+        let phi = self.atoms.atoms(theta);
+        let n = self.data.n as f64;
+        let thr: Vec<f64> = theta
+            .iter()
+            .map(|&v| if v.abs() < 0.01 { 0.0 } else { v })
+            .collect();
+        let llt = -obj.value_grad(&thr, &mut g);
+        let df = thr.iter().filter(|&&v| v != 0.0).count() as f64;
+        PathPoint {
+            lambda,
+            lambda_n: lambda / n,
+            coef: self.to_original(theta),
+            log_likelihood: ll,
+            objective,
+            r,
+            active: phi.iter().map(|&v| v > 1e-12).collect(),
+            df,
+            criterion_loglik: llt,
+            bic: -2.0 * llt + n.ln() * df,
+            aic: -2.0 * llt + 2.0 * df,
+            cv: None,
+            kkt,
+            converged,
+            n_iter,
+            coef_thresholded: Some(self.to_original(&thr)),
+            loglik_thresholded: Some(llt),
+            sbic: Some(-2.0 * llt + ((n + 2.0) / 24.0).ln() * df),
+        }
     }
 
     /// The null model's coefficients: every penalized atom at zero, the

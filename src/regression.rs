@@ -3729,27 +3729,32 @@ fn kernel_grad(data: &RegressionData, eta: &[f64], y: &[f64], g: &mut [f64]) -> 
     }
 }
 
-/// How [`joint_loglik_grad_hess`] computes the per-observation Hessians of
-/// γ.
+/// How [`joint_loglik_grad_hess`] computes the per-observation Hessians.
+/// Every shape has an exact Hessian except `Shape::GammaTransported`
+/// (central differences of its gradient); the smooth charts use theirs for
+/// `Differences` too.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObsHessian {
-    /// Exact ([`crate::adjoint_hess`]): 0.09, 0.22, 0.42 and 2.1 µs per
-    /// observation at d = 3, 4, 5 and 8.
+    /// Exact. γ ([`crate::adjoint_hess`]): 0.09, 0.22, 0.42 and 2.1 µs per
+    /// observation at d = 3, 4, 5 and 8; γ-rot
+    /// ([`crate::gamma_rot_adjoint::loglik_gr_hess`]) 0.10, 0.36, 1.7 µs and
+    /// spectral ([`crate::spectral::loglik_sp_hess`]) 0.10, 0.30, 1.1 µs at
+    /// d = 3, 5 and 8 (against 0.4–0.5, 1.8–3.1 and 13–16 µs by differences
+    /// of their gradients); log-tangent 0.12, 0.67, 3.2 µs.
     Exact,
-    /// Central differences of the exact gradient for `d ≥ 4` (the exact
-    /// Hessian at d = 3): 1.5, 2.7 and 11 µs at d = 4, 5 and 8. They are
-    /// what fits used before the exact Hessian existed, and `finalize` keeps
-    /// them for fits that did not converge: such fits stop next to kinks
-    /// of γ, where differences over a small step (which average over the
-    /// kink) give the polishing Newton steps a better model than the
+    /// For γ, central differences of the exact gradient for `d ≥ 4` (the
+    /// exact Hessian at d = 3): 1.5, 2.7 and 11 µs at d = 4, 5 and 8. They
+    /// are what fits used before the exact Hessian existed, and `finalize`
+    /// keeps them for fits that did not converge: such fits stop next to
+    /// kinks of γ, where differences over a small step (which average over
+    /// the kink) give the polishing Newton steps a better model than the
     /// pointwise Hessian (measured on unconverged d = 4 and 5 fits).
     Differences,
     /// The outer product of the score, `−s_i s_iᵀ`: the expected information
     /// in place of the observed one. A metric for the proximal Newton of
-    /// penalized paths with shapes that have no exact Hessian (gamma-rot,
-    /// gamma-transported), where differences cost `2·b_dim` gradients per
-    /// observation; the solution of the penalized problem does not depend
-    /// on the metric.
+    /// penalized paths (measured 1.4× slower than the exact Hessian with
+    /// the same solutions; the solution of the penalized problem does not
+    /// depend on the metric).
     Opg,
 }
 
@@ -3782,10 +3787,10 @@ fn obs_hessian(
         return crate::gamma_transported::loglik_gt_hess_fd(fr, eta, y, g, h);
     }
     if let Some(fr) = &data.gr {
-        return crate::gamma_rot_adjoint::loglik_gr_hess_fd_rev(fr, eta, y, g, h);
+        return crate::gamma_rot_adjoint::loglik_gr_hess(fr, eta, y, g, h);
     }
     if let Some(fr) = &data.sp {
-        return crate::spectral::loglik_sp_hess_fd(fr, eta, y, g, h);
+        return crate::spectral::loglik_sp_hess(fr, eta, y, g, h);
     }
     if kind == ObsHessian::Differences && data.d >= 4 {
         return crate::hdual::loglik_eta_hess_fd(eta, y, g, h);
