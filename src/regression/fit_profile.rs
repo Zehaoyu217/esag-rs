@@ -6110,6 +6110,14 @@ fn penalized_speed() {
                 "log-tangent aLASSO",
                 PenalizedEsag::adaptive_lasso().shape(Shape::LogTangent),
             ),
+            (
+                "spectral hierarchical",
+                PenalizedEsag::hierarchical().shape(Shape::Spectral),
+            ),
+            (
+                "gamma-rot hierarchical",
+                PenalizedEsag::hierarchical().shape(Shape::GammaRot),
+            ),
         ];
         for (name, pe) in presets {
             if let Ok(f) = std::env::var("PRESET")
@@ -6119,12 +6127,14 @@ fn penalized_speed() {
             }
             for seed in seed0..seed0 + reps {
                 let (x, y) = simulate(&b, n, seed, Shape::Gamma);
-                let pe = pe
-                    .clone()
-                    .target(Target::ShapeSlopes)
-                    .lt_reference(center(d))
-                    .bic()
-                    .with_parallel(false);
+                let pe = if name.contains("hierarchical") {
+                    pe.clone()
+                } else {
+                    pe.clone().target(Target::ShapeSlopes)
+                }
+                .lt_reference(center(d))
+                .bic()
+                .with_parallel(false);
                 stage::take();
                 let t = Instant::now();
                 let path = pe.fit(&x, &y).unwrap();

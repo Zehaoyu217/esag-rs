@@ -99,6 +99,9 @@ enum ShapeKind {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum PenaltyKind {
+    /// the recommended penalty: hierarchical with covariates, the adaptive
+    /// eigen-gap penalty (log-tangent) without
+    Auto,
     /// L1 on each target coefficient
     Lasso,
     /// LASSO with adaptive weights (r = 1 unless --r)
@@ -113,6 +116,9 @@ enum PenaltyKind {
     Isotropy,
     /// i.i.d.: ties between the eigenvalues of the shape
     EigenGap,
+    /// nested groups per covariate: the covariate, its mean and shape
+    /// slopes, the shape's eigen parts, each coefficient (adaptive)
+    Hierarchical,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -535,6 +541,7 @@ fn run() -> Res<()> {
                 Some(name) => PenalizedEsag::paper(name)?,
                 None => {
                     let mut e = match penalty {
+                        PenaltyKind::Auto => PenalizedEsag::recommended(xm.ncols() > 0),
                         PenaltyKind::Lasso => PenalizedEsag::lasso(),
                         PenaltyKind::AdaptiveLasso => PenalizedEsag::adaptive_lasso(),
                         PenaltyKind::GroupLasso => PenalizedEsag::group_lasso(),
@@ -544,6 +551,7 @@ fn run() -> Res<()> {
                         }
                         PenaltyKind::Isotropy => PenalizedEsag::isotropy(),
                         PenaltyKind::EigenGap => PenalizedEsag::eigen_gap(),
+                        PenaltyKind::Hierarchical => PenalizedEsag::hierarchical(),
                     };
                     if let Some(t) = target {
                         e = e.target(match t {
@@ -572,13 +580,19 @@ fn run() -> Res<()> {
                             RocKind::Joint => RocMode::Joint,
                         });
                     }
-                    e.shape(match shape {
-                        ShapeKind::Gamma => Shape::Gamma,
-                        ShapeKind::LogTangent => Shape::LogTangent,
-                        ShapeKind::GammaTransported => Shape::GammaTransported,
-                        ShapeKind::GammaRot => Shape::GammaRot,
-                        ShapeKind::Spectral => Shape::Spectral,
-                    })
+                    if e.penalty == esag::penalized::Penalty::EigenGap {
+                        // log-tangent coordinates (i.i.d.: every shape
+                        // describes the same distributions)
+                        e
+                    } else {
+                        e.shape(match shape {
+                            ShapeKind::Gamma => Shape::Gamma,
+                            ShapeKind::LogTangent => Shape::LogTangent,
+                            ShapeKind::GammaTransported => Shape::GammaTransported,
+                            ShapeKind::GammaRot => Shape::GammaRot,
+                            ShapeKind::Spectral => Shape::Spectral,
+                        })
+                    }
                 }
             };
             est = match select {

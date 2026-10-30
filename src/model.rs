@@ -125,7 +125,11 @@ impl EsagModel {
     /// The model's shape and names override the estimator's (paper presets
     /// keep the paper's gamma shape).
     pub fn fit_regularized(&self, penalty: PenalizedEsag) -> Result<PenalizedPath> {
-        let mut p = if penalty.is_paper() {
+        // the paper's methods are γ's, and the eigen-gap penalty is the
+        // log-tangent's (i.i.d., where every shape describes the same
+        // distributions): they keep their shape
+        let mut p = if penalty.is_paper() || penalty.penalty == crate::penalized::Penalty::EigenGap
+        {
             penalty
         } else {
             penalty.shape(self.config.shape)

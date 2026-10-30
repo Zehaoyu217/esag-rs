@@ -546,3 +546,64 @@ fn gamma_penalized_kkt() {
         }
     }
 }
+
+/// The hierarchical penalty recovers which covariate acts on what: on
+/// log-tangent data where x1 shifts the mean only, x2 the shape only and x3,
+/// x4 nothing, the selected model keeps x1's mean slopes, x2's shape slopes
+/// and nothing else, for the adaptive and the RoC weights.
+#[test]
+fn hierarchical_selects_covariate_components() {
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+    let (d, n, p) = (5usize, 1500usize, 4usize);
+    let bd = esag::dims::eta_len(d);
+    let lt = esag::logtangent::LtFrame::standard(d);
+    let b = DMatrix::from_fn(bd, p + 1, |k, j| {
+        let s = (k * 7 + j * 3) as f64;
+        match j {
+            0 => {
+                if k < d {
+                    0.8 * (s * 0.9).sin() + if k == d - 1 { 3.0 } else { 0.0 }
+                } else {
+                    0.5 * (s * 1.3).sin()
+                }
+            }
+            1 if k < d => 0.5 * (s * 0.7).cos(),
+            2 if k >= d => 0.35 * (s * 1.1).sin(),
+            _ => 0.0,
+        }
+    });
+    let x = DMatrix::from_fn(n, p, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let eta: Vec<f64> = (0..bd)
+            .map(|k| b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+            .collect();
+        let v = esag::logtangent::covariance(&lt, &eta[..d], &eta[d..]);
+        let dist = Esag::from_covariance(&eta[..d], &v).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    for est in [
+        PenalizedEsag::hierarchical(),
+        PenalizedEsag::hierarchical().roc(RocMode::FixedPoint),
+    ] {
+        let path = est.fit(&x, &y).unwrap();
+        assert!(
+            path.points.iter().all(|p| p.converged),
+            "{}",
+            path.summary()
+        );
+        let c = &path.relaxed.as_ref().unwrap().coef;
+        let mean = |j: usize| (0..d).any(|k| c[(k, j)] != 0.0);
+        let shape = |j: usize| (d..bd).any(|k| c[(k, j)] != 0.0);
+        assert!(mean(1) && !shape(1), "x1: {}", path.summary());
+        assert!(!mean(2) && shape(2), "x2: {}", path.summary());
+        for j in [3, 4] {
+            assert!(!mean(j) && !shape(j), "x{j}: {}", path.summary());
+        }
+        assert!(path.config.method_name().contains("hierarchical"));
+    }
+}

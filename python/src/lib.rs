@@ -168,14 +168,22 @@ impl PyModel {
                     "roc_group_lasso" | "roc_glasso" | "roc_aglasso" => {
                         PenalizedEsag::group_lasso().roc(RocMode::FixedPoint)
                     }
+                    "auto" | "recommended" => {
+                        PenalizedEsag::recommended(self.inner.exog().ncols() > 0)
+                    }
+                    "hierarchical" | "tree" => PenalizedEsag::hierarchical(),
+                    "roc_hierarchical" | "roc_tree" => {
+                        PenalizedEsag::hierarchical().roc(RocMode::FixedPoint)
+                    }
                     "sparse_group_lasso" | "sglasso" => PenalizedEsag::sparse_group_lasso(l1_ratio),
                     "isotropy" => PenalizedEsag::isotropy(),
                     "eigen_gap" | "eigengap" => PenalizedEsag::eigen_gap(),
                     other => {
                         return Err(err(format!(
-                            "unknown penalty {other:?} (lasso, adaptive_lasso, roc_lasso, \
+                            "unknown penalty {other:?} (auto, lasso, adaptive_lasso, roc_lasso, \
                              group_lasso, adaptive_group_lasso, roc_group_lasso, \
-                             sparse_group_lasso, isotropy, eigen_gap)"
+                             hierarchical, roc_hierarchical, sparse_group_lasso, isotropy, \
+                             eigen_gap)"
                         )));
                     }
                 };

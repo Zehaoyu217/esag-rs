@@ -15,7 +15,11 @@
 //! which covariates keep a shape slope), how many λ's of the path were solved
 //! to their KKT tolerance, and the time per path.
 //!
-//! `cargo run --release --example penalty_compare -- iid|regression`
+//! * `covariates`: the same data with every slope penalized (the
+//!   covariates' effects on μ and on V): which covariates each method keeps
+//!   for the mean and for the shape, including the hierarchical penalty.
+//!
+//! `cargo run --release --example penalty_compare -- iid|regression|covariates`
 //! env: `R` (replicates), `NS` (sample sizes, e.g. `100,400`), `SHAPES`
 //! (`gamma,gr,sp,lt`), `PAPER=0` (skip the paper mode).
 use esag::distribution::Esag;
@@ -404,9 +408,160 @@ fn regression() {
     }
 }
 
+/// Every slope penalized (the covariates' effects on μ and on V): which
+/// covariates each method keeps for the mean (truth: x1, x2, x4) and for
+/// the shape (truth: x1, x3, x4), V̂ and μ̂ errors on 200 fresh rows, time.
+fn covariates() {
+    let d = env("D", 5usize);
+    let reps = env("R", 8u64);
+    let ns: Vec<usize> = list("NS", "500,2000")
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let b = hard_truth(d);
+    let (bd, pt) = (b.nrows(), b.ncols());
+    let (xt, _) = simulate(&b, 200, 99);
+    let eta = |c: &DMatrix<f64>, i: usize| -> Vec<f64> {
+        (0..bd)
+            .map(|k| c[(k, 0)] + (0..pt - 1).map(|j| c[(k, j + 1)] * xt[(i, j)]).sum::<f64>())
+            .collect()
+    };
+    let vtrue: Vec<DMatrix<f64>> = (0..200)
+        .map(|i| Esag::from_eta(&eta(&b, i)).unwrap().covariance())
+        .collect();
+    let mtrue: Vec<Vec<f64>> = (0..200).map(|i| eta(&b, i)[..d].to_vec()).collect();
+    // (V̂ error, μ̂ error) of coefficients c in the frame of `fit`
+    let errs = |fit: &esag::regression::EsagRegressorFit, c: &DMatrix<f64>| -> (f64, f64) {
+        let lt = fit.lt_frame();
+        let mut ve = 0.0;
+        let mut me = 0.0;
+        for i in 0..200 {
+            let e = eta(c, i);
+            ve += geodesic(
+                &vtrue[i],
+                &fit.distribution_at(&e, lt.as_ref()).unwrap().covariance(),
+            );
+            me += (0..d)
+                .map(|k| (e[k] - mtrue[i][k]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+        }
+        (ve / 200.0, me / 200.0)
+    };
+    let methods: Vec<(&str, PenalizedEsag)> = vec![
+        ("aLASSO", PenalizedEsag::adaptive_lasso()),
+        ("RoC-LASSO", PenalizedEsag::lasso().roc(RocMode::FixedPoint)),
+        (
+            "aGLASSO (cov. parts)",
+            PenalizedEsag::adaptive_group_lasso().grouping(Grouping::CovariatePart),
+        ),
+        (
+            "RoC-GLASSO (cov. parts)",
+            PenalizedEsag::group_lasso()
+                .grouping(Grouping::CovariatePart)
+                .roc(RocMode::FixedPoint),
+        ),
+        (
+            "a-sparse-GLASSO",
+            PenalizedEsag::sparse_group_lasso(0.5)
+                .grouping(Grouping::CovariatePart)
+                .adaptive(1.0),
+        ),
+        ("hierarchical a", PenalizedEsag::hierarchical()),
+        (
+            "hierarchical RoC",
+            PenalizedEsag::hierarchical().roc(RocMode::FixedPoint),
+        ),
+    ];
+    let (mu_drivers, shape_drivers) = ([1usize, 2, 4], [1usize, 3, 4]);
+    for &n in &ns {
+        println!(
+            "== covariates, d = {d}, n = {n}, {reps} replicates (γ data; μ: x1, x2, x4; V: x1, x3, x4; x5 nothing)"
+        );
+        let data: Vec<(DMatrix<f64>, DMatrix<f64>)> =
+            (0..reps).map(|s| simulate(&b, n, 7000 + s)).collect();
+        for (sname, shape) in shapes() {
+            let full: Vec<(f64, f64)> = data
+                .par_iter()
+                .map(|(x, y)| {
+                    let mut cfg = EsagRegressor::new().with_shape(shape).with_parallel(false);
+                    if shape != Shape::Gamma {
+                        cfg = cfg.with_lt_reference(Some(center(d)));
+                    }
+                    let f = cfg.fit(x, y).unwrap();
+                    errs(&f, &f.coef)
+                })
+                .collect();
+            println!(
+                "{sname:<12} {:<24} V̂ {:.3}  μ̂ {:.3}",
+                "full model",
+                full.iter().map(|r| r.0).sum::<f64>() / full.len() as f64,
+                full.iter().map(|r| r.1).sum::<f64>() / full.len() as f64,
+            );
+            for (mname, est) in &methods {
+                // (V̂, μ̂, μ TP, μ FP, V TP, V FP, solved, ms)
+                let rows: Vec<[f64; 8]> = data
+                    .par_iter()
+                    .map(|(x, y)| {
+                        let t = Instant::now();
+                        let path = est
+                            .clone()
+                            .shape(shape)
+                            .target(Target::Slopes)
+                            .lt_reference(center(d))
+                            .with_parallel(false)
+                            .fit(x, y)
+                            .unwrap();
+                        let ms = t.elapsed().as_secs_f64() * 1e3;
+                        let c = selected(&path);
+                        let fit = path.relaxed.as_ref().unwrap_or(&path.initial);
+                        let mean = |j: usize| (0..d).any(|k| c[(k, j)] != 0.0);
+                        let shp = |j: usize| (d..bd).any(|k| c[(k, j)] != 0.0);
+                        let (ve, me) = errs(fit, &c);
+                        let count = |f: &dyn Fn(usize) -> bool, js: &[usize]| {
+                            js.iter().filter(|&&j| f(j)).count() as f64
+                        };
+                        let not_mu: Vec<usize> =
+                            (1..pt).filter(|j| !mu_drivers.contains(j)).collect();
+                        let not_shape: Vec<usize> =
+                            (1..pt).filter(|j| !shape_drivers.contains(j)).collect();
+                        let solved = path.points.iter().filter(|p| p.converged).count() as f64
+                            / path.points.len() as f64;
+                        [
+                            ve,
+                            me,
+                            count(&mean, &mu_drivers),
+                            count(&mean, &not_mu),
+                            count(&shp, &shape_drivers),
+                            count(&shp, &not_shape),
+                            solved,
+                            ms,
+                        ]
+                    })
+                    .collect();
+                let m = |k: usize| rows.iter().map(|q| q[k]).sum::<f64>() / rows.len() as f64;
+                let mut ms: Vec<f64> = rows.iter().map(|q| q[7]).collect();
+                ms.sort_by(f64::total_cmp);
+                println!(
+                    "{sname:<12} {mname:<24} V̂ {:.3}  μ̂ {:.3}  μ kept {:.2}/3 wrong {:.2}/2  V kept {:.2}/3 wrong {:.2}/2  solved {:5.1}%  {:6.0} ms",
+                    m(0),
+                    m(1),
+                    m(2),
+                    m(3),
+                    m(4),
+                    m(5),
+                    100.0 * m(6),
+                    ms[ms.len() / 2]
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("regression") => regression(),
+        Some("covariates") => covariates(),
         _ => iid(),
     }
 }

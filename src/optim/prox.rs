@@ -225,6 +225,101 @@ impl PenaltyAtoms for SparseGroupNorms {
 /// `φ_j = σ_(j+1) − σ_(j)`: gaps between the sorted eigenvalues of the
 /// traceless symmetric `p × p` matrix `S` whose log-tangent coordinates
 /// ([`crate::logtangent::s_to_matrix`]) are `θ[offset .. offset + s_len]`.
+/// Tree-structured (hierarchical) group norms: `φ_g = ‖θ_{G_g}‖₂` over
+/// groups any two of which are disjoint or nested (singletons are entry
+/// atoms, `|θ_i|`). Their exact prox applies the groups' block
+/// soft-thresholdings once each, every group after the groups inside it
+/// (Jenatton, Mairal, Obozinski & Bach 2011, *Proximal methods for
+/// hierarchical sparse coding*). The top-level groups are disjoint and are
+/// the blocks of the coordinate descent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeGroupNorms {
+    pub groups: Vec<Vec<usize>>,
+    /// Atom indices in prox order (inner groups first).
+    order: Vec<usize>,
+    /// Per top-level group: its coordinates and its atoms, in prox order.
+    roots: Vec<(Vec<usize>, Vec<usize>)>,
+}
+
+impl TreeGroupNorms {
+    /// From groups any two of which are disjoint or nested (any order;
+    /// equal groups add their weights). `None` if two groups overlap without
+    /// one containing the other.
+    pub fn new(groups: Vec<Vec<usize>>) -> Option<Self> {
+        let sets: Vec<std::collections::BTreeSet<usize>> =
+            groups.iter().map(|g| g.iter().copied().collect()).collect();
+        for a in 0..sets.len() {
+            for b in a + 1..sets.len() {
+                let common = sets[a].intersection(&sets[b]).count();
+                if common > 0 && common < sets[a].len().min(sets[b].len()) {
+                    return None;
+                }
+            }
+        }
+        // a group inside another is a strict subset, so smaller; groups of
+        // equal size are disjoint or equal
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&a| groups[a].len());
+        let inside = |outer: usize, inner: usize| sets[inner].is_subset(&sets[outer]);
+        let mut roots: Vec<(Vec<usize>, Vec<usize>)> = vec![];
+        let mut placed = vec![false; groups.len()];
+        for &a in order.iter().rev() {
+            if placed[a] {
+                continue;
+            }
+            let atoms: Vec<usize> = order.iter().copied().filter(|&c| inside(a, c)).collect();
+            for &c in &atoms {
+                placed[c] = true;
+            }
+            roots.push((groups[a].clone(), atoms));
+        }
+        Some(Self {
+            groups,
+            order,
+            roots,
+        })
+    }
+
+    fn soft(&self, a: usize, v: &mut [f64], t: f64) {
+        let g = &self.groups[a];
+        let nrm = g.iter().map(|&i| v[i] * v[i]).sum::<f64>().sqrt();
+        let scale = if !(t < nrm) { 0.0 } else { 1.0 - t / nrm };
+        for &i in g {
+            v[i] *= scale;
+        }
+    }
+}
+
+impl PenaltyAtoms for TreeGroupNorms {
+    fn len(&self) -> usize {
+        self.groups.len()
+    }
+    fn atoms(&self, theta: &[f64], out: &mut [f64]) {
+        for (o, g) in out.iter_mut().zip(&self.groups) {
+            *o = g.iter().map(|&i| theta[i] * theta[i]).sum::<f64>().sqrt();
+        }
+    }
+    fn prox(&self, v: &mut [f64], t: &[f64]) {
+        for &a in &self.order {
+            self.soft(a, v, t[a]);
+        }
+    }
+    fn support(&self) -> Vec<usize> {
+        self.roots
+            .iter()
+            .flat_map(|(c, _)| c.iter().copied())
+            .collect()
+    }
+    fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        Some(self.roots.clone())
+    }
+    fn prox_block(&self, b: usize, v: &mut [f64], t: &[f64]) {
+        for &a in &self.roots[b].1 {
+            self.soft(a, v, t[a]);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EigenGaps {
     pub p: usize,
@@ -1065,6 +1160,76 @@ fn saddle_free(h: &DMatrix<f64>, floor: f64) -> DMatrix<f64> {
     (&fixed + fixed.transpose()) * 0.5
 }
 
+/// A block of [`solve_model_blocks`] with several atoms (sparse groups,
+/// trees), minimized on its own by FISTA with adaptive restarts:
+/// `min_u ½(u − z_B)ᵀH_BB(u − z_B) + r_Bᵀ(u − z_B) + λ Σ_a w_a φ_a(u)`, step
+/// `1/L_B` (so the thresholds are `t_a = λ w_a / L_B`), from `z_B`, until a
+/// step moves no coordinate by more than `1e-12 (1 + max|u|)` or after
+/// [`BLOCK_INNER`] steps; the result is written into `z`.
+#[allow(clippy::too_many_arguments)]
+fn block_fista<A: PenaltyAtoms>(
+    pen: &Penalty<A>,
+    b: usize,
+    coords: &[usize],
+    hbb: &DMatrix<f64>,
+    lb: f64,
+    t: &[f64],
+    r: &[f64],
+    z: &mut [f64],
+) {
+    let m = coords.len();
+    let z0: Vec<f64> = coords.iter().map(|&i| z[i]).collect();
+    let rb: Vec<f64> = coords.iter().map(|&i| r[i]).collect();
+    let mut u = z0.clone();
+    let mut y = z0.clone();
+    let mut tk = 1.0f64;
+    let mut g = vec![0.0; m];
+    for _ in 0..BLOCK_INNER {
+        for a in 0..m {
+            g[a] = rb[a] + (0..m).map(|c| hbb[(a, c)] * (y[c] - z0[c])).sum::<f64>();
+        }
+        for (a, &i) in coords.iter().enumerate() {
+            z[i] = y[a] - g[a] / lb;
+        }
+        pen.atoms.prox_block(b, z, t);
+        let unew: Vec<f64> = coords.iter().map(|&i| z[i]).collect();
+        let change = unew
+            .iter()
+            .zip(&u)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0, f64::max);
+        // restart where the momentum points uphill (O'Donoghue & Candès)
+        let uphill: f64 = (0..m).map(|a| (y[a] - unew[a]) * (unew[a] - u[a])).sum();
+        let t_next = if uphill > 0.0 {
+            1.0
+        } else {
+            0.5 * (1.0 + (1.0 + 4.0 * tk * tk).sqrt())
+        };
+        let beta = if uphill > 0.0 {
+            0.0
+        } else {
+            (tk - 1.0) / t_next
+        };
+        for a in 0..m {
+            y[a] = unew[a] + beta * (unew[a] - u[a]);
+        }
+        tk = t_next;
+        u = unew;
+        if change <= 1e-12 * (1.0 + u.iter().fold(0.0f64, |mx, v| mx.max(v.abs()))) {
+            break;
+        }
+    }
+    for (a, &i) in coords.iter().enumerate() {
+        z[i] = u[a];
+    }
+}
+
+/// Steps of [`block_fista`] per visit of a block. The sweeps revisit every
+/// block, so a few steps per visit suffice: on hierarchical paths (d = 5)
+/// 10 took half the time of 200, with the same solutions, and 3 or 5 needed
+/// more sweeps.
+const BLOCK_INNER: usize = 10;
+
 /// `u = argmin ½uᵀHu − cᵀu + τ‖u‖₂` for symmetric positive definite `H`
 /// (eigen-decomposition `eig`), written into `z` at `coords`: `u = 0` if
 /// `‖c‖ ≤ τ`, else `u = (H + sI)⁻¹c` with `s > 0` the root of
@@ -1165,8 +1330,32 @@ fn solve_model_blocks<A: PenaltyAtoms>(
     // the eigen-decomposition of H_BB (the exact block minimizer)
     let mut penalized: Vec<(usize, f64)> = vec![];
     let mut exact: Vec<Option<(SymmetricEigen<f64, nalgebra::Dyn>, f64)>> = vec![];
+    // H_BB of the blocks with several atoms (solved by an inner FISTA)
+    let mut inner: Vec<Option<DMatrix<f64>>> = vec![];
     for (b, (coords, atoms)) in blocks.iter().enumerate() {
         if atoms.iter().all(|&a| w[a] == 0.0) {
+            continue;
+        }
+        if atoms.iter().all(|&a| w[a] == 0.0 || w[a].is_infinite()) {
+            // only free and pinned atoms (relaxed refits): the coordinates
+            // in a pinned atom are 0, the others are free, minimized
+            // exactly with the unpenalized ones (the prox with thresholds
+            // ∞ / 0 zeroes exactly the pinned atoms' coordinates)
+            let mut ones = vec![0.0; n];
+            for &i in coords {
+                ones[i] = 1.0;
+            }
+            let tz: Vec<f64> = w
+                .iter()
+                .map(|&v| if v.is_infinite() { v } else { 0.0 })
+                .collect();
+            pen.atoms.prox_block(b, &mut ones, &tz);
+            for &i in coords {
+                if ones[i] == 0.0 {
+                    in_block[i] = true;
+                    z[i] = 0.0;
+                }
+            }
             continue;
         }
         for &i in coords {
@@ -1178,13 +1367,13 @@ fn solve_model_blocks<A: PenaltyAtoms>(
             }
             continue;
         }
-        let (lb, eig) = if coords.len() == 1 {
-            (h[(coords[0], coords[0])], None)
+        let (lb, eig, sub) = if coords.len() == 1 {
+            (h[(coords[0], coords[0])], None, None)
         } else {
             let sub =
                 DMatrix::from_fn(coords.len(), coords.len(), |a, c| h[(coords[a], coords[c])]);
-            let eig = SymmetricEigen::new(sub);
-            (eig.eigenvalues.max(), Some(eig))
+            let eig = SymmetricEigen::new(sub.clone());
+            (eig.eigenvalues.max(), Some(eig), Some(sub))
         };
         let lb = lb.max(1e-300);
         for &a in atoms {
@@ -1192,6 +1381,7 @@ fn solve_model_blocks<A: PenaltyAtoms>(
         }
         let norm = atoms.len() == 1 && pen.atoms.block_is_norm(b) && w[atoms[0]].is_finite();
         exact.push(eig.filter(|_| norm).map(|e| (e, pen.lambda * w[atoms[0]])));
+        inner.push(sub.filter(|_| !norm && atoms.len() > 1));
         penalized.push((b, lb));
     }
     let free: Vec<usize> = (0..n).filter(|&i| !in_block[i]).collect();
@@ -1244,6 +1434,8 @@ fn solve_model_blocks<A: PenaltyAtoms>(
                     .map(|&i| coords.iter().map(|&j| h[(i, j)] * old[j]).sum::<f64>() - r[i])
                     .collect();
                 group_block_min(eig, &c, *tau, coords, &mut z);
+            } else if let Some(hbb) = &inner[k] {
+                block_fista(pen, b, coords, hbb, lb, &t, &r, &mut z);
             } else {
                 for &i in coords {
                     z[i] -= r[i] / lb;
@@ -1348,6 +1540,58 @@ fn solve_model_fista<A: PenaltyAtoms>(
 mod tests {
     use super::*;
 
+    /// The tree prox is the exact proximal map: no perturbation lowers
+    /// `½‖z − v‖² + Σ_g t_g ‖z_g‖` at its output.
+    #[test]
+    fn tree_prox_is_exact() {
+        let groups: Vec<Vec<usize>> = vec![
+            (0..7).collect(),
+            vec![0, 1, 2],
+            vec![3, 4, 5, 6],
+            vec![5, 6],
+            vec![0],
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![4],
+            vec![5],
+            vec![6],
+        ];
+        let tree = TreeGroupNorms::new(groups.clone()).unwrap();
+        let obj = |z: &[f64], v: &[f64], t: &[f64]| -> f64 {
+            0.5 * z.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum::<f64>()
+                + groups
+                    .iter()
+                    .zip(t)
+                    .map(|(g, &tg)| tg * g.iter().map(|&i| z[i] * z[i]).sum::<f64>().sqrt())
+                    .sum::<f64>()
+        };
+        for case in 0..40 {
+            let v: Vec<f64> = (0..7)
+                .map(|i| 2.0 * ((i * 13 + case * 7) as f64 * 0.71).sin())
+                .collect();
+            let t: Vec<f64> = (0..groups.len())
+                .map(|g| 0.4 * (1.0 + ((g * 5 + case * 3) as f64 * 1.3).cos()))
+                .collect();
+            let mut z = v.clone();
+            tree.prox(&mut z, &t);
+            let f0 = obj(&z, &v, &t);
+            for k in 0..400 {
+                for eps in [1e-3, 1e-1] {
+                    let dz: Vec<f64> = (0..7)
+                        .map(|i| eps * ((i * 31 + k * 17 + case) as f64 * 0.37).sin())
+                        .collect();
+                    let zp: Vec<f64> = z.iter().zip(&dz).map(|(a, b)| a + b).collect();
+                    assert!(
+                        obj(&zp, &v, &t) >= f0 - 1e-12,
+                        "case {case}: perturbation lowers it"
+                    );
+                }
+            }
+        }
+        assert!(TreeGroupNorms::new(vec![vec![0, 1], vec![1, 2]]).is_none());
+    }
+
     /// Block coordinate descent and FISTA reach the same minimizer of the
     /// model (the same model value; the same coordinates where `H` is well
     /// conditioned), for group and sparse-group atoms, with free (weight 0),
@@ -1448,6 +1692,53 @@ mod tests {
                     &h,
                     coords,
                     &format!("sparse groups, ridge {ridge}, λ = {lambda}"),
+                );
+
+                // a tree: two top-level groups, each with nested parts and entries
+                let tree_groups: Vec<Vec<usize>> = vec![
+                    (0..9).collect(),
+                    vec![0, 1, 2],
+                    vec![3, 4, 5, 6, 7, 8],
+                    vec![3, 4],
+                    vec![5, 6, 7, 8],
+                    (10..18).collect(),
+                    vec![10, 11, 12, 13],
+                    vec![14, 15, 16, 17],
+                ]
+                .into_iter()
+                .chain((0..18).filter(|&i| i != 9).map(|i| vec![i]))
+                .collect();
+                let tg = Penalty {
+                    atoms: TreeGroupNorms::new(tree_groups).unwrap(),
+                    base: vec![],
+                    exponent: Exponent::Fixed(1.0),
+                    lambda,
+                };
+                let mut w = vec![0.8; tg.atoms.len()];
+                w[2] = f64::INFINITY;
+                w[9] = 0.0;
+                check(
+                    &theta,
+                    &g,
+                    &tg,
+                    &w,
+                    &h,
+                    coords,
+                    &format!("tree, ridge {ridge}, λ = {lambda}"),
+                );
+                // relaxed refits: only free (0) and pinned (∞) atoms
+                let mut w = vec![0.0; tg.atoms.len()];
+                w[2] = f64::INFINITY;
+                w[6] = f64::INFINITY;
+                w[12] = f64::INFINITY;
+                check(
+                    &theta,
+                    &g,
+                    &tg,
+                    &w,
+                    &h,
+                    coords,
+                    &format!("tree 0/∞, ridge {ridge}, λ = {lambda}"),
                 );
             }
         }

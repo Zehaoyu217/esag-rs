@@ -87,6 +87,8 @@ reg = model.fit_regularized("group_lasso",
                             groups=[[("mu[1]", "temp"), ("mu[2]", "temp")]])
 reg = model.fit_regularized("lasso", alpha=0.02)                  # fixed weight, no path
 reg = model.fit_regularized("roc_group_lasso", groups="gamma")    # RoC-GLASSO (any shape; "eigen_parts" for spectral)
+reg = model.fit_regularized("auto")                               # recommended: the hierarchical adaptive group LASSO
+reg = model.fit_regularized("hierarchical", adaptive="roc")       # ... with RoC weights
 print(reg.summary())       # relaxed refit of the selected model, dropped terms marked
 reg.params                 # penalized coefficients at the selected weight
 reg.relaxed                # an ESAGResults (SEs, tests, ...)
@@ -95,13 +97,21 @@ reg.path                   # alpha, lambda, df, llf, criterion, n_active, select
 
 | argument | values |
 |---|---|
-| `penalty` | `lasso`, `adaptive_lasso`, `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
+| `penalty` | `auto` (recommended: `hierarchical` with covariates, the adaptive `eigen_gap` without), `lasso`, `adaptive_lasso`, `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`, `hierarchical`, `roc_hierarchical`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
 | `target` | `slopes` (default), `mean`, `shape_slopes`, `shape` |
 | `groups` | `covariate` (default), `covariate_part`, `parameter`, `all`, `gamma` (γ and γ-rot), `eigen_parts` (γ-rot and spectral), or lists of `(parameter, variable)` pairs |
 | `adaptive` | `True` (r = 1), a number r, `False`, or `"roc"`: Project 3's RoC exponent r = max(1, ‖μ̃‖/‖μ‖) (with covariates the mean of the per-observation ratios), by the fixed point; `"roc_joint"`: the paper's joint objective (i.i.d.) |
 | `select` | `bic` (default), `aic`, `cv` (`cv_folds`, `seed`) |
 | `alpha` | penalty weight(s) per observation (`lambda / n`); default: automatic path |
 | `paper` | `"LASSO"`, `"aLASSO"`, `"RoC-LASSO"`, `"GLASSO"`, `"aGLASSO"`, `"RoC-GLASSO"`: the Project 3 R scripts' methods |
+
+`hierarchical` nests, per covariate, the covariate's whole column, its
+mean slopes and its shape slopes, the shape's eigen parts (gamma-rot: group
+1, each log eigenvalue ratio, each rotation vector; spectral and
+log-tangent: the eigenvalue and the rotation coordinates) and every
+coefficient, each weighted adaptively (or by RoC): a covariate can drop out,
+act on the mean direction or on V only, move only V's sizes or only its
+axes, or keep single coefficients (exact proximal map for nested groups).
 
 Covariates are standardized internally for the penalty; coefficients are
 reported on the original scale. With about as many coefficients as

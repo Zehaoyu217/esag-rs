@@ -223,8 +223,11 @@ def test_iid_and_shape_penalties():
     assert (iso.params.values[:, 4:] == 0).all()
     gaps = m.fit_regularized("eigen_gap")
     assert "eigen-gap" in gaps.method
-    with pytest.raises(ValueError):
-        esag.ESAG(y, shape="gamma").fit_regularized("eigen_gap")
+    # the eigen-gap penalty is the log-tangent's; without covariates every
+    # shape describes the same distributions, so any model's shape fits it
+    g2 = esag.ESAG(y, shape="gamma").fit_regularized("eigen_gap")
+    assert "eigen-gap" in g2.method
+    assert list(g2.params.columns)[y.shape[1]:][0].startswith("s[")
 
 
 def test_auto_shape():
@@ -407,3 +410,23 @@ def test_roc_weights_for_every_shape():
         esag.ESAG(Y, X, shape="gamma-rot").fit_regularized("group_lasso", adaptive="roc_joint")
     with pytest.raises(ValueError):
         esag.ESAG(Y).fit_regularized(paper="RoC-GLASSO", adaptive="roc")
+
+
+def test_auto_penalty():
+    """``"auto"``: the hierarchical adaptive group LASSO with covariates, the
+    adaptive eigen-gap penalty (log-tangent coordinates) without them, for
+    any model shape."""
+    rng = np.random.default_rng(4)
+    n = 400
+    X = rng.standard_normal((n, 2))
+    Y = np.empty((n, 4))
+    for i in range(n):
+        mu = np.array([1.0 + 0.5 * X[i, 0], 0.8, 1.2, 2.0])
+        gam = np.array([0.6, -0.3, 0.4 + 0.3 * X[i, 1], 0.2, -0.1])
+        Y[i] = esag.Distribution(mu=mu, gamma=gam).sample(1, seed=int(80 + i))[0]
+    for shape in ["gamma-rot", "spectral", "log-tangent"]:
+        reg = esag.ESAG(Y, X, shape=shape).fit_regularized("auto")
+        assert "hierarchical" in str(reg.summary())
+        iid = esag.ESAG(Y, shape=shape).fit_regularized("auto")
+        assert "eigen-gap" in str(iid.summary())
+        assert list(iid.params.columns)[4:] == [f"s[{k}]" for k in range(1, 6)]

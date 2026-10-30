@@ -49,7 +49,7 @@ use crate::error::{EsagError, Result};
 use crate::optim::lbfgs::{LbfgsConfig, Objective, minimize};
 use crate::optim::prox::{
     EigenGaps, Exponent, GroupNorms, Penalty as AtomPenalty, PenaltyAtoms, ProxConfig, RocMode,
-    SmoothObjective, SparseGroupNorms,
+    SmoothObjective, SparseGroupNorms, TreeGroupNorms,
 };
 use crate::regression::{
     EsagRegressor, EsagRegressorFit, Init, RegressionData, Shape, SmoothNegLogLik,
@@ -73,6 +73,16 @@ pub enum Penalty {
     /// the log-tangent shape `S` (i.i.d.): zero gaps are tied eigenvalues of
     /// `V` (partial isotropy).
     EigenGap,
+    /// The hierarchical group LASSO over the covariates' components: per
+    /// design column, `w‖β_col‖₂` (the covariate), `w‖β_mean‖₂` and
+    /// `w‖β_shape‖₂` (its effect on the mean direction and on `V`), the
+    /// shape's eigen parts (γ-rot: group 1, each `κ_j`, each `ω_j`;
+    /// spectral and log-tangent: the eigenvalue and the rotation
+    /// coordinates; γ: its groups) and every coefficient alone, so that a
+    /// covariate can drop out, act on `μ` or `V` only, move only the sizes or
+    /// only the axes of `V`, or keep single coefficients. Tree-structured,
+    /// with the exact prox (`optim::prox::TreeGroupNorms`).
+    Hierarchical,
 }
 
 /// How the target coefficients are grouped (group and sparse-group LASSO).
@@ -282,6 +292,19 @@ impl PenalizedEsag {
         )
     }
     /// Adaptive group LASSO (`r = 1`), one group per covariate.
+    /// The hierarchical adaptive group LASSO over every slope
+    /// ([`Penalty::Hierarchical`]): which covariates act, on the mean
+    /// direction or on `V`, and through which eigen parts. `.roc(..)` for RoC
+    /// weights, `.plain()` for none.
+    pub fn hierarchical() -> Self {
+        Self::base(
+            Penalty::Hierarchical,
+            Grouping::Covariate,
+            Target::Slopes,
+            Weighting::Adaptive(1.0),
+        )
+    }
+
     pub fn adaptive_group_lasso() -> Self {
         Self::group_lasso().adaptive(1.0)
     }
@@ -314,6 +337,22 @@ impl PenalizedEsag {
             Weighting::Adaptive(1.0),
         )
     }
+    /// The recommended penalty (the comparison of `docs/MATH.md` §8,
+    /// `examples/penalty_compare.rs`): with covariates the hierarchical
+    /// adaptive group LASSO over every slope ([`Self::hierarchical`]: which
+    /// covariates act, on the mean direction or on `V`, through which eigen
+    /// parts), on the model's shape; without, the eigen-gap penalty with
+    /// adaptive weights ([`Self::eigen_gap`]: tied eigenvalues of `V`), in
+    /// log-tangent coordinates (without covariates every shape describes
+    /// the same distributions).
+    pub fn recommended(has_covariates: bool) -> Self {
+        if has_covariates {
+            Self::hierarchical()
+        } else {
+            Self::eigen_gap().shape(Shape::LogTangent)
+        }
+    }
+
     /// One of the paper's six methods, reproduced as coded in its R scripts
     /// (γ shape, i.i.d.): `LASSO`, `aLASSO`, `RoC-LASSO`, `GLASSO`,
     /// `aGLASSO`, `RoC-GLASSO`.
@@ -423,6 +462,7 @@ impl PenalizedEsag {
             Penalty::GroupLasso => "group LASSO".to_string(),
             Penalty::SparseGroupLasso { .. } => "sparse group LASSO".to_string(),
             Penalty::EigenGap => "eigen-gap LASSO".to_string(),
+            Penalty::Hierarchical => "hierarchical group LASSO".to_string(),
         };
         let paper = if self.is_paper() { " [paper mode]" } else { "" };
         format!("{weights}{core}{paper}")
@@ -693,6 +733,7 @@ impl PenalizedPath {
         let grouping = match (&c.penalty, &c.grouping) {
             (Penalty::Lasso, _) => "entries".to_string(),
             (Penalty::EigenGap, _) => "eigen-gaps".to_string(),
+            (Penalty::Hierarchical, _) => "covariate tree".to_string(),
             (_, Grouping::Covariate) => "covariate".to_string(),
             (_, Grouping::CovariatePart) => "cov. part".to_string(),
             (_, Grouping::Parameter) => "parameter".to_string(),
@@ -851,6 +892,7 @@ enum Atoms {
     Groups(GroupNorms),
     SparseGroups(SparseGroupNorms),
     Gaps(EigenGaps),
+    Tree(TreeGroupNorms),
 }
 
 impl Atoms {
@@ -859,6 +901,7 @@ impl Atoms {
             Atoms::Groups(g) => g.len(),
             Atoms::SparseGroups(g) => g.len(),
             Atoms::Gaps(g) => g.len(),
+            Atoms::Tree(g) => g.len(),
         }
     }
     fn atoms(&self, theta: &[f64]) -> Vec<f64> {
@@ -1118,6 +1161,60 @@ impl Prepared {
                 p: d - 1,
                 offset: d,
             }),
+            Penalty::Hierarchical => {
+                // the shape's eigen parts, as row ranges of B
+                let p_ = d - 1;
+                let parts: Vec<std::ops::Range<usize>> = match cfg.shape {
+                    Shape::GammaRot => {
+                        let mut v = Vec::with_capacity(2 * d);
+                        v.push(d..d + 2);
+                        for jg in 2..=d - 2 {
+                            let start = d + jg * (jg + 1) / 2 - 1;
+                            v.push(start..start + 1);
+                            v.push(start + 1..start + jg + 1);
+                        }
+                        v
+                    }
+                    Shape::Gamma | Shape::GammaTransported => (1..=d - 2)
+                        .map(|jg| {
+                            let start = d + jg * (jg + 1) / 2 - 1;
+                            start..start + jg + 1
+                        })
+                        .collect(),
+                    // eigenvalue (Helmert) and rotation (off-diagonal)
+                    // coordinates
+                    Shape::Spectral | Shape::LogTangent => vec![d..d + p_ - 1, d + p_ - 1..bd],
+                };
+                let mut groups: Vec<Vec<usize>> = vec![];
+                let push = |g: Vec<usize>, groups: &mut Vec<Vec<usize>>| {
+                    if !g.is_empty() && !groups.contains(&g) {
+                        groups.push(g);
+                    }
+                };
+                for j in 0..pt {
+                    let col: Vec<(usize, usize)> =
+                        target.iter().copied().filter(|c| c.1 == j).collect();
+                    if col.is_empty() {
+                        continue;
+                    }
+                    let ids = |f: &dyn Fn(usize) -> bool| -> Vec<usize> {
+                        col.iter()
+                            .filter(|c| f(c.0))
+                            .map(|&(k, j)| idx(k, j))
+                            .collect()
+                    };
+                    push(ids(&|_| true), &mut groups);
+                    push(ids(&|k| k < d), &mut groups);
+                    push(ids(&|k| k >= d), &mut groups);
+                    for r in &parts {
+                        push(ids(&|k| r.contains(&k)), &mut groups);
+                    }
+                    for &(k, j) in &col {
+                        push(vec![idx(k, j)], &mut groups);
+                    }
+                }
+                Atoms::Tree(TreeGroupNorms::new(groups).expect("the covariate tree is nested"))
+            }
         };
         // base weights: adaptive 1/φ(θ̃) (∞ at zero), group-size factor √|g|
         // on group atoms, and the sparse-group mixture (1−α) / α
@@ -1131,6 +1228,7 @@ impl Prepared {
                 .chain(std::iter::repeat_n(1.0, g.support().len()))
                 .collect(),
             Atoms::Gaps(g) => vec![1.0; g.p - 1],
+            Atoms::Tree(g) => g.groups.iter().map(|g| g.len() as f64).collect(),
         };
         let mut base: Vec<f64> = match (cfg.weighting, &atoms) {
             (Weighting::Plain, Atoms::Gaps(gp)) => {
@@ -1349,6 +1447,42 @@ impl Prepared {
                             lo = mid
                         } else {
                             hi = mid
+                        }
+                    }
+                    lmax = lmax.max(hi);
+                }
+                lmax
+            }
+            Atoms::Tree(tr) => {
+                // a top-level group is zero at λ iff the tree prox of the
+                // gradient with thresholds λ w zeroes it (monotone in λ):
+                // bisection per group
+                let blocks = tr.blocks().unwrap_or_default();
+                let mut lmax: f64 = 0.0;
+                let mut v = vec![0.0; g.len()];
+                for (b, (coords, _)) in blocks.iter().enumerate() {
+                    let zero = |lam: f64, v: &mut Vec<f64>| -> bool {
+                        for &i in coords {
+                            v[i] = g[i];
+                        }
+                        let t: Vec<f64> = w.iter().map(|&wi| lam * wi).collect();
+                        tr.prox_block(b, v, &t);
+                        coords.iter().all(|&i| v[i] == 0.0)
+                    };
+                    if zero(0.0, &mut v) {
+                        continue;
+                    }
+                    let mut hi = 1.0;
+                    while !zero(hi, &mut v) && hi < 1e12 {
+                        hi *= 2.0;
+                    }
+                    let mut lo = 0.0;
+                    for _ in 0..80 {
+                        let mid = 0.5 * (lo + hi);
+                        if zero(mid, &mut v) {
+                            hi = mid
+                        } else {
+                            lo = mid
                         }
                     }
                     lmax = lmax.max(hi);
@@ -1992,6 +2126,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.atoms(theta, out),
             Atoms::SparseGroups(g) => g.atoms(theta, out),
             Atoms::Gaps(g) => g.atoms(theta, out),
+            Atoms::Tree(g) => g.atoms(theta, out),
         }
     }
     fn prox(&self, v: &mut [f64], t: &[f64]) {
@@ -1999,6 +2134,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.prox(v, t),
             Atoms::SparseGroups(g) => g.prox(v, t),
             Atoms::Gaps(g) => g.prox(v, t),
+            Atoms::Tree(g) => g.prox(v, t),
         }
     }
     fn support(&self) -> Vec<usize> {
@@ -2006,6 +2142,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.support(),
             Atoms::SparseGroups(g) => g.support(),
             Atoms::Gaps(g) => g.support(),
+            Atoms::Tree(g) => g.support(),
         }
     }
     fn blocks(&self) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
@@ -2013,6 +2150,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.blocks(),
             Atoms::SparseGroups(g) => g.blocks(),
             Atoms::Gaps(g) => g.blocks(),
+            Atoms::Tree(g) => g.blocks(),
         }
     }
     fn prox_block(&self, b: usize, v: &mut [f64], t: &[f64]) {
@@ -2020,6 +2158,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.prox_block(b, v, t),
             Atoms::SparseGroups(g) => g.prox_block(b, v, t),
             Atoms::Gaps(g) => g.prox_block(b, v, t),
+            Atoms::Tree(g) => g.prox_block(b, v, t),
         }
     }
     fn block_is_norm(&self, b: usize) -> bool {
@@ -2027,6 +2166,7 @@ impl PenaltyAtoms for Atoms {
             Atoms::Groups(g) => g.block_is_norm(b),
             Atoms::SparseGroups(g) => g.block_is_norm(b),
             Atoms::Gaps(g) => g.block_is_norm(b),
+            Atoms::Tree(g) => g.block_is_norm(b),
         }
     }
 }

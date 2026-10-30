@@ -71,12 +71,15 @@ class ShapeWarning(UserWarning):
 
 #: ``fit_regularized(penalty=...)`` choices.
 PENALTIES = (
+    "auto",
     "lasso",
     "adaptive_lasso",
     "roc_lasso",
     "group_lasso",
     "adaptive_group_lasso",
     "roc_group_lasso",
+    "hierarchical",
+    "roc_hierarchical",
     "sparse_group_lasso",
     "isotropy",
     "eigen_gap",
@@ -300,11 +303,20 @@ class ESAG:
         penalty : str
             One of :data:`PENALTIES`:
 
+            * ``"auto"``: the recommended penalty: with covariates the
+              hierarchical adaptive group LASSO over every slope, without
+              them the adaptive eigen-gap penalty (log-tangent coordinates);
             * ``"lasso"`` / ``"adaptive_lasso"`` / ``"roc_lasso"``: L1 on
               each coefficient (plain, adaptive, RoC weights);
             * ``"group_lasso"`` / ``"adaptive_group_lasso"`` /
               ``"roc_group_lasso"``: L2 norm of each group (``groups``),
               sqrt(group size) weights (plain, adaptive, RoC);
+            * ``"hierarchical"`` / ``"roc_hierarchical"``: the hierarchical
+              adaptive (RoC) group LASSO over each covariate's components:
+              the covariate, its mean and shape slopes, the shape's eigen
+              parts and each coefficient, nested (default target: every
+              slope), so a covariate can drop out, act on the mean or on V
+              only, or move only V's sizes or only its axes;
             * ``"sparse_group_lasso"``: ``l1_ratio`` * LASSO +
               (1 - ``l1_ratio``) * group LASSO;
             * ``"isotropy"``: all shape coefficients as one group (shrinks
@@ -365,9 +377,13 @@ class ESAG:
         if alpha is not None:
             a = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
             lambdas = [float(v) * self.nobs for v in a]
-        # the paper's methods are defined on Yu & Huang's gamma whatever the
-        # model's shape (the fit itself always uses it), so label them so
-        shape = "gamma" if paper is not None else self.shape
+        # the paper's methods are defined on Yu & Huang's gamma, and the
+        # eigen-gap penalty (also "auto" without covariates) on the
+        # log-tangent shape, whatever the model's shape: label them so
+        iid_gap = penalty in ("eigen_gap", "eigengap") or (
+            penalty in ("auto", "recommended") and self.exog.shape[1] == 0
+        )
+        shape = "gamma" if paper is not None else ("log-tangent" if iid_gap else self.shape)
         native = self._native.fit_regularized(
             penalty=penalty,
             target=target,

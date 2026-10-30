@@ -98,10 +98,15 @@ esag.Distribution(mu=[...], gamma=[...]).sample(1000, seed=1)   # .logpdf, .cova
 esag.PENALTIES, esag.TARGETS, esag.GROUPINGS, esag.NULLS
 ```
 
-`fit_regularized` arguments: `penalty` in `lasso | adaptive_lasso |
-roc_lasso | group_lasso | adaptive_group_lasso | roc_group_lasso |
+`fit_regularized` arguments: `penalty` in `auto` (recommended:
+`hierarchical` with covariates, adaptive `eigen_gap` on log-tangent
+coordinates without) `| lasso | adaptive_lasso | roc_lasso | group_lasso |
+adaptive_group_lasso | roc_group_lasso | hierarchical | roc_hierarchical |
 sparse_group_lasso (l1_ratio) | isotropy | eigen_gap` (i.i.d.,
-log-tangent); `target` in `slopes | mean |
+log-tangent); `hierarchical` nests per covariate its column, its mean and
+shape slopes, the shape's eigen parts and each coefficient (Rust
+`PenalizedEsag::hierarchical()`, `PenalizedEsag::recommended(has_covariates)`;
+CLI `--penalty hierarchical`); `target` in `slopes | mean |
 shape_slopes | shape`; `groups` in `covariate | covariate_part | parameter |
 all | gamma` (the gamma family's groups, for gamma-rot each (kappa_j,
 omega_j)) `| eigen_parts` (gamma-rot: each kappa_j alone and each omega_j as
