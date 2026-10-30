@@ -86,6 +86,7 @@ reg = model.fit_regularized("lasso", target="mean", select="cv")  # mean slopes 
 reg = model.fit_regularized("group_lasso",
                             groups=[[("mu[1]", "temp"), ("mu[2]", "temp")]])
 reg = model.fit_regularized("lasso", alpha=0.02)                  # fixed weight, no path
+reg = model.fit_regularized("roc_group_lasso", groups="gamma")    # RoC-GLASSO (any shape; "eigen_parts" for spectral)
 print(reg.summary())       # relaxed refit of the selected model, dropped terms marked
 reg.params                 # penalized coefficients at the selected weight
 reg.relaxed                # an ESAGResults (SEs, tests, ...)
@@ -94,10 +95,10 @@ reg.path                   # alpha, lambda, df, llf, criterion, n_active, select
 
 | argument | values |
 |---|---|
-| `penalty` | `lasso`, `adaptive_lasso`, `group_lasso`, `adaptive_group_lasso`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
+| `penalty` | `lasso`, `adaptive_lasso`, `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
 | `target` | `slopes` (default), `mean`, `shape_slopes`, `shape` |
-| `groups` | `covariate` (default), `covariate_part`, `parameter`, `all`, `gamma`, or lists of `(parameter, variable)` pairs |
-| `adaptive` | `True` (r = 1), a number r, or `False` |
+| `groups` | `covariate` (default), `covariate_part`, `parameter`, `all`, `gamma` (γ and γ-rot), `eigen_parts` (γ-rot and spectral), or lists of `(parameter, variable)` pairs |
+| `adaptive` | `True` (r = 1), a number r, `False`, or `"roc"`: Project 3's RoC exponent r = max(1, ‖μ̃‖/‖μ‖) (with covariates the mean of the per-observation ratios), by the fixed point; `"roc_joint"`: the paper's joint objective (i.i.d.) |
 | `select` | `bic` (default), `aic`, `cv` (`cv_folds`, `seed`) |
 | `alpha` | penalty weight(s) per observation (`lambda / n`); default: automatic path |
 | `paper` | `"LASSO"`, `"aLASSO"`, `"RoC-LASSO"`, `"GLASSO"`, `"aGLASSO"`, `"RoC-GLASSO"`: the Project 3 R scripts' methods |

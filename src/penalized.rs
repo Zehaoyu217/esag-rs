@@ -739,7 +739,7 @@ impl PenalizedPath {
         if let Penalty::SparseGroupLasso { l1_ratio } = c.penalty {
             extra.push(("l1_ratio:".to_string(), format!("{l1_ratio}")));
         }
-        match &self.relaxed {
+        let mut s = match &self.relaxed {
             Some(r) => r.summary_titled(
                 "ESAG Regularized Regression Results",
                 &c.method_name(),
@@ -770,7 +770,23 @@ impl PenalizedPath {
                     "(dropped)",
                 )
             }
+        };
+        let unsolved = self.points.iter().filter(|p| !p.converged).count();
+        if unsolved > 0 && !c.is_paper() {
+            let why = if self.initial.non_regular || !self.initial.singular_obs.is_empty() {
+                format!(
+                    "\n    The unpenalized fit is a non-regular maximum ({} observations on\n    the singular set of the gamma parameterization), where no penalized\n    solve can be certified; the gamma-rot shape (Shape::GammaRot;\n    shape=\"gamma-rot\" in Python) has no singular set.",
+                    self.initial.singular_obs.len()
+                )
+            } else {
+                String::new()
+            };
+            s += &format!(
+                "Warning: {unsolved} of {} lambdas were not solved to their KKT\n    tolerance, so the selection is not reliable.{why}\n",
+                self.points.len()
+            );
         }
+        s
     }
 
     /// A text table of the λ path.

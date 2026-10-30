@@ -409,6 +409,15 @@ fn roc_weights_in_regression_are_the_mean_ratio() {
         // never do)
         if shape != Shape::Gamma {
             assert!(path.points.iter().all(|p| p.converged), "{shape:?}");
+            assert!(!path.summary().contains("Warning"), "{shape:?}");
+        } else {
+            // the summary says when the path's solves were not certified
+            assert!(path.points.iter().any(|p| !p.converged));
+            assert!(
+                path.summary().contains("were not solved"),
+                "{}",
+                path.summary()
+            );
         }
         for pt in path.points.iter().filter(|p| p.converged) {
             let hat = norms(&pt.coef, &x);

@@ -1475,6 +1475,76 @@ moved to a lower maximum under the start policy of §2); refinement cost
 10–45% of a path. Custom grids, the paper's grid and cross-validation are
 not refined.
 
+**RoC weights for every shape, and in regression.** RoC-LASSO and
+RoC-GLASSO run with every shape (`PenalizedEsag::…().roc(RocMode::…)`;
+Python `fit_regularized("roc_lasso" | "roc_group_lasso")` or
+`adaptive="roc"`; CLI `--roc fixed-point`). With covariates the exponent is
+the methodology's mean of the per-observation ratios,
+`r(B) = max(1, (1/n) Σ_i ‖μ̃_i‖/‖μ_i(B)‖)` (`Exponent::RoCMean`), by the
+fixed point; the paper's joint objective stays i.i.d. The fixed point
+stops when `r` has settled to `10⁻⁸` or when a solve fails: on γ's paths
+it re-solved each stuck point 50 times. Tests check that `r` is the mean
+ratio at every converged point (four shapes) and that i.i.d. RoC paths
+solve for every shape.
+
+**The LASSO family across shapes** (`examples/penalty_compare.rs`; V̂ is
+the geodesic error of the selected model's `V`, in regression averaged
+over 200 fresh covariate rows; this package's methods select by BIC at
+relaxed refits; the group methods use the γ groups for γ and γ-rot, the
+eigen parts for spectral, and for the log-tangent the eigen-gap penalty
+(i.i.d.) or one group per covariate (regression)).
+
+*The paper's experiments* (i.i.d., `d = 6`, `μ = (2, −5, 3, −4, 5, 6)`, 20
+replicates; exp 1 has no tied eigenvalues, exp 2's truth ties `λ_2..λ_5`):
+
+| | exp 1, n = 100 | exp 1, 400 | exp 2, 100 | exp 2, 400 |
+|---|---|---|---|---|
+| paper's six methods as coded (γ) | 0.607–0.648 | 0.357–0.440 | 0.640–0.784 | 0.755–1.047 |
+| this package, γ, all six | 0.648 | 0.279 | 0.577 | 0.244 |
+| γ-rot LASSO family / group family | 0.656 / 0.648 | 0.288 / 0.279 | 0.577 / 0.697–0.737 | 0.244 / 0.244 |
+| spectral, all six | 0.654–0.660 | 0.288 | 0.577 | 0.244 |
+| log-tangent LASSO family | 0.710 | 0.285–0.287 | 0.447–0.542 | 0.258–0.259 |
+| log-tangent eigen gaps: plain / adaptive / RoC | 0.648 | 0.279 | 0.856 / 0.353 / 0.352 | 0.312 / 0.148 / 0.148 |
+
+So the tie structure that Project 3's group penalties aim at is recovered
+by the eigen-gap penalty with adaptive or RoC weights (0.148 against 0.244
+for the MLE at `n = 400`); with BIC the γ, γ-rot and spectral penalties
+keep (nearly) the full model; the coded methods, with their thresholding
+and γ's discontinuity at the exp-2 truth, lose accuracy as `n` grows.
+γ-rot's groups do not represent ties (a zero γ-rot group is an axis at the
+geometric mean of the lower axes), so its group penalty misfits exp 2 at
+`n = 100`.
+
+*Regression* (the hard scenario, `d = 5`, γ data, 8 replicates; penalties
+on the shape slopes; "drivers" are the three covariates with a shape
+effect, x5 has none):
+
+| shape | n | full model | best penalized (method) | drivers kept | x5 kept | λ's solved | ms per path |
+|---|---|---|---|---|---|---|---|
+| γ | 500 | 0.812 (3/8 converged) | 0.855 (GLASSO) | 3/3 | 8/8 | 23–35% | 3 000–14 000 |
+| γ-rot | 500 | 0.777 | 0.428 (GLASSO) | 0.1–2.1 | 0/8 | 100% | 130–330 |
+| spectral | 500 | 0.828 | 0.421 (aGLASSO, RoC-GLASSO) | 0.3–1.5 | ≤ 1/8 | 100% | 150–310 |
+| log-tangent | 500 | 0.527 | 0.424 (group family) | 0–2.1 | ≤ 2/8 | 100% | 70–170 |
+| γ | 2000 | 0.334 (7/8) | 0.315 (aGLASSO, RoC-GLASSO) | 3/3 | 8/8 | 17–29% | 5 100–6 800 |
+| γ-rot | 2000 | 0.289 | 0.273 (aLASSO), RoC-LASSO 0.274 | 1.6–2.8 | ≤ 1/8 | 100% | 240–360 |
+| spectral | 2000 | 0.291 | 0.270 (GLASSO) | 1.9–2.8 | ≤ 1/8 | 100% | 240–400 |
+| log-tangent | 2000 | 0.276 | 0.276 (aLASSO, RoC-LASSO) | 0–2.5 | 0/8 | 100% | 220–590 |
+
+RoC and adaptive weights give the same selections to within 0.001–0.03
+of V̂ in every cell: `μ` is not penalized, so `r` stays within a few
+percent of 1 (the methodology's "RoC is asymptotically 1"); RoC costs
+20–40% more time for its fixed point. On γ the paths are not solved at
+most λ's (its unpenalized fit did not converge on 5 of 8 datasets at
+`n = 500` and 1 of 8 at `n = 2000`, and where it stops at a certified
+non-regular maximum, on the singular set, no penalized solve can be
+certified either), they keep every covariate including x5, and they are
+15–100× slower; the summary of such a path now says that its solves were
+not certified. On the smooth shapes the
+penalties gain most at `n = 500` (V̂ 0.42–0.44 against 0.53–0.83 for the
+full models); at `n = 2000` the elementwise adaptive or RoC LASSO matches
+or beats the full model while the group penalties with BIC can drop true
+drivers (log-tangent with one group per covariate keeps none).
+
 **Selection.** BIC (default) or AIC at the *relaxed* refit, the
 unpenalized maximum over the selected model, with the model dimension as
 df: all coefficients minus those of zero groups, or for a tie pattern with

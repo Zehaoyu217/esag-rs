@@ -99,13 +99,18 @@ esag.PENALTIES, esag.TARGETS, esag.GROUPINGS, esag.NULLS
 ```
 
 `fit_regularized` arguments: `penalty` in `lasso | adaptive_lasso |
-group_lasso | adaptive_group_lasso | sparse_group_lasso (l1_ratio) |
-isotropy | eigen_gap` (i.i.d., log-tangent); `target` in `slopes | mean |
+roc_lasso | group_lasso | adaptive_group_lasso | roc_group_lasso |
+sparse_group_lasso (l1_ratio) | isotropy | eigen_gap` (i.i.d.,
+log-tangent); `target` in `slopes | mean |
 shape_slopes | shape`; `groups` in `covariate | covariate_part | parameter |
 all | gamma` (the gamma family's groups, for gamma-rot each (kappa_j,
 omega_j)) `| eigen_parts` (gamma-rot: each kappa_j alone and each omega_j as
 a group; spectral: eigenvalues vs rotation) or explicit lists of
-`("mu[1]", "temp")` pairs; `adaptive=True|r|False`; `select` in `bic | aic
+`("mu[1]", "temp")` pairs; `adaptive=True|r|False|"roc"|"roc_joint"` (RoC
+exponent r = max(1, ‖μ̃‖/‖μ‖), with covariates the mean of the
+per-observation ratios, by the fixed point; `roc_joint` is the paper's
+objective, i.i.d. only; Rust `.roc(RocMode::FixedPoint)`, CLI `--roc
+fixed-point`); `select` in `bic | aic
 | cv` (`cv_folds`, `seed`); `alpha` fixes the per-observation weight;
 `paper="LASSO|aLASSO|RoC-LASSO|GLASSO|aGLASSO|RoC-GLASSO"` reproduces the
 Project 3 R scripts (i.i.d., gamma). `python/README.md` has the details and
