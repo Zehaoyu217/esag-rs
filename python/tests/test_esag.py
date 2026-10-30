@@ -380,3 +380,30 @@ def test_paper_methods_use_gamma_under_any_shape():
         assert list(got.columns) == list(ref.columns)
         assert np.allclose(got.values, ref.values)
 
+
+
+def test_roc_weights_for_every_shape():
+    """RoC-LASSO and RoC-GLASSO (Project 3's RoC exponent, fixed point) run
+    for every smooth shape, with and without covariates; ``adaptive="roc"``
+    is the same as the ``roc_*`` names."""
+    rng = np.random.default_rng(9)
+    n, p = 400, 2
+    X = rng.standard_normal((n, p))
+    Y = np.empty((n, 4))
+    for i in range(n):
+        mu = np.array([1.0 + 0.4 * X[i, 0], 0.8, 1.2, 2.0])
+        gam = np.array([0.6, -0.3, 0.4 + 0.3 * X[i, 1], 0.2, -0.1])
+        Y[i] = esag.Distribution(mu=mu, gamma=gam).sample(1, seed=int(50 + i))[0]
+    for shape, groups in [("gamma-rot", "gamma"), ("spectral", "eigen_parts"), ("log-tangent", "covariate_part")]:
+        m = esag.ESAG(Y, X, shape=shape)
+        a = m.fit_regularized("roc_group_lasso", target="slopes", groups=groups)
+        b = m.fit_regularized("group_lasso", adaptive="roc", target="slopes", groups=groups)
+        assert np.allclose(a.params.values, b.params.values)
+        assert "RoC" in str(a.summary())
+        assert m.fit_regularized("roc_lasso", target="shape_slopes").relaxed is not None
+        iid = esag.ESAG(Y, shape=shape).fit_regularized("roc_lasso", target="shape")
+        assert np.isfinite(iid.params.values).all()
+    with pytest.raises(ValueError):
+        esag.ESAG(Y, X, shape="gamma-rot").fit_regularized("group_lasso", adaptive="roc_joint")
+    with pytest.raises(ValueError):
+        esag.ESAG(Y).fit_regularized(paper="RoC-GLASSO", adaptive="roc")

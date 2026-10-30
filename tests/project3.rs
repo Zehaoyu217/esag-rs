@@ -170,7 +170,9 @@ fn microbiome_application_reproduces_paper() {
 // ---- corrected methods (log-tangent shape) ----
 
 use esag::distribution::Esag;
-use esag::penalized::Grouping;
+use esag::optim::prox::RocMode;
+use esag::penalized::{Grouping, Target};
+use esag::regression::Shape;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
@@ -332,4 +334,206 @@ fn cv_folds_fit_the_full_data_frame() {
         assert!((a - b).abs() <= 1e-6 * a.abs().max(1.0), "{a} vs {b}");
     }
     assert_eq!(default.selected, explicit.selected);
+}
+
+/// RoC weights in regression: the exponent is the mean of the
+/// per-observation concentration ratios, `r = max(1, (1/n) Σ_i ‖μ̃_i‖/‖μ̂_i‖)`,
+/// at every point of the path (the fixed point), and it leaves the floor
+/// once the penalty shrinks the mean slopes.
+#[test]
+fn roc_weights_in_regression_are_the_mean_ratio() {
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+    let (d, n, p) = (4usize, 400usize, 2usize);
+    let bd = esag::dims::eta_len(d);
+    let b = DMatrix::from_fn(bd, p + 1, |k, j| {
+        let s = (k * 5 + j * 3) as f64;
+        match (j, k < d) {
+            (0, true) => 0.6 * (s * 0.9).sin() + if k == d - 1 { 2.5 } else { 0.0 },
+            (0, false) => 0.4 * (s * 1.3).sin(),
+            (1, true) => 0.5 * (s * 0.7).cos(),
+            (2, false) => 0.3 * (s * 1.1).sin(),
+            _ => 0.0,
+        }
+    });
+    let x = DMatrix::from_fn(n, p, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let eta: Vec<f64> = (0..bd)
+            .map(|k| b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+            .collect();
+        let dist = Esag::from_eta(&eta).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    // ‖μ_i‖ of coefficients c on the design z
+    let norms = |c: &DMatrix<f64>, z: &DMatrix<f64>| -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                (0..d)
+                    .map(|k| {
+                        let m = c[(k, 0)] + (0..p).map(|j| c[(k, j + 1)] * z[(i, j)]).sum::<f64>();
+                        m * m
+                    })
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect()
+    };
+    // the initial fit is on the standardized covariates
+    let xs = DMatrix::from_fn(n, p, |i, j| {
+        let c = x.column(j);
+        let m = c.sum() / n as f64;
+        let sd = (c.iter().map(|v: &f64| (v - m).powi(2)).sum::<f64>() / n as f64).sqrt();
+        (x[(i, j)] - m) / sd
+    });
+    for shape in [
+        Shape::GammaRot,
+        Shape::Spectral,
+        Shape::LogTangent,
+        Shape::Gamma,
+    ] {
+        let path = PenalizedEsag::group_lasso()
+            .roc(RocMode::FixedPoint)
+            .shape(shape)
+            .target(Target::Slopes)
+            .grouping(Grouping::CovariatePart)
+            .fit(&x, &y)
+            .unwrap();
+        let tilde = norms(&path.initial.coef, &xs);
+        let mut off_floor = 0;
+        // (γ's solves stop unconverged at half the path on these data, with
+        // adaptive weights too: `gamma_penalized_kkt`; the smooth shapes'
+        // never do)
+        if shape != Shape::Gamma {
+            assert!(path.points.iter().all(|p| p.converged), "{shape:?}");
+        }
+        for pt in path.points.iter().filter(|p| p.converged) {
+            let hat = norms(&pt.coef, &x);
+            let mean: f64 = tilde.iter().zip(&hat).map(|(t, h)| t / h).sum::<f64>() / n as f64;
+            let want = mean.max(1.0);
+            assert!(
+                (pt.r - want).abs() <= 1e-7 * want,
+                "{shape:?} λ/n {}: r {} against the mean ratio {want}",
+                pt.lambda_n,
+                pt.r
+            );
+            off_floor += usize::from(pt.r > 1.0 + 1e-9);
+        }
+        assert!(off_floor > 0, "{shape:?}: r never left the floor");
+        assert!(
+            path.config.method_name().starts_with("RoC-"),
+            "{}",
+            path.config.method_name()
+        );
+    }
+    // the paper's joint objective stays i.i.d.
+    assert!(
+        PenalizedEsag::group_lasso()
+            .roc(RocMode::Joint)
+            .fit(&x, &y)
+            .is_err()
+    );
+}
+
+/// RoC-LASSO and RoC-GLASSO on i.i.d. data with every shape: the paths
+/// solve, and `r ≥ 1` with `r = max(1, ‖μ̃‖/‖μ̂‖)`.
+#[test]
+fn roc_weights_for_every_shape_iid() {
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+    let y = Esag::new(&[2.0, -1.0, 1.5, 3.0], &[1.2, -0.6, 0.0, 0.8, -0.3])
+        .unwrap()
+        .sample(300, &mut rng);
+    let x = DMatrix::<f64>::zeros(300, 0);
+    for (shape, grouping) in [
+        (Shape::Gamma, Grouping::GammaGroups),
+        (Shape::GammaRot, Grouping::GammaGroups),
+        (Shape::Spectral, Grouping::EigenParts),
+        (Shape::LogTangent, Grouping::Parameter),
+    ] {
+        for est in [
+            PenalizedEsag::lasso().roc(RocMode::FixedPoint),
+            PenalizedEsag::group_lasso()
+                .roc(RocMode::FixedPoint)
+                .grouping(grouping.clone()),
+        ] {
+            let path = est.shape(shape).target(Target::Shape).fit(&x, &y).unwrap();
+            let mt = (0..4)
+                .map(|k| path.initial.coef[(k, 0)].powi(2))
+                .sum::<f64>()
+                .sqrt();
+            for pt in &path.points {
+                let mh = (0..4).map(|k| pt.coef[(k, 0)].powi(2)).sum::<f64>().sqrt();
+                let want = (mt / mh).max(1.0);
+                assert!(
+                    (pt.r - want).abs() <= 1e-6 * want,
+                    "{shape:?}: r {} vs {want}",
+                    pt.r
+                );
+            }
+            assert!(path.best().converged, "{shape:?}: {}", path.summary());
+        }
+    }
+}
+
+/// (diagnostic) Penalized γ fits of the RoC regression test's data with
+/// adaptive and RoC weights: unconverged path points and their KKT.
+/// `cargo test --release --test project3 gamma_penalized_kkt -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gamma_penalized_kkt() {
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11);
+    let (d, n, p) = (4usize, 400usize, 2usize);
+    let bd = esag::dims::eta_len(d);
+    let b = DMatrix::from_fn(bd, p + 1, |k, j| {
+        let s = (k * 5 + j * 3) as f64;
+        match (j, k < d) {
+            (0, true) => 0.6 * (s * 0.9).sin() + if k == d - 1 { 2.5 } else { 0.0 },
+            (0, false) => 0.4 * (s * 1.3).sin(),
+            (1, true) => 0.5 * (s * 0.7).cos(),
+            (2, false) => 0.3 * (s * 1.1).sin(),
+            _ => 0.0,
+        }
+    });
+    let x = DMatrix::from_fn(n, p, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let eta: Vec<f64> = (0..bd)
+            .map(|k| b[(k, 0)] + (0..p).map(|j| b[(k, j + 1)] * x[(i, j)]).sum::<f64>())
+            .collect();
+        let dist = Esag::from_eta(&eta).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    for shape in [Shape::Gamma, Shape::GammaRot] {
+        for (name, est) in [
+            ("adaptive", PenalizedEsag::adaptive_group_lasso()),
+            ("RoC", PenalizedEsag::group_lasso().roc(RocMode::FixedPoint)),
+        ] {
+            let path = est
+                .shape(shape)
+                .target(Target::Slopes)
+                .grouping(Grouping::CovariatePart)
+                .fit(&x, &y)
+                .unwrap();
+            let bad: Vec<String> = path
+                .points
+                .iter()
+                .filter(|p| !p.converged)
+                .map(|p| format!("λ/n {:.3} kkt {:.1e}", p.lambda_n, p.kkt))
+                .collect();
+            println!(
+                "{shape:?} {name}: {} of {} points unconverged {:?}; selected {:?}",
+                bad.len(),
+                path.points.len(),
+                bad,
+                path.best().active
+            );
+        }
+    }
 }

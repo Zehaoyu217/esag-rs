@@ -25,7 +25,9 @@
 //! `λ Σ_g φ_g w_g ln(b_g) ∂r/∂μ`, `∂r/∂μ = −‖μ̃‖ μ/‖μ‖³` (0 on the floor),
 //! enters the smooth part; with [`RocMode::FixedPoint`] (the recommended
 //! default) `r` is frozen, the problem solved, `r` updated, until it
-//! settles.
+//! settles. In regression ([`Exponent::RoCMean`]) the ratio is the mean
+//! over the observations, `r(θ) = max(1, (1/n) Σ_i ‖μ̃_i‖/‖μ_i(θ)‖)`
+//! (`docs/project3/METHODOLOGY.md` §2.3), by the fixed point only.
 //!
 //! # Algorithm (proximal Newton; Lee, Sun & Saunders 2014)
 //!
@@ -373,6 +375,10 @@ pub fn pava_nondecreasing(y: &[f64]) -> Vec<f64> {
     out
 }
 
+/// Relative change of the RoC exponent below which its fixed point has
+/// settled (the solves resolve `r` to about this).
+const ROC_SETTLED: f64 = 1e-8;
+
 /// How RoC weights are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RocMode {
@@ -396,6 +402,16 @@ pub enum Exponent {
         mu_tilde_norm: f64,
         mode: RocMode,
     },
+    /// RoC in regression, `r = max(1, (1/n) Σ_i ‖μ̃_i‖ / ‖μ_i(θ)‖)` with
+    /// `μ_i(θ)_k = Σ_j θ[mu[k·pt + j]] x_ij` (`x` the `n × pt` design,
+    /// row-major; an index `usize::MAX` is a coefficient fixed at 0) and
+    /// `‖μ̃_i‖` from the unpenalized fit. Solved by the fixed point.
+    RoCMean {
+        mu: Vec<usize>,
+        pt: usize,
+        x: Vec<f64>,
+        mu_tilde_norms: Vec<f64>,
+    },
 }
 
 /// `λ Σ_g b_g^{r(θ)} φ_g(θ)`.
@@ -418,6 +434,33 @@ impl<A: PenaltyAtoms> Penalty<A> {
             } => {
                 let nm = mu.iter().map(|&i| theta[i] * theta[i]).sum::<f64>().sqrt();
                 (mu_tilde_norm / nm).max(1.0)
+            }
+            Exponent::RoCMean {
+                mu,
+                pt,
+                x,
+                mu_tilde_norms,
+            } => {
+                let d = mu.len() / pt;
+                let coef = |k: usize, j: usize| {
+                    let i = mu[k * pt + j];
+                    if i == usize::MAX { 0.0 } else { theta[i] }
+                };
+                let sum: f64 = mu_tilde_norms
+                    .iter()
+                    .enumerate()
+                    .map(|(obs, &nt)| {
+                        let xi = &x[obs * pt..(obs + 1) * pt];
+                        let nm2: f64 = (0..d)
+                            .map(|k| {
+                                let m: f64 = (0..*pt).map(|j| coef(k, j) * xi[j]).sum();
+                                m * m
+                            })
+                            .sum();
+                        nt / nm2.sqrt()
+                    })
+                    .sum();
+                (sum / mu_tilde_norms.len().max(1) as f64).max(1.0)
             }
         }
     }
@@ -570,13 +613,18 @@ pub fn prox_newton_warm<A: PenaltyAtoms>(
         Exponent::RoC {
             mode: RocMode::FixedPoint,
             ..
-        } => {
+        }
+        | Exponent::RoCMean { .. } => {
             let mut r = pen.r(theta0);
             let mut res = prox_newton_r(f, pen, theta0, cfg, Some(r), hess0);
             let mut total = res.n_iter;
+            // Stop once r settles to what the solves resolve, or when a
+            // solve fails: re-solving a stuck point with a slightly moved r
+            // only repeats it (γ's paths, with cliffs, ran all 50 rounds
+            // at KKT ~10² before this check).
             for _ in 0..cfg.max_roc_iter {
                 let r_new = pen.r(&res.theta);
-                if (r_new - r).abs() <= 1e-10 * r.max(1.0) {
+                if (r_new - r).abs() <= ROC_SETTLED * r.max(1.0) || !res.converged {
                     break;
                 }
                 r = r_new;

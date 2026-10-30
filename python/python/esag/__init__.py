@@ -73,8 +73,10 @@ class ShapeWarning(UserWarning):
 PENALTIES = (
     "lasso",
     "adaptive_lasso",
+    "roc_lasso",
     "group_lasso",
     "adaptive_group_lasso",
+    "roc_group_lasso",
     "sparse_group_lasso",
     "isotropy",
     "eigen_gap",
@@ -283,7 +285,7 @@ class ESAG:
         target: Optional[str] = None,
         groups: Union[None, str, Sequence[Sequence[tuple]]] = None,
         l1_ratio: float = 0.5,
-        adaptive: Union[None, bool, float] = None,
+        adaptive: Union[None, bool, float, str] = None,
         select: str = "bic",
         alpha: Union[None, float, Iterable[float]] = None,
         cv_folds: int = 10,
@@ -298,9 +300,11 @@ class ESAG:
         penalty : str
             One of :data:`PENALTIES`:
 
-            * ``"lasso"`` / ``"adaptive_lasso"``: L1 on each coefficient;
-            * ``"group_lasso"`` / ``"adaptive_group_lasso"``: L2 norm of each
-              group (``groups``), sqrt(group size) weights;
+            * ``"lasso"`` / ``"adaptive_lasso"`` / ``"roc_lasso"``: L1 on
+              each coefficient (plain, adaptive, RoC weights);
+            * ``"group_lasso"`` / ``"adaptive_group_lasso"`` /
+              ``"roc_group_lasso"``: L2 norm of each group (``groups``),
+              sqrt(group size) weights (plain, adaptive, RoC);
             * ``"sparse_group_lasso"``: ``l1_ratio`` * LASSO +
               (1 - ``l1_ratio``) * group LASSO;
             * ``"isotropy"``: all shape coefficients as one group (shrinks
@@ -325,9 +329,15 @@ class ESAG:
             variance without turning it, or turn it without changing its
             variance); or explicit groups as lists of ``(parameter,
             variable)`` pairs, by name (``("mu[1]", "x1")``) or index.
-        adaptive : bool or float, optional
+        adaptive : bool, float or str, optional
             Adaptive weights ||theta_mle||^-r: ``True`` (r = 1), a number r,
-            or ``False`` (plain weights). Defaults to the preset's.
+            ``False`` (plain weights), or ``"roc"``: Project 3's RoC exponent
+            r = max(1, ||mu_mle|| / ||mu||) (in regression the mean of the
+            per-observation ratios), solved as a fixed point; ``"roc_joint"``
+            is the paper's joint objective (i.i.d. only). Defaults to the
+            preset's. ``"roc_lasso"`` and ``"roc_group_lasso"`` are the
+            LASSO and group LASSO with ``adaptive="roc"`` (RoC-LASSO and
+            RoC-GLASSO for any shape).
         select : {"bic", "aic", "cv"}
             How the penalty weight is chosen (BIC and AIC at the relaxed
             refit; ``"cv"``: ``cv_folds``-fold held-out log-likelihood).
@@ -344,7 +354,10 @@ class ESAG:
         if groups is not None and not isinstance(groups, str):
             custom = [[self._coef_index(e) for e in g] for g in groups]
             groups = None
-        if isinstance(adaptive, bool):
+        roc = None
+        if isinstance(adaptive, str):
+            roc, r = adaptive, None
+        elif isinstance(adaptive, bool):
             r = 1.0 if adaptive else 0.0
         else:
             r = None if adaptive is None else float(adaptive)
@@ -368,6 +381,7 @@ class ESAG:
             paper_grid=paper_grid,
             paper=paper,
             custom_groups=custom,
+            roc=roc,
         )
         return RegularizedResults(self, native, _esag.param_rows(self.k_endog, shape))
 

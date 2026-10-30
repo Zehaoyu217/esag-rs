@@ -655,7 +655,11 @@ pub struct PathPoint {
 pub struct PenalizedPath {
     /// The estimator configuration.
     pub config: PenalizedEsag,
-    /// The unpenalized fit behind the adaptive weights.
+    /// The unpenalized fit behind the adaptive weights, on the standardized
+    /// covariates (each centred and scaled to unit standard deviation, the
+    /// scale the penalty is applied on): its slopes are per standard
+    /// deviation. `points`, `relaxed` and the summaries are on the original
+    /// scale.
     pub initial: EsagRegressorFit,
     pub points: Vec<PathPoint>,
     /// Selection criterion per λ (lower is better).
@@ -878,9 +882,10 @@ impl Prepared {
                 cfg.target
             )));
         }
-        if matches!(cfg.weighting, Weighting::RoC(_)) && p > 0 {
+        if cfg.weighting == Weighting::RoC(RocMode::Joint) && p > 0 {
             return Err(EsagError::Data(
-                "RoC weights are defined for i.i.d. data; use adaptive weights in regression"
+                "the paper's joint RoC objective is defined for i.i.d. data; in regression \
+                 RoC weights use the fixed point (RocMode::FixedPoint)"
                     .into(),
             ));
         }
@@ -1171,11 +1176,36 @@ impl Prepared {
         let exponent = match (cfg.weighting, &atoms) {
             (Weighting::Plain, _) => Exponent::Fixed(1.0),
             (Weighting::Adaptive(r), _) => Exponent::Fixed(r),
-            (Weighting::RoC(mode), _) => Exponent::RoC {
+            (Weighting::RoC(mode), _) if p == 0 => Exponent::RoC {
                 mu: (0..d).collect(),
                 mu_tilde_norm: theta_init[..d].iter().map(|v| v * v).sum::<f64>().sqrt(),
                 mode,
             },
+            (Weighting::RoC(_), _) => {
+                // the mean coefficients B[k, j] are θ[idx(k, j)] (every
+                // coefficient is a free parameter here)
+                let mu: Vec<usize> = (0..d)
+                    .flat_map(|k| (0..pt).map(move |j| idx(k, j)))
+                    .collect();
+                let mu_tilde_norms: Vec<f64> = (0..data.n)
+                    .map(|i| {
+                        let xi = &data.x[i * pt..(i + 1) * pt];
+                        (0..d)
+                            .map(|k| {
+                                let m: f64 = (0..pt).map(|j| theta_init[idx(k, j)] * xi[j]).sum();
+                                m * m
+                            })
+                            .sum::<f64>()
+                            .sqrt()
+                    })
+                    .collect();
+                Exponent::RoCMean {
+                    mu,
+                    pt,
+                    x: data.x.clone(),
+                    mu_tilde_norms,
+                }
+            }
         };
         let lambdas = match &cfg.grid {
             LambdaGrid::Paper => {
@@ -1244,7 +1274,7 @@ impl Prepared {
         obj.value_grad(&null.theta, &mut g);
         let r = match exponent {
             Exponent::Fixed(r) => *r,
-            Exponent::RoC { .. } => 1.0,
+            Exponent::RoC { .. } | Exponent::RoCMean { .. } => 1.0,
         };
         let w: Vec<f64> = base
             .iter()

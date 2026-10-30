@@ -4,6 +4,7 @@
 use esag::distribution::Esag;
 use esag::inference::{GofMethod, HypothesisTestResult, Restriction, bootstrap_gof};
 use esag::model::{EsagModel, EsagResults};
+use esag::optim::prox::RocMode;
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, PenalizedPath, Target};
 use esag::regression::{EsagRegressor, Shape};
 use nalgebra::DMatrix;
@@ -54,6 +55,7 @@ struct PyModel {
 impl PyModel {
     #[new]
     #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None, rot_basis=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         endog: PyReadonlyArray2<'_, f64>,
         exog: Option<PyReadonlyArray2<'_, f64>>,
@@ -135,7 +137,7 @@ impl PyModel {
     /// Penalized fit along a λ path (see `esag.ESAG.fit_regularized`).
     #[pyo3(signature = (penalty="adaptive_lasso", target=None, groups=None, l1_ratio=0.5,
                         r=None, select="bic", folds=10, seed=1, lambdas=None,
-                        paper_grid=false, paper=None, custom_groups=None))]
+                        paper_grid=false, paper=None, custom_groups=None, roc=None))]
     #[allow(clippy::too_many_arguments)]
     fn fit_regularized(
         &self,
@@ -152,6 +154,7 @@ impl PyModel {
         paper_grid: bool,
         paper: Option<&str>,
         custom_groups: Option<Vec<Vec<(usize, usize)>>>,
+        roc: Option<&str>,
     ) -> PyResult<PyRegularized> {
         let mut est = match paper {
             Some(name) => PenalizedEsag::paper(name).map_err(err)?,
@@ -159,15 +162,20 @@ impl PyModel {
                 let mut e = match penalty.to_ascii_lowercase().replace('-', "_").as_str() {
                     "lasso" | "l1" => PenalizedEsag::lasso(),
                     "adaptive_lasso" | "alasso" => PenalizedEsag::adaptive_lasso(),
+                    "roc_lasso" | "roc_alasso" => PenalizedEsag::lasso().roc(RocMode::FixedPoint),
                     "group_lasso" | "glasso" => PenalizedEsag::group_lasso(),
                     "adaptive_group_lasso" | "aglasso" => PenalizedEsag::adaptive_group_lasso(),
+                    "roc_group_lasso" | "roc_glasso" | "roc_aglasso" => {
+                        PenalizedEsag::group_lasso().roc(RocMode::FixedPoint)
+                    }
                     "sparse_group_lasso" | "sglasso" => PenalizedEsag::sparse_group_lasso(l1_ratio),
                     "isotropy" => PenalizedEsag::isotropy(),
                     "eigen_gap" | "eigengap" => PenalizedEsag::eigen_gap(),
                     other => {
                         return Err(err(format!(
-                            "unknown penalty {other:?} (lasso, adaptive_lasso, group_lasso, \
-                             adaptive_group_lasso, sparse_group_lasso, isotropy, eigen_gap)"
+                            "unknown penalty {other:?} (lasso, adaptive_lasso, roc_lasso, \
+                             group_lasso, adaptive_group_lasso, roc_group_lasso, \
+                             sparse_group_lasso, isotropy, eigen_gap)"
                         )));
                     }
                 };
@@ -205,11 +213,22 @@ impl PyModel {
                 if let Some(r) = r {
                     e = if r == 0.0 { e.plain() } else { e.adaptive(r) };
                 }
+                if let Some(mode) = roc {
+                    e = e.roc(match mode.to_ascii_lowercase().replace('-', "_").as_str() {
+                        "roc" | "fixed_point" => RocMode::FixedPoint,
+                        "roc_joint" | "joint" => RocMode::Joint,
+                        other => {
+                            return Err(err(format!(
+                                "unknown RoC mode {other:?} (roc, roc_joint)"
+                            )));
+                        }
+                    });
+                }
                 e
             }
         };
-        if paper.is_some() && r.is_some() {
-            return Err(err("r cannot be combined with paper="));
+        if paper.is_some() && (r.is_some() || roc.is_some()) {
+            return Err(err("adaptive cannot be combined with paper="));
         }
         est = match select.to_ascii_lowercase().as_str() {
             "bic" => est.bic(),
@@ -256,7 +275,9 @@ fn param_rows(d: usize, shape: &str) -> PyResult<Vec<String>> {
         Shape::LogTangent => "s",
         Shape::Spectral => unreachable!(),
     };
-    Ok(mu.chain((0..g).map(|k| format!("{tag}[{}]", k + 1))).collect())
+    Ok(mu
+        .chain((0..g).map(|k| format!("{tag}[{}]", k + 1)))
+        .collect())
 }
 
 /// Load a fitted model from JSON (as written by `Results.to_json`).

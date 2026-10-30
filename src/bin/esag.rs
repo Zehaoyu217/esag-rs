@@ -16,6 +16,7 @@ use esag::distribution::Esag;
 use esag::inference::{
     GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region, score_test,
 };
+use esag::optim::prox::RocMode;
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, Target};
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
@@ -136,8 +137,19 @@ enum GroupKind {
     Parameter,
     /// all target coefficients together
     All,
-    /// the paper's gamma groups (gamma shape)
+    /// the paper's gamma groups (gamma, gamma-rot)
     Gamma,
+    /// per covariate: the eigen charts' eigenvalue and rotation parts
+    /// (gamma-rot, spectral)
+    EigenParts,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RocKind {
+    /// solve with r frozen, update it, repeat (the recommended form)
+    FixedPoint,
+    /// r inside the objective, as in the paper (i.i.d. only)
+    Joint,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -250,6 +262,11 @@ enum Cmd {
         /// Adaptive exponent r (weights ‖θ̃‖^-r); 0 = plain weights.
         #[arg(long)]
         r: Option<f64>,
+        /// RoC weights (Project 3): exponent r = max(1, ‖μ̃‖/‖μ‖), the mean
+        /// of the per-observation ratios with covariates, by the fixed point
+        /// ("fixed-point") or the paper's joint objective ("joint", i.i.d.).
+        #[arg(long, value_enum)]
+        roc: Option<RocKind>,
         #[arg(long, value_enum, default_value = "log-tangent")]
         shape: ShapeKind,
         /// Reproduce one of the paper's six methods as coded in its R scripts
@@ -505,6 +522,7 @@ fn run() -> Res<()> {
             groups,
             l1_ratio,
             r,
+            roc,
             shape,
             paper,
             select,
@@ -542,10 +560,17 @@ fn run() -> Res<()> {
                             GroupKind::Parameter => Grouping::Parameter,
                             GroupKind::All => Grouping::All,
                             GroupKind::Gamma => Grouping::GammaGroups,
+                            GroupKind::EigenParts => Grouping::EigenParts,
                         });
                     }
                     if let Some(r) = r {
                         e = if r == 0.0 { e.plain() } else { e.adaptive(r) };
+                    }
+                    if let Some(m) = roc {
+                        e = e.roc(match m {
+                            RocKind::FixedPoint => RocMode::FixedPoint,
+                            RocKind::Joint => RocMode::Joint,
+                        });
                     }
                     e.shape(match shape {
                         ShapeKind::Gamma => Shape::Gamma,
