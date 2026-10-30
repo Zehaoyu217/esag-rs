@@ -138,10 +138,16 @@ src/optim/         lbfgs.rs (Objective trait, LbfgsConfig, minimize), hessian.rs
 src/error.rs       EsagError (thiserror)
 src/distribution.rs  Esag { mu, gamma } : log_pdf, pdf, sample, covariance, mean_direction, angles, ...
 src/regression.rs  EsagRegressor (config/builder) + EsagRegressorFit (fitted model)
+src/model.rs       statsmodels-style front end: EsagModel::new(endog, exog) → fit() / fit_regularized(); EsagResults
+src/summary.rs     statsmodels-style text tables (header block, per-equation coefficient blocks)
+src/logtangent.rs  smooth shape coordinates (LtFrame, loglik_lt{,_grad,_hess}, eigen_frame)
+src/penalized.rs   LASSO family: Penalty × Target × Grouping × Weighting, λ paths, BIC/AIC/CV, relaxed refits
+src/optim/prox.rs  proximal Newton (GroupNorms, SparseGroupNorms, EigenGaps atoms)
 src/estimator.rs   EsagEstimator (no covariates) + EsagFit; traits Fit/Predict/Score
 src/inference/     gof.rs, regions.rs, tests.rs, bootstrap.rs (residuals live on the fitted model)
 src/preprocessing.rs MinMaxScaler ([1, 2] covariate scaling, as in the papers)
 src/bin/esag.rs    command-line tool
+python/            PyO3 + maturin bindings (`esag._esag`) and the statsmodels-style Python package `esag`
 examples/          regression_demo.rs, …
 tests/             r_parity.rs (fixtures), properties.rs
 ```
@@ -177,3 +183,51 @@ Data matrices use `nalgebra::DMatrix<f64>` with one observation per ROW
 * `M` is the squared norm, as in the R code and the published tables.
 * Hypothesis-test refits take the best of two starts, which removed an
   over-rejection of the bootstrap LR test.
+* Performance branch: the frame-free, trig-free kernel
+  (`loglik::quad_form_parts`); a hand-written adjoint gradient
+  (`adjoint.rs`); second-order duals (`hdual.rs`) for the d = 3 Hessian
+  (now the test reference, see the γ-speed branch);
+  `Scalar::DERIV_ORDER`; the inverse map `param::gamma_from_covariance`
+  (moment start, canonical γ for intercept-only fits); starts sharing an
+  iteration budget; xoshiro256++ streams from `stream_rng(seed, tag, index)`.
+* Large-regression branch:
+  * Fits are bit-for-bit reproducible. Parallel sums run in chunk order,
+    and starts race in lockstep: `optim::lbfgs::Lbfgs` is resumable, and all
+    decisions are taken between 25-iteration rounds. That replaced the
+    timing-dependent shared iteration budget.
+  * The race keeps the highest likelihood. Starts that trail the leader by
+    0.05 per observation, crawl, or are pinned at the singular set (trap
+    monitor) are stopped. Waves of perturbed starts serve as the safety net.
+  * With SEs requested, L-BFGS hands over to Newton steps that reuse one
+    exact Hessian. The Hessian's Kronecker sum is one GEMM per chunk.
+    `η = B·Xᵀ` and the gradient `G·X` are per-chunk matrix products.
+  * `Shape::LogTangent` (`logtangent.rs`): a smooth shape with an exact
+    gradient and Hessian, an opt-in alternative to γ with the same family and
+    parameter count. The frame's reference direction is stored in the fitted
+    model's config.
+  * The `M` statistic uses exact second moments
+    (`distribution::second_moment_weights`); `n_mc > 0` keeps the R code's
+    Monte Carlo. Bootstrap refits are preconditioned with the original
+    observed information (`EsagRegressor::precondition`). The full refits
+    of hypothesis tests are preconditioned with the full model's
+    information at the restricted fit (`precondition_at`), where null
+    replicates end, except on the γ = 0 cone (isotropy in γ).
+  * Project 3 (`penalized.rs`, `optim/prox.rs`): proximal Newton over
+    penalty atoms (group norms, sparse-group mixtures, eigenvalue gaps of
+    S). Penalties compose: `Penalty` (LASSO, group, sparse group, eigen
+    gap) × `Target` × `Grouping` × `Weighting` (plain, adaptive(r), RoC),
+    with presets `lasso()`, `adaptive_lasso()`, `group_lasso()`, … The
+    paper's six methods are offered as a reproduction mode in γ
+    (`PenalizedEsag::paper`). `docs/project3/` holds
+    the spec of the R code and the methodology review.
+* γ-speed branch:
+  * the exact Hessian of the γ log-density for every d (`adjoint_hess.rs`,
+    built on the adjoint's tape) replaces the hyper-dual Hessian at d = 3
+    and central differences of the gradient at d ≥ 4, except in the
+    polish of fits that did not converge (`ObsHessian::Differences`);
+  * sequential evaluations sum the same fixed chunks as parallel ones, so
+    `with_parallel(false)` gives exactly the default's fits; the small
+    products of `joint_eval` (any dimension ≤ 5, always at d = 3) run in
+    fixed-size loops, bit-identical to nalgebra's;
+  * bootstrap procedures build the samplers of their generating fit once
+    (`EsagRegressorFit::response_samplers`).

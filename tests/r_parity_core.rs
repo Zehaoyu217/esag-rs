@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Parity of the deterministic ESAG math with the original R code
 //! (`reference/r/ESAG_Project2.R`). Fixtures were produced by running the R
 //! code; see `tests/fixtures/README.md`.

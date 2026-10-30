@@ -21,7 +21,9 @@
 //!   Alg. 3.6 zoom) with safeguarded cubic-Hermite / quadratic interpolation
 //!   and bisection fallback. The initial trial step is 1 once curvature
 //!   information is available and `min(1, 1/‖g‖₁)` on steepest-descent steps
-//!   (the first iteration and after a memory reset). A non-finite trial value
+//!   (the first iteration and after a memory reset), or 1 there too for a
+//!   problem scaled so that its Hessian is near the identity
+//!   ([`LbfgsConfig::unit_scale`]: the first step is then a Newton step). A non-finite trial value
 //!   or gradient is treated as "step too long" and the step is shrunk. If the
 //!   curvature condition cannot be met within `max_ls_iter` evaluations, the
 //!   best point found that satisfies the sufficient-decrease (Armijo) condition
@@ -120,6 +122,14 @@ pub trait Objective: Sync {
         let mut grad = vec![0.0; x.len()];
         self.value_and_gradient(x, &mut grad)
     }
+
+    /// Checked once per iteration: returning `true` stops the solver with
+    /// [`Status::Aborted`] (the best point so far is returned). Lets an
+    /// objective that can diagnose a hopeless run (e.g. an iterate pinned at
+    /// a discontinuity) end it early. The default never aborts.
+    fn should_stop(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter that turns a closure `|x, grad| -> f` into an [`Objective`].
@@ -163,6 +173,10 @@ pub struct LbfgsConfig {
     /// relaxed proportionally once the iterate itself is larger than 1 in
     /// magnitude; for `‖x‖_∞ ≤ 1` it is exactly scipy's rule.
     pub tol_grad: f64,
+    /// Absolute gradient tolerance: also stop with
+    /// [`Status::GradientConverged`] once `‖∇f(x)‖_∞ ≤ tol_grad_abs`.
+    /// Default `0.0` (off). Useful when a Newton step will polish the result.
+    pub tol_grad_abs: f64,
     /// Relative function-decrease tolerance: stop when
     /// `|f_k − f_{k+1}| ≤ tol_f · max(|f_k|, |f_{k+1}|, 1)`. Default 1e-12.
     /// `0.0` disables the test.
@@ -177,8 +191,22 @@ pub struct LbfgsConfig {
     pub c2: f64,
     /// Maximum number of objective evaluations per line search. Default 40.
     pub max_ls_iter: usize,
+    /// The problem is scaled so that its Hessian is near the identity (e.g.
+    /// whitened with the inverse observed information): the first trial step
+    /// is 1 instead of `min(1, 1/‖g‖₁)`. Default `false`.
+    pub unit_scale: bool,
+    /// Newton-decrement tolerance for a `unit_scale` problem: also stop with
+    /// [`Status::GradientConverged`] once `½‖∇f‖₂² ≤ tol_decrement`, the
+    /// remaining decrease `½ gᵀH⁻¹g` predicted with `H = I`. Default `0.0`
+    /// (off).
+    pub tol_decrement: f64,
     /// Print one line per iteration to stderr. Default `false`.
     pub verbose: bool,
+    /// Optional shared, dynamically lowerable iteration limit: the solver
+    /// stops with [`Status::MaxIterations`] once `n_iter` reaches
+    /// `min(max_iter, budget)`. Lets concurrent runs from different starts
+    /// cut each other short (see `EsagRegressor`'s `Init::Auto`).
+    pub iter_budget: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for LbfgsConfig {
@@ -188,12 +216,16 @@ impl Default for LbfgsConfig {
             max_iter: 500,
             max_fev: 500 * 20,
             tol_grad: 1e-6,
+            tol_grad_abs: 0.0,
             tol_f: 1e-12,
             tol_x: 0.0,
             c1: 1e-4,
             c2: 0.9,
             max_ls_iter: 40,
+            unit_scale: false,
+            tol_decrement: 0.0,
             verbose: false,
+            iter_budget: None,
         }
     }
 }
@@ -217,6 +249,8 @@ pub enum Status {
     LineSearchFailed,
     /// The objective or its gradient was non-finite at the starting point.
     NonFinite,
+    /// The objective asked to stop ([`Objective::should_stop`]).
+    Aborted,
 }
 
 impl Status {
@@ -239,6 +273,7 @@ impl fmt::Display for Status {
             Status::MaxEvaluations => "maximum function evaluations reached",
             Status::LineSearchFailed => "line search failed",
             Status::NonFinite => "non-finite objective at the starting point",
+            Status::Aborted => "stopped by the objective",
         };
         f.write_str(s)
     }
@@ -670,120 +705,222 @@ impl LineSearch<'_> {
 ///
 /// If `cfg` violates `0 < c1 < c2 < 1`.
 pub fn minimize(obj: &dyn Objective, x0: &[f64], cfg: &LbfgsConfig) -> OptimResult {
-    assert!(
-        0.0 < cfg.c1 && cfg.c1 < cfg.c2 && cfg.c2 < 1.0,
-        "LbfgsConfig requires 0 < c1 < c2 < 1 (got c1 = {}, c2 = {})",
-        cfg.c1,
-        cfg.c2
-    );
+    let mut run = Lbfgs::new(obj, x0, cfg);
+    run.advance(usize::MAX);
+    run.into_result()
+}
 
-    let n = x0.len();
-    let mut n_fev = 0usize;
-    let mut x = x0.to_vec();
-    let mut g = vec![0.0; n];
-    let mut f = obj.value_and_gradient(&x, &mut g);
-    n_fev += 1;
-    if !f.is_finite() || !all_finite(&g) {
-        return OptimResult {
-            grad_norm_inf: norm_inf(&g),
+/// A resumable L-BFGS run: [`Lbfgs::advance`] performs a bounded number of
+/// iterations and can be called again to continue exactly where it stopped
+/// (the trajectory is identical to one uninterrupted [`minimize`] call).
+/// Used to race several starts in lockstep, deterministically.
+pub struct Lbfgs<'a> {
+    obj: &'a dyn Objective,
+    cfg: &'a LbfgsConfig,
+    n_fev: usize,
+    x: Vec<f64>,
+    f: f64,
+    g: Vec<f64>,
+    best: Best,
+    mem: VecDeque<Pair>,
+    n_iter: usize,
+    f_prev: f64,
+    last_df: f64,
+    last_dx: f64,
+    status: Option<Status>,
+}
+
+impl<'a> Lbfgs<'a> {
+    /// Evaluate the objective at `x0` and prepare the run.
+    ///
+    /// # Panics
+    ///
+    /// If `cfg` violates `0 < c1 < c2 < 1`.
+    pub fn new(obj: &'a dyn Objective, x0: &[f64], cfg: &'a LbfgsConfig) -> Self {
+        assert!(
+            0.0 < cfg.c1 && cfg.c1 < cfg.c2 && cfg.c2 < 1.0,
+            "LbfgsConfig requires 0 < c1 < c2 < 1 (got c1 = {}, c2 = {})",
+            cfg.c1,
+            cfg.c2
+        );
+        let n = x0.len();
+        let x = x0.to_vec();
+        let mut g = vec![0.0; n];
+        let f = obj.value_and_gradient(&x, &mut g);
+        let status = (!f.is_finite() || !all_finite(&g)).then_some(Status::NonFinite);
+        Self {
+            obj,
+            cfg,
+            n_fev: 1,
+            best: Best::new(f, &x, &g),
             x,
             f,
-            grad: g,
+            g,
+            mem: VecDeque::with_capacity(cfg.memory),
             n_iter: 0,
-            n_fev,
-            status: Status::NonFinite,
-        };
+            f_prev: f,
+            last_df: f64::INFINITY,
+            last_dx: f64::INFINITY,
+            status,
+        }
     }
 
-    let mut best = Best::new(f, &x, &g);
-    let mut mem: VecDeque<Pair> = VecDeque::with_capacity(cfg.memory);
-    let mut n_iter = 0usize;
-    let mut f_prev = f;
-    let mut last_df = f64::INFINITY;
-    let mut last_dx = f64::INFINITY;
+    /// Accepted iterations so far.
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
 
-    let status = loop {
-        // --- termination tests at the current iterate --------------------
-        let gnorm = norm_inf(&g);
-        if gnorm <= cfg.tol_grad * norm_inf(&x).max(1.0) {
-            break Status::GradientConverged;
-        }
-        if cfg.tol_f > 0.0 && last_df <= cfg.tol_f * f.abs().max(f_prev.abs()).max(1.0) {
-            break Status::FunctionConverged;
-        }
-        if cfg.tol_x > 0.0 && last_dx <= cfg.tol_x {
-            break Status::StepConverged;
-        }
-        if n_iter >= cfg.max_iter {
-            break Status::MaxIterations;
-        }
-        if n_fev >= cfg.max_fev {
-            break Status::MaxEvaluations;
-        }
+    /// Objective value at the current iterate.
+    pub fn f(&self) -> f64 {
+        self.f
+    }
 
+    /// `‖∇f‖_∞` at the current iterate.
+    pub fn grad_norm_inf(&self) -> f64 {
+        norm_inf(&self.g)
+    }
+
+    /// `Some(status)` once the run has terminated.
+    pub fn status(&self) -> Option<Status> {
+        self.status
+    }
+
+    /// Stop the run from outside (it reports `status`).
+    pub fn stop(&mut self, status: Status) {
+        if self.status.is_none() {
+            self.status = Some(status);
+        }
+    }
+
+    /// Perform up to `iters` more iterations; returns the status once the run
+    /// has terminated (`None` if it is merely paused).
+    pub fn advance(&mut self, iters: usize) -> Option<Status> {
+        let (obj, cfg) = (self.obj, self.cfg);
+        let target = self.n_iter.saturating_add(iters);
+        while self.status.is_none() {
+            // --- termination tests at the current iterate --------------------
+            let gnorm = norm_inf(&self.g);
+            if gnorm <= cfg.tol_grad * norm_inf(&self.x).max(1.0)
+                || gnorm <= cfg.tol_grad_abs
+                || 0.5 * dot(&self.g, &self.g) <= cfg.tol_decrement
+            {
+                self.status = Some(Status::GradientConverged);
+                break;
+            }
+            if cfg.tol_f > 0.0
+                && self.last_df <= cfg.tol_f * self.f.abs().max(self.f_prev.abs()).max(1.0)
+            {
+                self.status = Some(Status::FunctionConverged);
+                break;
+            }
+            if cfg.tol_x > 0.0 && self.last_dx <= cfg.tol_x {
+                self.status = Some(Status::StepConverged);
+                break;
+            }
+            let limit = match &cfg.iter_budget {
+                Some(b) => cfg
+                    .max_iter
+                    .min(b.load(std::sync::atomic::Ordering::Relaxed)),
+                None => cfg.max_iter,
+            };
+            if self.n_iter >= limit {
+                self.status = Some(Status::MaxIterations);
+                break;
+            }
+            if self.n_fev >= cfg.max_fev {
+                self.status = Some(Status::MaxEvaluations);
+                break;
+            }
+            if obj.should_stop() {
+                self.status = Some(Status::Aborted);
+                break;
+            }
+            if self.n_iter >= target {
+                return None;
+            }
+            self.iterate();
+        }
+        self.status
+    }
+
+    /// One iteration: direction, line search, curvature update.
+    fn iterate(&mut self) {
+        let (obj, cfg) = (self.obj, self.cfg);
+        let x = &self.x;
+        let g = &self.g;
         // --- search direction --------------------------------------------
-        let mut d = lbfgs_direction(&mem, &g);
-        let mut dphi0 = dot(&d, &g);
+        let mut d = lbfgs_direction(&self.mem, g);
+        let mut dphi0 = dot(&d, g);
         if !(dphi0 < 0.0) || !all_finite(&d) {
             // Not a descent direction (rounding / bad curvature): reset.
-            mem.clear();
+            self.mem.clear();
             d = g.iter().map(|v| -v).collect();
-            dphi0 = -dot(&g, &g);
+            dphi0 = -dot(g, g);
         }
-        let steepest_step = (1.0 / norm_1(&g)).min(1.0);
-        let alpha_init = if mem.is_empty() { steepest_step } else { 1.0 };
+        let steepest_step = (1.0 / norm_1(g)).min(1.0);
+        let alpha_init = if self.mem.is_empty() && !cfg.unit_scale {
+            steepest_step
+        } else {
+            1.0
+        };
         let alpha_floor =
-            |d: &[f64]| f64::EPSILON * (1.0 + norm_inf(&x)) / norm_inf(d).max(f64::MIN_POSITIVE);
+            |d: &[f64]| f64::EPSILON * (1.0 + norm_inf(x)) / norm_inf(d).max(f64::MIN_POSITIVE);
 
         // --- line search (with one steepest-descent retry) ----------------
         let mut outcome = LineSearch {
             obj,
             cfg,
-            x0: &x,
+            x0: x,
             d: &d,
-            phi0: f,
+            phi0: self.f,
             dphi0,
             alpha_floor: alpha_floor(&d),
-            n_fev: &mut n_fev,
-            best: &mut best,
+            n_fev: &mut self.n_fev,
+            best: &mut self.best,
         }
         .run(alpha_init);
 
-        if matches!(outcome, LsOutcome::Failed) && !mem.is_empty() {
-            mem.clear();
+        if matches!(outcome, LsOutcome::Failed) && !self.mem.is_empty() {
+            self.mem.clear();
             d = g.iter().map(|v| -v).collect();
-            dphi0 = -dot(&g, &g);
+            dphi0 = -dot(g, g);
             outcome = LineSearch {
                 obj,
                 cfg,
-                x0: &x,
+                x0: x,
                 d: &d,
-                phi0: f,
+                phi0: self.f,
                 dphi0,
                 alpha_floor: alpha_floor(&d),
-                n_fev: &mut n_fev,
-                best: &mut best,
+                n_fev: &mut self.n_fev,
+                best: &mut self.best,
             }
             .run(steepest_step);
         }
 
         let t = match outcome {
             LsOutcome::Accepted(t) => t,
-            LsOutcome::Failed => break Status::LineSearchFailed,
-            LsOutcome::Budget => break Status::MaxEvaluations,
+            LsOutcome::Failed => {
+                self.status = Some(Status::LineSearchFailed);
+                return;
+            }
+            LsOutcome::Budget => {
+                self.status = Some(Status::MaxEvaluations);
+                return;
+            }
         };
 
         // --- curvature pair ----------------------------------------------
-        let s: Vec<f64> = t.x.iter().zip(&x).map(|(a, b)| a - b).collect();
-        let y: Vec<f64> = t.g.iter().zip(&g).map(|(a, b)| a - b).collect();
-        last_dx = norm_inf(&s);
+        let s: Vec<f64> = t.x.iter().zip(x).map(|(a, b)| a - b).collect();
+        let y: Vec<f64> = t.g.iter().zip(g).map(|(a, b)| a - b).collect();
+        self.last_dx = norm_inf(&s);
         let sy = dot(&s, &y);
         let yy = dot(&y, &y);
         if cfg.memory > 0 && sy.is_finite() && sy > 1e-10 * norm_2(&s) * norm_2(&y) && yy > 0.0 {
-            if mem.len() == cfg.memory {
-                mem.pop_front();
+            if self.mem.len() == cfg.memory {
+                self.mem.pop_front();
             }
-            mem.push_back(Pair {
+            self.mem.push_back(Pair {
                 rho: 1.0 / sy,
                 gamma: sy / yy,
                 s,
@@ -792,37 +929,44 @@ pub fn minimize(obj: &dyn Objective, x0: &[f64], cfg: &LbfgsConfig) -> OptimResu
         }
 
         // --- accept the step ---------------------------------------------
-        f_prev = f;
-        last_df = (f - t.f).abs();
-        x = t.x;
-        f = t.f;
-        g = t.g;
-        n_iter += 1;
+        self.f_prev = self.f;
+        self.last_df = (self.f - t.f).abs();
+        self.x = t.x;
+        self.f = t.f;
+        self.g = t.g;
+        self.n_iter += 1;
 
         if cfg.verbose {
             eprintln!(
-                "lbfgs iter {n_iter:4}  f = {f:+.10e}  |g|_inf = {:.3e}  step = {:.3e}  nfev = {n_fev}  mem = {}",
-                norm_inf(&g),
+                "lbfgs iter {:4}  f = {:+.10e}  |g|_inf = {:.3e}  step = {:.3e}  nfev = {}  mem = {}",
+                self.n_iter,
+                self.f,
+                norm_inf(&self.g),
                 t.alpha,
-                mem.len()
+                self.n_fev,
+                self.mem.len()
             );
         }
-    };
+    }
 
-    // Never return a point worse than the best one seen.
-    let (x, f, g) = if best.f < f {
-        (best.x, best.f, best.g)
-    } else {
-        (x, f, g)
-    };
-    OptimResult {
-        grad_norm_inf: norm_inf(&g),
-        x,
-        f,
-        grad: g,
-        n_iter,
-        n_fev,
-        status,
+    /// The result: never a point worse than the best one evaluated.
+    /// A run that never terminated reports [`Status::MaxIterations`].
+    pub fn into_result(self) -> OptimResult {
+        let status = self.status.unwrap_or(Status::MaxIterations);
+        let (x, f, g) = if self.best.f < self.f {
+            (self.best.x, self.best.f, self.best.g)
+        } else {
+            (self.x, self.f, self.g)
+        };
+        OptimResult {
+            grad_norm_inf: norm_inf(&g),
+            x,
+            f,
+            grad: g,
+            n_iter: self.n_iter,
+            n_fev: self.n_fev,
+            status,
+        }
     }
 }
 

@@ -7,15 +7,20 @@
 //! esag predict model.json data.csv --x x1 --out pred.csv
 //! esag gof model.json data.csv --y y1,y2,y3 --x x1 --boot 200
 //! esag test model.json data.csv --y y1,y2,y3 --x x1 --null isotropy --boot 200
+//! esag penalize data.csv --y y1,y2,y3 --x x1,x2 --method drivers
 //! ```
 
 use clap::{Parser, Subcommand, ValueEnum};
+use esag::FastRng;
 use esag::distribution::Esag;
-use esag::inference::{GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region};
-use esag::regression::{EsagRegressor, EsagRegressorFit};
+use esag::inference::{
+    GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region, score_test,
+};
+use esag::optim::prox::RocMode;
+use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, Target};
+use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
 use nalgebra::DMatrix;
 use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use std::error::Error;
 use std::path::PathBuf;
@@ -69,6 +74,97 @@ enum NullKind {
     Gamma,
     /// both mu and gamma coefficients of --feature are 0
     Feature,
+    /// the shape coefficients of every feature are 0 (an anisotropic shape,
+    /// the same at every x)
+    ConstantShape,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ShapeKind {
+    /// Yu & Huang's gamma (the papers' model)
+    Gamma,
+    /// the smooth log-tangent coordinates (no singular set; recommended for
+    /// regressions with covariates at d >= 4)
+    LogTangent,
+    /// gamma in the tangent frame transported from the data's mean
+    /// direction (no pole at mu_0 = mu_1 = 0)
+    GammaTransported,
+    /// gamma made smooth: eigenvalue ratios and rotation vectors per group, in
+    /// the transported frame (no singular set; at d = 3 Paine et al.'s gamma)
+    GammaRot,
+    /// the eigen-decomposition itself: log-eigenvalues and one rotation of the
+    /// axes (ordering-free, smooth; see docs/MATH.md)
+    Spectral,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PenaltyKind {
+    /// the recommended penalty (default): hierarchical with covariates, the
+    /// eigen-gap penalty (log-tangent) without, RoC weights (--r 1 for the
+    /// adaptive ones)
+    Auto,
+    /// L1 on each target coefficient
+    Lasso,
+    /// LASSO with adaptive weights (r = 1 unless --r)
+    AdaptiveLasso,
+    /// L2 norm per group (--groups)
+    GroupLasso,
+    /// group LASSO with adaptive weights
+    AdaptiveGroupLasso,
+    /// mixture of group and L1 penalties (--l1-ratio)
+    SparseGroupLasso,
+    /// all shape coefficients as one group (isotropy)
+    Isotropy,
+    /// i.i.d.: ties between the eigenvalues of the shape
+    EigenGap,
+    /// nested groups per covariate: the covariate, its mean and shape
+    /// slopes, the shape's eigen parts, each coefficient (adaptive)
+    Hierarchical,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TargetKind {
+    /// every slope
+    Slopes,
+    /// the mean-direction slopes
+    Mean,
+    /// the shape slopes
+    ShapeSlopes,
+    /// every shape coefficient (intercept included)
+    Shape,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupKind {
+    /// one group per covariate
+    Covariate,
+    /// per covariate: its mean slopes and its shape slopes
+    CovariatePart,
+    /// one group per parameter row
+    Parameter,
+    /// all target coefficients together
+    All,
+    /// the paper's gamma groups (gamma, gamma-rot)
+    Gamma,
+    /// per covariate: the eigen charts' eigenvalue and rotation parts
+    /// (gamma-rot, spectral)
+    EigenParts,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RocKind {
+    /// solve with r frozen, update it, repeat (the recommended form)
+    FixedPoint,
+    /// r inside the objective, as in the paper (i.i.d. only)
+    Joint,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SelectKind {
+    Bic,
+    Aic,
+    /// cross-validated held-out log-likelihood
+    Cv,
 }
 
 #[derive(Subcommand)]
@@ -96,6 +192,9 @@ enum Cmd {
         /// Number of random restarts.
         #[arg(long, default_value_t = 0)]
         restarts: usize,
+        /// Shape parameterization.
+        #[arg(long, value_enum, default_value = "gamma")]
+        shape: ShapeKind,
     },
     /// Predict mean directions (and eigenvalues) for new covariates.
     Predict {
@@ -122,7 +221,7 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
-    /// Bootstrap hypothesis test (RoC, D, M, LR) against a restricted model.
+    /// Bootstrap hypothesis test (RoC, D, M, LR, LM) against a restricted model.
     Test {
         model: PathBuf,
         data: PathBuf,
@@ -137,9 +236,57 @@ enum Cmd {
         feature: usize,
         #[arg(long, default_value_t = 200)]
         boot: usize,
-        /// Monte-Carlo draws per observation for the M statistic.
-        #[arg(long, default_value_t = 1000)]
+        /// Monte-Carlo draws per observation for the M statistic (0 = exact
+        /// moments, recommended; the R code uses Monte Carlo).
+        #[arg(long, default_value_t = 0)]
         mc: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Score test: refit only the restricted model (LM and M); 1.4-1.9x
+        /// faster for log-tangent, 2-4x (up to 29x) for gamma.
+        #[arg(long)]
+        score: bool,
+    },
+    /// LASSO-type penalized fit along a lambda path with lambda selection
+    /// (Yu & Huang, Project 3; see docs/MATH.md section 8).
+    Penalize {
+        data: PathBuf,
+        #[arg(long)]
+        y: String,
+        #[arg(long, default_value = "")]
+        x: String,
+        #[arg(long, value_enum, default_value = "auto")]
+        penalty: PenaltyKind,
+        /// Which coefficients to penalize (default: the preset's).
+        #[arg(long, value_enum)]
+        target: Option<TargetKind>,
+        /// How to group them (group and sparse-group LASSO).
+        #[arg(long, value_enum)]
+        groups: Option<GroupKind>,
+        /// L1 share of the sparse group LASSO.
+        #[arg(long, default_value_t = 0.5)]
+        l1_ratio: f64,
+        /// Adaptive exponent r (weights ‖θ̃‖^-r); 0 = plain weights.
+        #[arg(long)]
+        r: Option<f64>,
+        /// RoC weights (Project 3): exponent r = max(1, ‖μ̃‖/‖μ‖), the mean
+        /// of the per-observation ratios with covariates, by the fixed point
+        /// ("fixed-point") or the paper's joint objective ("joint", i.i.d.).
+        #[arg(long, value_enum)]
+        roc: Option<RocKind>,
+        #[arg(long, value_enum, default_value = "log-tangent")]
+        shape: ShapeKind,
+        /// Reproduce one of the paper's six methods as coded in its R scripts
+        /// (LASSO, aLASSO, RoC-LASSO, GLASSO, aGLASSO, RoC-GLASSO; i.i.d.).
+        #[arg(long)]
+        paper: Option<String>,
+        #[arg(long, value_enum, default_value = "bic")]
+        select: SelectKind,
+        /// Use the paper's grid 0, 0.5, 1, 2, ..., 256 (default: automatic).
+        #[arg(long)]
+        paper_grid: bool,
+        #[arg(long, default_value_t = 10)]
+        folds: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
@@ -232,7 +379,7 @@ fn run() -> Res<()> {
                 2,
                 &[1.5, 0.5, 1.0, 0.8, -0.4, -0.6, 1.2, 0.3, 0.5, 0.7],
             );
-            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut rng = FastRng::seed_from_u64(seed);
             let mut w = csv::Writer::from_path(&out)?;
             w.write_record(["x1", "y1", "y2", "y3"])?;
             let mut buf = [0.0; 3];
@@ -259,12 +406,21 @@ fn run() -> Res<()> {
             x,
             model,
             restarts,
+            shape,
         } => {
             let (xm, ym, names) = load_xy(&data, &y, &x)?;
             let t0 = Instant::now();
             let fit = EsagRegressor::new()
                 .with_feature_names(names)
+                .with_response_names(split_cols(&y))
                 .with_restarts(restarts, 0)
+                .with_shape(match shape {
+                    ShapeKind::Gamma => Shape::Gamma,
+                    ShapeKind::LogTangent => Shape::LogTangent,
+                    ShapeKind::GammaTransported => Shape::GammaTransported,
+                    ShapeKind::GammaRot => Shape::GammaRot,
+                    ShapeKind::Spectral => Shape::Spectral,
+                })
                 .fit(&xm, &ym)?;
             outln!("{}", fit.summary());
             outln!("fitted in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
@@ -344,6 +500,7 @@ fn run() -> Res<()> {
             boot,
             mc,
             seed,
+            score,
         } => {
             let fit = load_model(&model)?;
             let (xm, ym, _) = load_xy(&data, &y, &x)?;
@@ -352,30 +509,109 @@ fn run() -> Res<()> {
                 NullKind::Mu => Restriction::MuOfFeature(feature),
                 NullKind::Gamma => Restriction::GammaOfFeature(feature),
                 NullKind::Feature => Restriction::Feature(feature),
+                NullKind::ConstantShape => Restriction::ConstantShape,
             };
             let t0 = Instant::now();
-            let r = hypothesis_test(&fit, &xm, &ym, restriction, boot, mc, seed)?;
+            let r = if score {
+                score_test(&fit, &xm, &ym, restriction, boot, mc, seed)?
+            } else {
+                hypothesis_test(&fit, &xm, &ym, restriction, boot, mc, seed)?
+            };
+            outln!("{}", r.summary());
+            outln!("{:.2} s", t0.elapsed().as_secs_f64());
+        }
+        Cmd::Penalize {
+            data,
+            y,
+            x,
+            penalty,
+            target,
+            groups,
+            l1_ratio,
+            r,
+            roc,
+            shape,
+            paper,
+            select,
+            paper_grid,
+            folds,
+            seed,
+        } => {
+            let (xm, ym, names) = load_xy(&data, &y, &x)?;
+            let mut est = match &paper {
+                Some(name) => PenalizedEsag::paper(name)?,
+                None => {
+                    let mut e = match penalty {
+                        PenaltyKind::Auto => PenalizedEsag::auto(),
+                        PenaltyKind::Lasso => PenalizedEsag::lasso(),
+                        PenaltyKind::AdaptiveLasso => PenalizedEsag::adaptive_lasso(),
+                        PenaltyKind::GroupLasso => PenalizedEsag::group_lasso(),
+                        PenaltyKind::AdaptiveGroupLasso => PenalizedEsag::adaptive_group_lasso(),
+                        PenaltyKind::SparseGroupLasso => {
+                            PenalizedEsag::sparse_group_lasso(l1_ratio)
+                        }
+                        PenaltyKind::Isotropy => PenalizedEsag::isotropy(),
+                        PenaltyKind::EigenGap => PenalizedEsag::eigen_gap(),
+                        PenaltyKind::Hierarchical => PenalizedEsag::hierarchical(),
+                    };
+                    if let Some(t) = target {
+                        e = e.target(match t {
+                            TargetKind::Slopes => Target::Slopes,
+                            TargetKind::Mean => Target::MeanSlopes,
+                            TargetKind::ShapeSlopes => Target::ShapeSlopes,
+                            TargetKind::Shape => Target::Shape,
+                        });
+                    }
+                    if let Some(g) = groups {
+                        e = e.grouping(match g {
+                            GroupKind::Covariate => Grouping::Covariate,
+                            GroupKind::CovariatePart => Grouping::CovariatePart,
+                            GroupKind::Parameter => Grouping::Parameter,
+                            GroupKind::All => Grouping::All,
+                            GroupKind::Gamma => Grouping::GammaGroups,
+                            GroupKind::EigenParts => Grouping::EigenParts,
+                        });
+                    }
+                    if let Some(r) = r {
+                        e = if r == 0.0 { e.plain() } else { e.adaptive(r) };
+                    }
+                    if let Some(m) = roc {
+                        e = e.roc(match m {
+                            RocKind::FixedPoint => RocMode::FixedPoint,
+                            RocKind::Joint => RocMode::Joint,
+                        });
+                    }
+                    if e.penalty == esag::penalized::Penalty::EigenGap {
+                        // log-tangent coordinates (i.i.d.: every shape
+                        // describes the same distributions)
+                        e
+                    } else {
+                        e.shape(match shape {
+                            ShapeKind::Gamma => Shape::Gamma,
+                            ShapeKind::LogTangent => Shape::LogTangent,
+                            ShapeKind::GammaTransported => Shape::GammaTransported,
+                            ShapeKind::GammaRot => Shape::GammaRot,
+                            ShapeKind::Spectral => Shape::Spectral,
+                        })
+                    }
+                }
+            };
+            est = match select {
+                SelectKind::Bic => est.bic(),
+                SelectKind::Aic => est.aic(),
+                SelectKind::Cv => est.cv(folds, seed),
+            };
+            if paper_grid {
+                est = est.with_grid(LambdaGrid::Paper);
+            }
+            est = est.feature_names(names).response_names(split_cols(&y));
+            let t0 = Instant::now();
+            let path = est.fit(&xm, &ym)?;
+            outln!("{}", path.path_summary());
+            outln!("{}", path.summary());
             outln!(
-                "restricted log-lik {:.4}, full log-lik {:.4}, df {}",
-                r.loglik_restricted,
-                r.loglik_full,
-                r.df
-            );
-            outln!("{:<6}{:>12}{:>12}", "stat", "value", "p (boot)");
-            outln!("{:<6}{:>12.4}{:>12.3}", "RoC", r.roc, r.p_roc);
-            outln!("{:<6}{:>12.4}{:>12.3}", "D", r.d_stat, r.p_d);
-            outln!("{:<6}{:>12.5}{:>12.3}", "M", r.m_stat, r.p_m);
-            outln!(
-                "{:<6}{:>12.4}{:>12.3}   (chi-square approx p {:.2e})",
-                "LR",
-                r.lr,
-                r.p_lr,
-                r.p_lr_chisq
-            );
-            outln!(
-                "{} bootstrap replicates ({} failed), {:.1} s",
-                r.n_boot,
-                r.n_failed,
+                "path of {} lambdas in {:.2} s",
+                path.points.len(),
                 t0.elapsed().as_secs_f64()
             );
         }

@@ -102,6 +102,108 @@ impl<S: Scalar> Frame<S> {
     }
 }
 
+impl Frame<f64> {
+    /// The frame of `γ`'s map in the tangent frame transported from `lt`'s
+    /// reference ([`crate::gamma_transported`]): `P = [Ξ(μ̂) R | μ̂]`, with
+    /// `Ξ(μ̂) = R(m → μ̂) E` in place of `onb(μ)`'s tangent columns.
+    pub fn transported(lt: &crate::logtangent::LtFrame, mu: &[f64], gamma: &[f64]) -> Frame<f64> {
+        let d = mu.len();
+        let ang = gamma_to_angles(gamma);
+        debug_assert_eq!(ang.lambda.len(), d - 1, "mu and gamma dimensions disagree");
+        let xi = lt.frame_at(mu);
+        let mut basis = vec![0.0; d * d];
+        for j in 0..d - 1 {
+            for r in 0..d {
+                basis[j * d + r] = xi[(r, j)];
+            }
+        }
+        let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for r in 0..d {
+            basis[(d - 1) * d + r] = if mu_norm > 0.0 {
+                mu[r] / mu_norm
+            } else {
+                lt.reference()[r]
+            };
+        }
+        {
+            let e = &mut basis[..(d - 1) * d];
+            for (a, angle) in givens_sequence(&ang.theta, &ang.phi) {
+                right_rotate(e, d, a, angle);
+            }
+        }
+        Frame {
+            d,
+            mu_norm,
+            lambda: ang.lambda,
+            basis,
+        }
+    }
+}
+
+impl Frame<f64> {
+    /// The frame of the `γ`-rot map ([`crate::gamma_rot`]): the eigen-axes
+    /// of `W = fr.tangent_covariance(gamma)` carried into `ℝ^d` by the
+    /// tangent frame `Ξ(μ̂) R_0`, and `μ̂` last.
+    pub fn gamma_rot(fr: &crate::gamma_rot::GrFrame, mu: &[f64], gamma: &[f64]) -> Frame<f64> {
+        let d = mu.len();
+        let p = d - 1;
+        let w = fr.tangent_covariance(gamma);
+        let eig = nalgebra::SymmetricEigen::new(w);
+        let xi = fr.tangent_frame(mu);
+        let u = &xi * &eig.eigenvectors;
+        let mut basis = vec![0.0; d * d];
+        for j in 0..p {
+            for r in 0..d {
+                basis[j * d + r] = u[(r, j)];
+            }
+        }
+        let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for r in 0..d {
+            basis[p * d + r] = if mu_norm > 0.0 {
+                mu[r] / mu_norm
+            } else {
+                fr.lt_frame().reference()[r]
+            };
+        }
+        Frame {
+            d,
+            mu_norm,
+            lambda: eig.eigenvalues.iter().copied().collect(),
+            basis,
+        }
+    }
+
+    /// The frame of the spectral map ([`crate::spectral`]): the eigen-axes
+    /// are the columns of `Ξ(μ̂) R_0 R` with `R` the chart's rotation, the
+    /// eigenvalues `e^{ℓ}`; `μ̂` last. No eigen-decomposition is needed.
+    pub fn spectral(fr: &crate::spectral::SpFrame, mu: &[f64], gamma: &[f64]) -> Frame<f64> {
+        let d = mu.len();
+        let p = d - 1;
+        let xi = fr.tangent_frame(mu);
+        let u = &xi * fr.rotation(gamma);
+        let mut basis = vec![0.0; d * d];
+        for j in 0..p {
+            for r in 0..d {
+                basis[j * d + r] = u[(r, j)];
+            }
+        }
+        let mu_norm = mu.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for r in 0..d {
+            basis[p * d + r] = if mu_norm > 0.0 {
+                mu[r] / mu_norm
+            } else {
+                fr.lt_frame().reference()[r]
+            };
+        }
+        Frame {
+            d,
+            mu_norm,
+            lambda: fr.eigenvalues(gamma),
+            basis,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +216,35 @@ mod tests {
             }
         }
         o
+    }
+
+    #[test]
+    fn transported_frame_matches_its_kernel() {
+        for d in 3..=7 {
+            let m: Vec<f64> = (0..d).map(|i| 0.8 + 0.3 * (i as f64 * 1.7).sin()).collect();
+            let lt = crate::logtangent::LtFrame::new(&m);
+            let mu: Vec<f64> = (0..d).map(|i| 1.2 * (i as f64 * 0.9 + 0.4).cos()).collect();
+            let g: Vec<f64> = (0..crate::dims::gamma_len(d))
+                .map(|i| 0.7 * (i as f64 * 2.3 + 0.1).sin())
+                .collect();
+            let f = Frame::transported(&lt, &mu, &g);
+            let v = nalgebra::DMatrix::from_row_slice(d, d, &f.cov_pow(1.0));
+            let want =
+                crate::gamma_smooth::GsFrame::gamma_transported(lt.reference()).covariance(&mu, &g);
+            assert!((&v - &want).abs().max() < 1e-12, "d = {d}");
+            let y: Vec<f64> = (0..d).map(|i| (i as f64 * 1.3).cos()).collect();
+            let n = y.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let y: Vec<f64> = y.iter().map(|x| x / n).collect();
+            let mut eta = mu.clone();
+            eta.extend_from_slice(&g);
+            let mut grad = vec![0.0; eta.len()];
+            let a = crate::gamma_transported::loglik_gt_grad(&lt, &eta, &y, &mut grad);
+            let b = crate::loglik::loglik_frame(&f, &mu, &y);
+            assert!(
+                (a - b).abs() < 1e-12 * b.abs().max(1.0),
+                "d = {d}: {a} vs {b}"
+            );
+        }
     }
 
     #[test]

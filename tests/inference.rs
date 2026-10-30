@@ -1,10 +1,11 @@
+#![allow(clippy::needless_range_loop)]
 //! Inference procedures: parity with the R code where deterministic, Monte
 //! Carlo agreement where stochastic, and reproducibility.
 
 use esag::distribution::Esag;
 use esag::inference::{
     GofMethod, Restriction, bootstrap_gof, confidence_region_sample, hypothesis_test,
-    prediction_region,
+    prediction_region, score_test,
 };
 use esag::regression::EsagRegressor;
 use esag::stats::ks::ks_1samp_chisq;
@@ -137,6 +138,66 @@ fn restricted_fits_are_nested() {
         assert!(t.lr >= -1e-6, "{r:?}: LR {}", t.lr);
     }
     assert!(hypothesis_test(&fit, &x, &y, Restriction::Feature(3), 2, 50, 1).is_err());
+}
+
+/// The score statistic is asymptotically equivalent to LR: on anisotropic
+/// data the two are close, under the null (gamma; the log-tangent model
+/// with the same coefficients is a different model, where both reject),
+/// and the null fit's own coefficients have no score left (LM = 0 for an
+/// empty restriction).
+#[test]
+fn score_statistic_tracks_lr_under_an_anisotropic_null() {
+    use esag::regression::Shape;
+    use rand_distr::{Distribution, StandardNormal};
+    let mut rng = ChaCha8Rng::seed_from_u64(31);
+    let n = 2000;
+    let x = DMatrix::from_fn(n, 2, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, 3);
+    let mut buf = [0.0; 3];
+    for i in 0..n {
+        // the gamma shape depends on x1 only: "shape free of x2" is true
+        let dist = Esag::new(
+            &[1.5 - 0.6 * x[(i, 0)], 0.5 + 1.2 * x[(i, 1)], 2.0],
+            &[0.8 + 0.3 * x[(i, 0)], -0.4],
+        )
+        .unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..3 {
+            y[(i, k)] = buf[k];
+        }
+    }
+    for shape in [Shape::Gamma, Shape::LogTangent] {
+        let fit = EsagRegressor::new().with_shape(shape).fit(&x, &y).unwrap();
+        let t = hypothesis_test(&fit, &x, &y, Restriction::GammaOfFeature(1), 20, 0, 3).unwrap();
+        eprintln!(
+            "{shape:?}: LM {:.3} (p {:.2}), LR {:.3} (p {:.2})",
+            t.lm, t.p_lm, t.lr, t.p_lr
+        );
+        assert!(
+            (t.lm - t.lr).abs() < 0.5 + 0.1 * t.lr,
+            "{shape:?}: LM {} vs LR {}",
+            t.lm,
+            t.lr
+        );
+        assert_eq!(t.boot_lm.len(), t.n_boot);
+        assert!((0.0..=1.0).contains(&t.p_lm));
+        // the score test runs the same restricted refits, and only those
+        let fast = score_test(&fit, &x, &y, Restriction::GammaOfFeature(1), 20, 0, 3).unwrap();
+        assert_eq!(fast.boot_lm, t.boot_lm);
+        assert_eq!(fast.boot_m, t.boot_m);
+        assert_eq!((fast.p_m, fast.p_lm), (t.p_m, t.p_lm));
+        assert!(fast.p_lr.is_nan() && fast.boot_lr.is_empty() && fast.lr == t.lr);
+        let c = score_test(&fit, &x, &y, Restriction::ConstantShape, 20, 0, 3).unwrap();
+        assert_eq!(c.df, 2 * 2);
+        assert!(c.loglik_restricted <= fit.log_likelihood + 1e-6);
+        let all = DMatrix::from_element(fit.coef.nrows(), fit.coef.ncols(), true);
+        let t0 = hypothesis_test(&fit, &x, &y, Restriction::Custom(all), 2, 0, 3).unwrap();
+        assert!(
+            t0.lm.abs() < 1e-6,
+            "{shape:?}: LM {} with nothing restricted",
+            t0.lm
+        );
+    }
 }
 
 /// Size of the goodness-of-fit test under the null (slow; run with

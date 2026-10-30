@@ -323,6 +323,7 @@ impl<const N: usize> DivAssign<f64> for Dual<N> {
 // ----- Scalar -----------------------------------------------------------------
 
 impl<const N: usize> Scalar for Dual<N> {
+    const DERIV_ORDER: u8 = 1;
     #[inline]
     fn from_f64(v: f64) -> Self {
         Self::constant(v)
@@ -400,6 +401,18 @@ impl<const N: usize> Scalar for Dual<N> {
             p * self.re.powf(p - 1.0)
         };
         self.chain(self.re.powf(p), scale)
+    }
+
+    /// `d ∛x = ∛x/(3x) dx` (value from `f64::cbrt`); derivative 0 at 0.
+    #[inline]
+    fn cbrt(self) -> Self {
+        let c = self.re.cbrt();
+        let scale = if self.re == 0.0 {
+            0.0
+        } else {
+            c / (3.0 * self.re)
+        };
+        self.chain(c, scale)
     }
 
     /// `d x^n = n x^(n-1) dx`; derivative 0 for `n == 0`.

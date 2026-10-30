@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Reproduce the real-data ESAG regression of Yu & Huang (2025, CSDA,
 //! Section 7.1; dissertation Section 2.9.1): square-root compositions of
 //! (K, Na, Ca, Mg) in Llobregat-basin water, Anoia tributaries (X = 0, n = 67)
@@ -110,6 +111,21 @@ fn reproduces_published_test_statistics_and_region_quantiles() {
         ),
     ] {
         let t = hypothesis_test(&f, &x, &y, r.clone(), 20, 4000, 2).unwrap();
+        // exact moments agree with the Monte-Carlo version to MC accuracy
+        let te = hypothesis_test(&f, &x, &y, r.clone(), 20, 0, 2).unwrap();
+        assert!(
+            (te.m_stat - t.m_stat).abs() / t.m_stat < 0.1,
+            "{r:?} exact M {} vs MC {}",
+            te.m_stat,
+            t.m_stat
+        );
+        if let Some(m) = m {
+            assert!(
+                (te.m_stat - m).abs() / m < 0.2,
+                "{r:?} exact M {}",
+                te.m_stat
+            );
+        }
         assert!((t.roc - roc).abs() < 6e-4, "{r:?} RoC {}", t.roc);
         assert!((t.d_stat - dd).abs() < 6e-4, "{r:?} D {}", t.d_stat);
         assert!((t.lr - lr).abs() < 0.06, "{r:?} LR {}", t.lr);
