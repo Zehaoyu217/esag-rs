@@ -24,7 +24,8 @@ angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
   and sparse group LASSO on any set of coefficients, with adaptive or RoC
   weights on every shape and with covariates, a hierarchical group LASSO over
   each covariate's components (its mean and shape slopes, the shape's eigen
-  parts, single coefficients: the recommended penalty, `"auto"`), isotropy
+  parts, single coefficients; with RoC weights the recommended penalty and
+  the default, `"auto"`), isotropy
   and eigenvalue-tie penalties, and the paper's six methods as coded in its
   R scripts, with λ paths, BIC/AIC/CV selection and relaxed refits;
 * statsmodels-style results (`params`, `bse`, `pvalues`, `conf_int`,
@@ -71,14 +72,15 @@ res.test("shape", "temp", n_boot=500)   # RoC, D, M, LR, LM with bootstrap p-val
 res.test("constant_shape", n_boot=500)  # nulls: mu | shape | feature | constant_shape | isotropy
 res.score_test("shape", "temp")         # LM and M from restricted refits only: faster
 
-reg = model.fit_regularized("auto")     # recommended: which covariates act on mu and on V
+reg = model.fit_regularized()           # "auto": which covariates act on mu and on V, and how
 reg = model.fit_regularized("adaptive_group_lasso", groups="covariate_part")
 print(reg.summary())                    # relaxed refit of the selected model; dropped terms marked
 reg.path                                # alpha, lambda, df, llf, BIC, active groups per step
 ```
 
-Penalties: `auto` (the hierarchical adaptive group LASSO with covariates,
-the adaptive eigen-gap penalty without), `lasso`, `adaptive_lasso`,
+Penalties: `auto` (the default: the hierarchical group LASSO with
+covariates, the eigen-gap penalty without, both with RoC weights), `lasso`,
+`adaptive_lasso`,
 `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`,
 `hierarchical`, `roc_hierarchical`, `sparse_group_lasso` (`l1_ratio`),
 `isotropy`, `eigen_gap`, or `paper="RoC-LASSO"` (any of the paper's six);
@@ -237,7 +239,7 @@ $B penalize sim.csv --y y1,y2,y3 --paper RoC-LASSO                          # th
 | `regression::canonicalize_coef` | picks the canonical sign of the first γ group (see identifiability below). |
 | `param::gamma_from_covariance` | the inverse of the parameterization: the canonical γ for any μ and V. |
 | `logtangent` | the smooth shape coordinates: `LtFrame`, `covariance`, `s_from_covariance`, `loglik_lt`, `loglik_lt_grad`, `loglik_lt_hess` (exact). |
-| `penalized::PenalizedEsag` | the LASSO family: `Penalty::{Lasso, GroupLasso, SparseGroupLasso, EigenGap, Hierarchical}` × `Target::{Slopes, MeanSlopes, ShapeSlopes, Shape}` × `Grouping::{Covariate, CovariatePart, Parameter, All, GammaGroups, Custom}` × `Weighting::{Plain, Adaptive(r), RoC}`; presets `lasso()`, `adaptive_lasso()`, `group_lasso()`, `adaptive_group_lasso()`, `sparse_group_lasso(α)`, `hierarchical()`, `recommended(has_covariates)`, `isotropy()`, `eigen_gap()`, `paper(name)`, and `.roc(RocMode)` on any; `LambdaGrid`, `Selection::{Bic, Aic, CrossValidation}`. `fit` returns a `PenalizedPath` (per-λ fits, criterion, selected point, relaxed refit, `summary()`, `path_summary()`). |
+| `penalized::PenalizedEsag` | the LASSO family: `Penalty::{Lasso, GroupLasso, SparseGroupLasso, EigenGap, Hierarchical}` × `Target::{Slopes, MeanSlopes, ShapeSlopes, Shape}` × `Grouping::{Covariate, CovariatePart, Parameter, All, GammaGroups, Custom}` × `Weighting::{Plain, Adaptive(r), RoC}`; presets `auto()` (chosen from the data when fitted), `lasso()`, `adaptive_lasso()`, `group_lasso()`, `adaptive_group_lasso()`, `sparse_group_lasso(α)`, `hierarchical()`, `recommended(has_covariates)`, `isotropy()`, `eigen_gap()`, `paper(name)`, and `.roc(RocMode)` on any; `LambdaGrid`, `Selection::{Bic, Aic, CrossValidation}`. `fit` returns a `PenalizedPath` (per-λ fits, criterion, selected point, relaxed refit, `summary()`, `path_summary()`). |
 | `distribution::Esag::second_moment` | exact `E[YYᵀ]` (one 1-D integral, ~1 µs). |
 | `optim::prox` | proximal Newton for smooth + group-norm / eigen-gap penalties. |
 

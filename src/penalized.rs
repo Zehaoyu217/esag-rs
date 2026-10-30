@@ -83,6 +83,12 @@ pub enum Penalty {
     /// only the axes of `V`, or keep single coefficients. Tree-structured,
     /// with the exact prox (`optim::prox::TreeGroupNorms`).
     Hierarchical,
+    /// The recommended penalty for the data, chosen when fitted
+    /// ([`PenalizedEsag::auto`], the default of the Python and command-line
+    /// front ends): [`Penalty::Hierarchical`] over every slope with
+    /// covariates, [`Penalty::EigenGap`] in log-tangent coordinates without
+    /// (with RoC weights unless set otherwise).
+    Auto,
 }
 
 /// How the target coefficients are grouped (group and sparse-group LASSO).
@@ -291,7 +297,6 @@ impl PenalizedEsag {
             Weighting::Plain,
         )
     }
-    /// Adaptive group LASSO (`r = 1`), one group per covariate.
     /// The hierarchical adaptive group LASSO over every slope
     /// ([`Penalty::Hierarchical`]): which covariates act, on the mean
     /// direction or on `V`, and through which eigen parts. `.roc(..)` for RoC
@@ -305,6 +310,7 @@ impl PenalizedEsag {
         )
     }
 
+    /// Adaptive group LASSO (`r = 1`), one group per covariate.
     pub fn adaptive_group_lasso() -> Self {
         Self::group_lasso().adaptive(1.0)
     }
@@ -337,20 +343,53 @@ impl PenalizedEsag {
             Weighting::Adaptive(1.0),
         )
     }
-    /// The recommended penalty (the comparison of `docs/MATH.md` §8,
+    /// The recommended penalty (the comparisons of `docs/MATH.md` §8,
     /// `examples/penalty_compare.rs`): with covariates the hierarchical
-    /// adaptive group LASSO over every slope ([`Self::hierarchical`]: which
+    /// group LASSO over every slope ([`Self::hierarchical`]: which
     /// covariates act, on the mean direction or on `V`, through which eigen
-    /// parts), on the model's shape; without, the eigen-gap penalty with
-    /// adaptive weights ([`Self::eigen_gap`]: tied eigenvalues of `V`), in
-    /// log-tangent coordinates (without covariates every shape describes
-    /// the same distributions).
+    /// parts), on the model's shape; without, the eigen-gap penalty
+    /// ([`Self::eigen_gap`]: tied eigenvalues of `V`), in log-tangent
+    /// coordinates (without covariates every shape describes the same
+    /// distributions); both with RoC weights (Project 3's exponent
+    /// `r = max(1, ‖μ̃‖/‖μ‖)`, the adaptive weights once `r = 1`).
     pub fn recommended(has_covariates: bool) -> Self {
-        if has_covariates {
-            Self::hierarchical()
-        } else {
-            Self::eigen_gap().shape(Shape::LogTangent)
+        Self::auto().resolved(has_covariates)
+    }
+    /// The recommended penalty, chosen from the data when fitted
+    /// ([`Penalty::Auto`]; [`Self::recommended`] when the data are known):
+    /// the hierarchical group LASSO with covariates, the eigen-gap penalty
+    /// without, with RoC weights (`.adaptive(1.0)` for the adaptive ones,
+    /// which they become as `n` grows: identical selections from `n = 300`
+    /// at `d = 5` with five covariates, and at `n = 200` lower `V` errors
+    /// for γ-rot and the log-tangent shape, higher for spectral). Builder
+    /// settings (weights, grid, selection, …) carry over to the chosen
+    /// penalty.
+    pub fn auto() -> Self {
+        Self::base(
+            Penalty::Auto,
+            Grouping::Covariate,
+            Target::Slopes,
+            Weighting::RoC(RocMode::FixedPoint),
+        )
+    }
+    /// This estimator with [`Penalty::Auto`] replaced by the penalty it
+    /// stands for on data with or without covariates (any other penalty is
+    /// returned unchanged). Without covariates the eigen-gap penalty works on
+    /// the shape, in log-tangent coordinates, whatever target and shape were
+    /// set.
+    pub fn resolved(&self, has_covariates: bool) -> Self {
+        let mut e = self.clone();
+        if e.penalty == Penalty::Auto {
+            if has_covariates {
+                e.penalty = Penalty::Hierarchical;
+            } else {
+                e.penalty = Penalty::EigenGap;
+                e.grouping = Grouping::All;
+                e.target = Target::Shape;
+                e.shape = Shape::LogTangent;
+            }
         }
+        e
     }
 
     /// One of the paper's six methods, reproduced as coded in its R scripts
@@ -463,6 +502,10 @@ impl PenalizedEsag {
             Penalty::SparseGroupLasso { .. } => "sparse group LASSO".to_string(),
             Penalty::EigenGap => "eigen-gap LASSO".to_string(),
             Penalty::Hierarchical => "hierarchical group LASSO".to_string(),
+            Penalty::Auto => {
+                return "auto (hierarchical group LASSO with covariates, eigen-gap LASSO without)"
+                    .to_string();
+            }
         };
         let paper = if self.is_paper() { " [paper mode]" } else { "" };
         format!("{weights}{core}{paper}")
@@ -522,6 +565,9 @@ impl PenalizedEsag {
     /// Fit the λ path to `(x, y)` (`x` may have zero columns: i.i.d.) and
     /// select λ.
     pub fn fit(&self, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<PenalizedPath> {
+        if self.penalty == Penalty::Auto {
+            return self.resolved(x.ncols() > 0).fit(x, y);
+        }
         #[cfg(test)]
         let clock = std::time::Instant::now();
         let prep = Prepared::new(self, x, y)?;
@@ -588,6 +634,11 @@ impl PenalizedEsag {
         coef: &DMatrix<f64>,
         lambda: f64,
     ) -> Result<f64> {
+        if self.penalty == Penalty::Auto {
+            return self
+                .resolved(x.ncols() > 0)
+                .penalized_loglik(x, y, coef, lambda);
+        }
         let prep = Prepared::new(self, x, y)?;
         let theta = prep.to_standardized(coef);
         let obj = SmoothNegLogLik::new(
@@ -734,6 +785,7 @@ impl PenalizedPath {
             (Penalty::Lasso, _) => "entries".to_string(),
             (Penalty::EigenGap, _) => "eigen-gaps".to_string(),
             (Penalty::Hierarchical, _) => "covariate tree".to_string(),
+            (Penalty::Auto, _) => "auto".to_string(),
             (_, Grouping::Covariate) => "covariate".to_string(),
             (_, Grouping::CovariatePart) => "cov. part".to_string(),
             (_, Grouping::Parameter) => "parameter".to_string(),
@@ -919,6 +971,11 @@ impl Prepared {
     fn new(cfg: &PenalizedEsag, x: &DMatrix<f64>, y: &DMatrix<f64>) -> Result<Self> {
         let d = y.ncols();
         let p = x.ncols();
+        if cfg.penalty == Penalty::Auto {
+            return Err(EsagError::Data(
+                "Penalty::Auto is chosen by PenalizedEsag::fit (or resolved())".into(),
+            ));
+        }
         let paper = cfg.is_paper();
         let iid_only = paper || cfg.penalty == Penalty::EigenGap;
         if iid_only && p > 0 {
@@ -1161,6 +1218,7 @@ impl Prepared {
                 p: d - 1,
                 offset: d,
             }),
+            Penalty::Auto => unreachable!("Penalty::Auto is rejected above"),
             Penalty::Hierarchical => {
                 // the shape's eigen parts, as row ranges of B
                 let p_ = d - 1;

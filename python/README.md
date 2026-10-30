@@ -87,8 +87,8 @@ reg = model.fit_regularized("group_lasso",
                             groups=[[("mu[1]", "temp"), ("mu[2]", "temp")]])
 reg = model.fit_regularized("lasso", alpha=0.02)                  # fixed weight, no path
 reg = model.fit_regularized("roc_group_lasso", groups="gamma")    # RoC-GLASSO (any shape; "eigen_parts" for spectral)
-reg = model.fit_regularized("auto")                               # recommended: the hierarchical adaptive group LASSO
-reg = model.fit_regularized("hierarchical", adaptive="roc")       # ... with RoC weights
+reg = model.fit_regularized()                                     # "auto" (default): the hierarchical group LASSO, RoC weights
+reg = model.fit_regularized("hierarchical")                       # ... with adaptive weights
 print(reg.summary())       # relaxed refit of the selected model, dropped terms marked
 reg.params                 # penalized coefficients at the selected weight
 reg.relaxed                # an ESAGResults (SEs, tests, ...)
@@ -97,7 +97,7 @@ reg.path                   # alpha, lambda, df, llf, criterion, n_active, select
 
 | argument | values |
 |---|---|
-| `penalty` | `auto` (recommended: `hierarchical` with covariates, the adaptive `eigen_gap` without), `lasso`, `adaptive_lasso`, `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`, `hierarchical`, `roc_hierarchical`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
+| `penalty` | `auto` (default, recommended: `hierarchical` with covariates, `eigen_gap` without, RoC weights), `lasso`, `adaptive_lasso`, `roc_lasso`, `group_lasso`, `adaptive_group_lasso`, `roc_group_lasso`, `hierarchical`, `roc_hierarchical`, `sparse_group_lasso`, `isotropy`, `eigen_gap` (i.i.d., log-tangent) |
 | `target` | `slopes` (default), `mean`, `shape_slopes`, `shape` |
 | `groups` | `covariate` (default), `covariate_part`, `parameter`, `all`, `gamma` (γ and γ-rot), `eigen_parts` (γ-rot and spectral), or lists of `(parameter, variable)` pairs |
 | `adaptive` | `True` (r = 1), a number r, `False`, or `"roc"`: Project 3's RoC exponent r = max(1, ‖μ̃‖/‖μ‖) (with covariates the mean of the per-observation ratios), by the fixed point; `"roc_joint"`: the paper's joint objective (i.i.d.) |
@@ -112,6 +112,19 @@ log-tangent: the eigenvalue and the rotation coordinates) and every
 coefficient, each weighted adaptively (or by RoC): a covariate can drop out,
 act on the mean direction or on V only, move only V's sizes or only its
 axes, or keep single coefficients (exact proximal map for nested groups).
+
+**Which penalty.** `auto` was the most accurate, or within noise of the
+most accurate, in every comparison of `docs/MATH.md` §8, and the only one
+that tells a covariate that changes V's eigenvalues from one that turns its
+axes. The others answer narrower questions: `adaptive_group_lasso` with
+`groups="covariate_part"` asks "does x move V at all?" and does as well at
+very small samples (about 2–3 observations per coefficient), where the best
+model keeps V constant, but it drops true drivers when a covariate moves
+only part of V; `adaptive_lasso` is the fastest (about 0.6 of `auto`'s time
+at d = 8) but keeps more covariates without an effect; RoC weights equal
+the adaptive ones once n is moderate (r = 1.06–1.12 at n = 200, below 1.015
+at n = 2000); `eigen_gap` finds tied eigenvalues (i.i.d.); `paper=...`
+reproduces the Project 3 R scripts.
 
 Covariates are standardized internally for the penalty; coefficients are
 reported on the original scale. With about as many coefficients as

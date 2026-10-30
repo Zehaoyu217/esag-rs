@@ -99,8 +99,9 @@ enum ShapeKind {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum PenaltyKind {
-    /// the recommended penalty: hierarchical with covariates, the adaptive
-    /// eigen-gap penalty (log-tangent) without
+    /// the recommended penalty (default): hierarchical with covariates, the
+    /// eigen-gap penalty (log-tangent) without, RoC weights (--r 1 for the
+    /// adaptive ones)
     Auto,
     /// L1 on each target coefficient
     Lasso,
@@ -254,7 +255,7 @@ enum Cmd {
         y: String,
         #[arg(long, default_value = "")]
         x: String,
-        #[arg(long, value_enum, default_value = "adaptive-lasso")]
+        #[arg(long, value_enum, default_value = "auto")]
         penalty: PenaltyKind,
         /// Which coefficients to penalize (default: the preset's).
         #[arg(long, value_enum)]
@@ -541,7 +542,7 @@ fn run() -> Res<()> {
                 Some(name) => PenalizedEsag::paper(name)?,
                 None => {
                     let mut e = match penalty {
-                        PenaltyKind::Auto => PenalizedEsag::recommended(xm.ncols() > 0),
+                        PenaltyKind::Auto => PenalizedEsag::auto(),
                         PenaltyKind::Lasso => PenalizedEsag::lasso(),
                         PenaltyKind::AdaptiveLasso => PenalizedEsag::adaptive_lasso(),
                         PenaltyKind::GroupLasso => PenalizedEsag::group_lasso(),

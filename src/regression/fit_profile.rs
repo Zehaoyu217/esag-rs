@@ -6118,6 +6118,28 @@ fn penalized_speed() {
                 "gamma-rot hierarchical",
                 PenalizedEsag::hierarchical().shape(Shape::GammaRot),
             ),
+            (
+                "log-tangent hierarchical",
+                PenalizedEsag::hierarchical().shape(Shape::LogTangent),
+            ),
+            (
+                "spectral hierarchical RoC",
+                PenalizedEsag::hierarchical()
+                    .roc(crate::optim::prox::RocMode::FixedPoint)
+                    .shape(Shape::Spectral),
+            ),
+            (
+                "gamma-rot hierarchical RoC",
+                PenalizedEsag::hierarchical()
+                    .roc(crate::optim::prox::RocMode::FixedPoint)
+                    .shape(Shape::GammaRot),
+            ),
+            (
+                "log-tangent hierarchical RoC",
+                PenalizedEsag::hierarchical()
+                    .roc(crate::optim::prox::RocMode::FixedPoint)
+                    .shape(Shape::LogTangent),
+            ),
         ];
         for (name, pe) in presets {
             if let Ok(f) = std::env::var("PRESET")

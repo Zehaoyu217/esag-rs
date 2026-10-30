@@ -169,7 +169,7 @@ impl PyModel {
                         PenalizedEsag::group_lasso().roc(RocMode::FixedPoint)
                     }
                     "auto" | "recommended" => {
-                        PenalizedEsag::recommended(self.inner.exog().ncols() > 0)
+                        PenalizedEsag::auto()
                     }
                     "hierarchical" | "tree" => PenalizedEsag::hierarchical(),
                     "roc_hierarchical" | "roc_tree" => {

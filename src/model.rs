@@ -121,10 +121,12 @@ impl EsagModel {
     }
 
     /// Penalized fit along a λ path, λ selected by the estimator's rule
-    /// (`PenalizedEsag::lasso()`, `adaptive_lasso()`, `group_lasso()`, …).
+    /// (`PenalizedEsag::auto()`, the recommended penalty for these data,
+    /// `lasso()`, `adaptive_lasso()`, `group_lasso()`, `hierarchical()`, …).
     /// The model's shape and names override the estimator's (paper presets
     /// keep the paper's gamma shape).
     pub fn fit_regularized(&self, penalty: PenalizedEsag) -> Result<PenalizedPath> {
+        let penalty = penalty.resolved(self.exog.ncols() > 0);
         // the paper's methods are γ's, and the eigen-gap penalty is the
         // log-tangent's (i.i.d., where every shape describes the same
         // distributions): they keep their shape

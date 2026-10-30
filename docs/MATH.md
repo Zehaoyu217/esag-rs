@@ -1610,11 +1610,100 @@ every cell (the covariate-part group LASSO, the most accurate for `V` at
 `n = 500`, gets there by dropping every shape covariate and loses mean
 drivers), has the best `μ̂` among the penalties, and keeps the fewest
 covariates without an effect; RoC weights give the same results to within
-0.003 (`r` stays within a few percent of 1). It is the recommended penalty
-with covariates (`PenalizedEsag::recommended(true)`, Python and CLI
-`"auto"`); without covariates the recommendation is the adaptive eigen-gap
-penalty above (`recommended(false)`, in log-tangent coordinates: without
-covariates every shape describes the same distributions).
+0.003 (`r` stays within a few percent of 1).
+
+**Where the other penalties win, and the default.** Two more designs at
+`d = 5`, every slope penalized: the same γ data in smaller samples
+(`NS=200,300`; 24 replicates at `n = 200`, 8 at 300; 84 coefficients), and
+a truth in spectral coordinates whose covariates act on V's eigen parts
+(`TRUTH=eigen`: x1 moves μ and V's eigenvalues only, x2 only μ, x3 only
+V's axes, x4 all three weakly, x5 nothing; 8 replicates), scored also on
+which covariates keep eigenvalue slopes (γ-rot: the `κ_j`; spectral: the
+Helmert coordinates) and axis slopes (the `ω_j`; the Cayley coordinates).
+
+*Small samples* (V̂ error, ± its standard error at `n = 200`):
+
+| n | shape | full | adaptive LASSO | RoC-LASSO | aGLASSO (cov. parts) | RoC-GLASSO (cov. parts) | a-sparse GLASSO | hierarchical | hierarchical, RoC |
+|---|---|---|---|---|---|---|---|---|---|
+| 200 | γ-rot | 1.570 | 0.869 ± 0.100 | 0.835 ± 0.090 | 0.727 ± 0.103 | 0.557 ± 0.054 | 0.815 ± 0.102 | 0.716 ± 0.090 | 0.661 ± 0.079 |
+| | spectral | 1.698 | 0.737 ± 0.061 | 0.701 ± 0.041 | 0.545 ± 0.028 | 0.557 ± 0.035 | 0.669 ± 0.061 | 0.544 ± 0.020 | 0.573 ± 0.022 |
+| | log-tangent | 0.897 | 0.614 ± 0.032 | 0.592 ± 0.029 | 0.551 ± 0.036 | 0.527 ± 0.031 | 0.573 ± 0.036 | 0.574 ± 0.036 | 0.551 ± 0.032 |
+| 300 | γ-rot | 1.074 | 0.540 | 0.539 | 0.455 | 0.455 | 0.478 | 0.458 | 0.461 |
+| | spectral | 1.233 | 0.531 | 0.526 | 0.459 | 0.459 | 0.528 | 0.471 | 0.474 |
+| | log-tangent | 0.685 | 0.516 | 0.516 | 0.456 | 0.456 | 0.470 | 0.456 | 0.457 |
+
+RoC's exponent at the selected λ is 1.06–1.12 at `n = 200`, 1.04–1.08 at
+300, 1.03–1.05 at 500 and 1.005–1.015 at 2000: it goes to 1, as the
+methodology says, and from `n = 300` on the RoC weights give the adaptive
+answers to within 0.005. At `n = 200` (2.4 observations per coefficient)
+their heavier weights on small coefficients lower the V̂ error in seven of
+the nine pairs (γ-rot 0.03–0.17, log-tangent 0.02, spectral's LASSO
+0.04) and raise it in two (spectral's group and hierarchical penalties,
+0.01–0.03). The covariate-part group LASSO is as good as the hierarchical
+penalty there or better (0.56 against 0.66 on γ-rot with RoC weights): the
+best model at this size keeps V constant, and it keeps 0.1–0.5 of the 3
+shape drivers. These solutions are fragile: at `n = 200` the γ-rot RoC
+errors moved by up to 0.06 (0.787 → 0.835, 0.621 → 0.557, 0.647 → 0.661)
+when only the way the RoC fixed point is solved changed (below), the other
+shapes' by 0.001 or less.
+
+*Eigen-part truth* (V̂ / μ̂ errors, then eigenvalue / axis slopes kept for
+covariates that do not move them, of 3 each):
+
+| n | method | γ-rot | spectral | log-tangent |
+|---|---|---|---|---|
+| 500 | full model | 0.730 / 0.256 | 0.794 / 0.265 | 0.553 / 0.245 |
+| | adaptive LASSO | 0.415 / 0.287; 0.25 / 0.75 | 0.422 / 0.297; 0.50 / 0.75 | 0.454 / 0.277 |
+| | aGLASSO (cov. parts) | 0.566 / 0.380; 0.25 / 0.38 | 0.565 / 0.398; 0.38 / 0.50 | 0.551 / 0.259 |
+| | a-sparse GLASSO | 0.391 / 0.290; 0.38 / 0.25 | 0.379 / 0.283; 0.50 / 0.62 | 0.449 / 0.263 |
+| | **hierarchical** | **0.381** / 0.262; 0.38 / 0 | **0.368** / 0.291; 0.12 / 0.12 | **0.438** / 0.248 |
+| 2000 | full model | 0.290 / 0.119 | 0.328 / 0.121 | 0.310 / 0.119 |
+| | adaptive LASSO | 0.227 / 0.162; 0.25 / 0.25 | **0.203** / 0.168; 0.12 / 0 | 0.285 / 0.163 |
+| | aGLASSO (cov. parts) | 0.275 / 0.135; 0.88 / 1.00 | 0.315 / 0.134; 1.38 / 1.12 | 0.328 / 0.136 |
+| | a-sparse GLASSO | **0.216** / 0.158; 0.12 / 0 | 0.207 / 0.159; 0 / 0.25 | 0.285 / 0.156 |
+| | **hierarchical** | 0.217 / 0.151; 0.25 / 0 | 0.212 / 0.154; 0 / 0 | **0.284** / 0.160 |
+
+Here the covariate-part groups lose (0.57 against 0.37–0.38 at `n = 500`):
+a covariate that moves only V's eigenvalues or only its axes is kept or
+dropped with all of V's coordinates, so they cannot tell the two apart. The
+hierarchical penalty is the most accurate at `n = 500` for all three shapes
+and within 0.009 of the best at 2000, with no false axis selections on γ-rot
+and none of either kind on spectral at `n = 2000`; RoC weights change its
+errors by 0.003 at most.
+
+So each of the other penalties wins only where its structure is the
+truth or the sample is tiny: the covariate-part group LASSO when V should
+stay constant (and it answers "does x move V at all?" directly), the
+adaptive LASSO on time (0.6 of the hierarchical penalty's at `d = 8`) and
+on spectral's V̂ at `n = 2000` (with more false selections), the RoC weights
+at `n = 200`. The hierarchical penalty contains their structures (its tree
+has the covariate and covariate-part groups and the single coefficients),
+and with RoC weights it is the default, `"auto"`: Python
+`fit_regularized()`, the CLI's `penalize`, Rust `PenalizedEsag::auto()`
+(chosen when fitted; `recommended(has_covariates)` for a known design).
+Without covariates `"auto"` is the eigen-gap penalty with RoC weights
+(the i.i.d. comparison above: the same errors as the adaptive ones).
+`.adaptive(1.0)` (Python `adaptive=True`) gives the adaptive weights.
+
+**The RoC fixed point in one solve.** The solve resets the exponent to the
+iterate's `r(θ)` before every proximal Newton step, so each step is a
+descent step for the current weights and a converged solve has
+`r = r(θ)`; the outer rounds (solve with `r` frozen, update, repeat until
+`r` settles to `10⁻⁸`) remain only for a solve that stops with `r` still
+moving. RoC paths now cost 1–11% more than adaptive ones on one core (the
+hierarchical penalty at `d = 5`, `n = 500` and 2000, and `d = 8`,
+`n = 2000`; 12–62% with a full solve per round), with the same solutions
+except at `n = 200` on γ-rot (above).
+
+Some spectral hierarchical paths are slow for another reason: where the
+smooth part has negative curvature the model Hessian's floored eigenvalues
+reach 10⁻⁷ of the largest, and the block coordinate descent on that model
+needs its 1000-sweep cap (one `d = 5`, `n = 500` path takes 1.45 s against
+0.2–0.27 s for its neighbours, one `d = 8` path 4.7 s against 1.7 s; γ-rot
+and log-tangent paths are not affected). A lower cap only moves the work to
+the Newton iterations (292 → 1449), and keeping the best of the block's
+FISTA iterates (monotone block updates) did not help; a Newton step on the
+active set of the tree would.
 
 **Selection.** BIC (default) or AIC at the *relaxed* refit, the
 unpenalized maximum over the selected model, with the model dimension as

@@ -430,3 +430,8 @@ def test_auto_penalty():
         iid = esag.ESAG(Y, shape=shape).fit_regularized("auto")
         assert "eigen-gap" in str(iid.summary())
         assert list(iid.params.columns)[4:] == [f"s[{k}]" for k in range(1, 6)]
+    # "auto" is the default
+    default = esag.ESAG(Y, X).fit_regularized()
+    assert "hierarchical" in default.method
+    assert np.allclose(default.params, esag.ESAG(Y, X).fit_regularized("auto").params)
+    assert "eigen-gap" in esag.ESAG(Y).fit_regularized().method

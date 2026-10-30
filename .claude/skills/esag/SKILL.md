@@ -98,15 +98,15 @@ esag.Distribution(mu=[...], gamma=[...]).sample(1000, seed=1)   # .logpdf, .cova
 esag.PENALTIES, esag.TARGETS, esag.GROUPINGS, esag.NULLS
 ```
 
-`fit_regularized` arguments: `penalty` in `auto` (recommended:
-`hierarchical` with covariates, adaptive `eigen_gap` on log-tangent
-coordinates without) `| lasso | adaptive_lasso | roc_lasso | group_lasso |
+`fit_regularized` arguments: `penalty` in `auto` (the default;
+recommended: `hierarchical` with covariates, `eigen_gap` on log-tangent
+coordinates without, RoC weights; `adaptive=True` for adaptive ones) `| lasso | adaptive_lasso | roc_lasso | group_lasso |
 adaptive_group_lasso | roc_group_lasso | hierarchical | roc_hierarchical |
 sparse_group_lasso (l1_ratio) | isotropy | eigen_gap` (i.i.d.,
 log-tangent); `hierarchical` nests per covariate its column, its mean and
 shape slopes, the shape's eigen parts and each coefficient (Rust
-`PenalizedEsag::hierarchical()`, `PenalizedEsag::recommended(has_covariates)`;
-CLI `--penalty hierarchical`); `target` in `slopes | mean |
+`PenalizedEsag::hierarchical()`; `PenalizedEsag::auto()` chooses from the
+data when fitted, the default of Python and of the CLI's `--penalty`); `target` in `slopes | mean |
 shape_slopes | shape`; `groups` in `covariate | covariate_part | parameter |
 all | gamma` (the gamma family's groups, for gamma-rot each (kappa_j,
 omega_j)) `| eigen_parts` (gamma-rot: each kappa_j alone and each omega_j as
@@ -120,6 +120,15 @@ fixed-point`); `select` in `bic | aic
 `paper="LASSO|aLASSO|RoC-LASSO|GLASSO|aGLASSO|RoC-GLASSO"` reproduces the
 Project 3 R scripts (i.i.d., gamma). `python/README.md` has the details and
 `python examples/demo.py [d]` a full session.
+
+Which penalty: keep the default `auto` unless the question is narrower.
+`groups="covariate_part"` group LASSO for "does x move V at all?" (as good
+as `auto` at about 2–3 observations per coefficient, where V should stay
+constant; drops drivers that move only part of V); `adaptive_lasso` when
+time matters most (about 0.6 of `auto`'s at d = 8, more false drivers);
+`hierarchical` (`adaptive=True`) for adaptive instead of RoC weights (the
+same selections from moderate n on); `eigen_gap` (i.i.d. ties); `paper=`
+to reproduce Project 3.
 
 ## 4. Rust API
 

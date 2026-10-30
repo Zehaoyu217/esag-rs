@@ -283,7 +283,7 @@ class ESAG:
 
     def fit_regularized(
         self,
-        penalty: str = "adaptive_lasso",
+        penalty: str = "auto",
         *,
         target: Optional[str] = None,
         groups: Union[None, str, Sequence[Sequence[tuple]]] = None,
@@ -301,11 +301,13 @@ class ESAG:
         Parameters
         ----------
         penalty : str
-            One of :data:`PENALTIES`:
+            One of :data:`PENALTIES` (default ``"auto"``):
 
             * ``"auto"``: the recommended penalty: with covariates the
-              hierarchical adaptive group LASSO over every slope, without
-              them the adaptive eigen-gap penalty (log-tangent coordinates);
+              hierarchical group LASSO over every slope, without them the
+              eigen-gap penalty (log-tangent coordinates), both with RoC
+              weights (``adaptive=True`` for the adaptive ones, which they
+              approach as n grows);
             * ``"lasso"`` / ``"adaptive_lasso"`` / ``"roc_lasso"``: L1 on
               each coefficient (plain, adaptive, RoC weights);
             * ``"group_lasso"`` / ``"adaptive_group_lasso"`` /

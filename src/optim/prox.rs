@@ -710,8 +710,10 @@ pub fn prox_newton_warm<A: PenaltyAtoms>(
             ..
         }
         | Exponent::RoCMean { .. } => {
-            let mut r = pen.r(theta0);
-            let mut res = prox_newton_r(f, pen, theta0, cfg, Some(r), hess0);
+            // the solve updates r to the iterate's before every step, so a
+            // converged solve is the fixed point; the rounds below only
+            // finish one that stopped with r still moving
+            let mut res = prox_newton_r(f, pen, theta0, cfg, Some(pen.r(theta0)), hess0, true);
             let mut total = res.n_iter;
             // Stop once r settles to what the solves resolve, or when a
             // solve fails: re-solving a stuck point with a slightly moved r
@@ -719,22 +721,25 @@ pub fn prox_newton_warm<A: PenaltyAtoms>(
             // at KKT ~10² before this check).
             for _ in 0..cfg.max_roc_iter {
                 let r_new = pen.r(&res.theta);
-                if (r_new - r).abs() <= ROC_SETTLED * r.max(1.0) || !res.converged {
+                if (r_new - res.r).abs() <= ROC_SETTLED * res.r.max(1.0) || !res.converged {
                     break;
                 }
-                r = r_new;
                 let h = res.hessian.clone();
-                res = prox_newton_r(f, pen, &res.theta.clone(), cfg, Some(r), Some(&h));
+                res = prox_newton_r(f, pen, &res.theta.clone(), cfg, Some(r_new), Some(&h), true);
                 total += res.n_iter;
             }
             res.n_iter = total;
             res
         }
-        _ => prox_newton_r(f, pen, theta0, cfg, None, hess0),
+        _ => prox_newton_r(f, pen, theta0, cfg, None, hess0, false),
     }
 }
 
-/// One proximal-Newton solve; `r_fixed` freezes the exponent.
+/// One proximal-Newton solve; `r_fixed` freezes the exponent (`None`: `r(θ)`
+/// inside the objective, the paper's joint formulation). With `track_r` the
+/// frozen exponent is reset to the iterate's `r(θ)` before every step (the
+/// RoC fixed point: each step is a descent step for the current weights, and
+/// a converged solve satisfies `r = r(θ)`).
 fn prox_newton_r<A: PenaltyAtoms>(
     f: &dyn SmoothObjective,
     pen: &Penalty<A>,
@@ -742,14 +747,16 @@ fn prox_newton_r<A: PenaltyAtoms>(
     cfg: &ProxConfig,
     r_fixed: Option<f64>,
     hess0: Option<&[f64]>,
+    track_r: bool,
 ) -> ProxResult {
     let n = theta0.len();
-    let r_at = |th: &[f64]| r_fixed.unwrap_or_else(|| pen.r(th));
-    let value = |th: &[f64]| pen.value_at_r(th, r_at(th));
+    let r_at = |th: &[f64], rc: Option<f64>| rc.unwrap_or_else(|| pen.r(th));
+    let value = |th: &[f64], rc: Option<f64>| pen.value_at_r(th, r_at(th, rc));
+    let mut r_cur = r_fixed;
     let mut theta = theta0.to_vec();
     // infinite-weight atoms start at their constraint
     {
-        let w = pen.weights_at_r(r_at(&theta));
+        let w = pen.weights_at_r(r_at(&theta, r_cur));
         if w.iter().any(|v| v.is_infinite()) {
             let t: Vec<f64> = w
                 .iter()
@@ -767,7 +774,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
         }
         _ => (f.value_grad_hess(&theta, &mut grad, &mut hess), 0usize),
     };
-    let mut obj = fs + value(&theta);
+    let mut obj = fs + value(&theta, r_cur);
     let blocks = pen.atoms.blocks().is_some();
     // positive-definite model Hessian, its largest eigenvalue and whether the
     // curvature floor was applied; recomputed with the Hessian or when the
@@ -789,7 +796,14 @@ fn prox_newton_r<A: PenaltyAtoms>(
         gh
     };
     while obj.is_finite() {
-        let w = pen.weights_at_r(r_at(&theta));
+        if track_r && r_cur.is_some() {
+            let r_new = pen.r(&theta);
+            if r_cur != Some(r_new) {
+                r_cur = Some(r_new);
+                obj = fs + value(&theta, r_cur);
+            }
+        }
+        let w = pen.weights_at_r(r_at(&theta, r_cur));
         let gh = smooth_grad(&theta, &grad);
         kkt = gradient_mapping(&theta, &gh, pen, &w);
         if kkt <= cfg.tol {
@@ -848,7 +862,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
                 }
             }
             let fc = f.value_grad(&cand, &mut gc);
-            let oc = fc + value(&cand);
+            let oc = fc + value(&cand, r_cur);
             if oc.is_finite() && oc <= obj + cfg.sigma * t * dd {
                 accepted = true;
                 f_cand = fc;
@@ -873,7 +887,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
             model_h = None;
             continue;
         }
-        let new_obj = f_cand + value(&cand);
+        let new_obj = f_cand + value(&cand, r_cur);
         // the model's predicted decrease against the actual one: on a floored
         // model a decrease far above the prediction means the floor is too
         // high along the step (the smooth part has negative curvature there),
@@ -937,7 +951,7 @@ fn prox_newton_r<A: PenaltyAtoms>(
                 grad.copy_from_slice(&gc);
                 obj = new_obj;
                 let gh = smooth_grad(&theta, &grad);
-                kkt = gradient_mapping(&theta, &gh, pen, &pen.weights_at_r(r_at(&theta)));
+                kkt = gradient_mapping(&theta, &gh, pen, &pen.weights_at_r(r_at(&theta, r_cur)));
                 converged = kkt <= cfg.tol.sqrt();
                 break;
             }
@@ -957,11 +971,11 @@ fn prox_newton_r<A: PenaltyAtoms>(
             since_hessian = 0;
             model_h = None;
         }
-        obj = fs + value(&theta);
+        obj = fs + value(&theta, r_cur);
     }
     let _ = floor;
     ProxResult {
-        r: r_at(&theta),
+        r: r_at(&theta, r_cur),
         theta,
         objective: obj,
         smooth: fs,

@@ -607,3 +607,67 @@ fn hierarchical_selects_covariate_components() {
         assert!(path.config.method_name().contains("hierarchical"));
     }
 }
+
+/// `PenalizedEsag::auto()` (the default of the Python and command-line front
+/// ends) is the hierarchical penalty with covariates and the eigen-gap
+/// penalty in log-tangent coordinates without, with RoC weights and the
+/// builder's other settings; through `EsagModel` it does so under any model
+/// shape.
+#[test]
+fn auto_penalty_resolves_from_the_data() {
+    use esag::model::EsagModel;
+    use esag::penalized::Penalty;
+    // i.i.d.: the eigen-gap path, also under a γ-rot model
+    let y = tied_iid(150, 1);
+    let x0 = DMatrix::<f64>::zeros(150, 0);
+    let gap = PenalizedEsag::eigen_gap()
+        .roc(RocMode::FixedPoint)
+        .with_parallel(false)
+        .fit(&x0, &y)
+        .unwrap();
+    let auto = PenalizedEsag::auto()
+        .with_parallel(false)
+        .fit(&x0, &y)
+        .unwrap();
+    assert_eq!(auto.config.penalty, Penalty::EigenGap);
+    assert_eq!(auto.best().active, gap.best().active);
+    assert_eq!(auto.best().coef, gap.best().coef);
+    let via_model = EsagModel::iid(&y)
+        .shape(Shape::GammaRot)
+        .fit_regularized(PenalizedEsag::auto().with_parallel(false))
+        .unwrap();
+    assert_eq!(via_model.config.shape, Shape::LogTangent);
+    assert_eq!(via_model.best().active, gap.best().active);
+    // with covariates: the hierarchical path, with the builder's weights and
+    // selection rule
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3);
+    let (n, d) = (400usize, 3usize);
+    let x = DMatrix::from_fn(n, 2, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let mu = [2.0 + 0.5 * x[(i, 0)], -1.0, 1.5];
+        let dist = Esag::new(&mu, &[0.4, -0.2]).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    for (a, h) in [
+        (
+            PenalizedEsag::auto(),
+            PenalizedEsag::hierarchical().roc(RocMode::FixedPoint),
+        ),
+        (
+            PenalizedEsag::auto().adaptive(1.0).aic(),
+            PenalizedEsag::hierarchical().aic(),
+        ),
+    ] {
+        let pa = a.with_parallel(false).fit(&x, &y).unwrap();
+        let ph = h.with_parallel(false).fit(&x, &y).unwrap();
+        assert_eq!(pa.config.penalty, Penalty::Hierarchical);
+        assert_eq!(pa.config.method_name(), ph.config.method_name());
+        assert_eq!(pa.best().coef, ph.best().coef);
+    }
+    assert!(PenalizedEsag::auto().method_name().starts_with("auto"));
+}
