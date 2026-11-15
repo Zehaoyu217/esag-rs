@@ -811,6 +811,8 @@ tests/                          R parity, paper reproduction, API, inference
 reference/r/                    the original R sources
 reference/checks/, project3/    R scripts behind the findings above
 docs/MATH.md                    the mathematics, with references
+docs/TIME_SERIES_AND_COMPOSITIONS.md  forecasting directions of time series and compositions
+                                  (python/examples/ts_directions.py, compositional.py)
 docs/project3/                  Project 3: what the R code does, review and corrected design
 ```
 

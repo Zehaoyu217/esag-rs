@@ -1,0 +1,143 @@
+# python examples/ts_directions.py iso aniso sv unitroot   (10 replicates, n = 2000)
+
+Stationary VAR(1), isotropic noise (ESAG is the exact model), d = 5 (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  oracle                       0.566     0.0     -2.193   0.000   0.000    1.000  -0.000
+  esag x_{t-1}                 0.564     4.7     -2.237   0.045   0.013    0.994   0.004
+  esag x_{t-1}, auto           0.564     4.7     -2.215   0.023   0.013    0.994   0.004
+  esag u_{t-1}                 0.563     5.1     -2.349   0.156   0.105    0.521   0.005
+  PN-reg x_{t-1}               0.564     4.9     -2.202   0.009   0.013    0.994   0.003
+  VAR-OLS                      0.564     4.7     -2.200   0.007   0.013    0.995   0.002
+  esag i.i.d.                  0.002    89.7     -3.202   1.009   0.542    0.011   0.021
+  persistence u_{t-1}          0.085    81.6                                            
+  [82 s]
+
+Stationary VAR(1), anisotropic noise (ESAG approximates PN), d = 5 (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  oracle                       0.606     0.0     -1.181   0.000   0.000    1.000   0.005
+  esag x_{t-1}                 0.597    10.2     -1.562   0.381   0.021    0.988   0.004
+  esag x_{t-1}, auto           0.596    10.3     -1.569   0.388   0.021    0.989   0.004
+  esag u_{t-1}                 0.595    10.4     -1.701   0.520   0.107    0.605   0.014
+  PN-reg x_{t-1}               0.605     4.3     -1.190   0.009   0.011    0.996   0.007
+  VAR-OLS                      0.604     4.2     -1.188   0.007   0.010    0.997   0.007
+  esag i.i.d.                  0.006    89.6     -2.740   1.559   0.588    0.010   0.016
+  persistence u_{t-1}          0.126    78.7                                            
+  [39 s]
+
+VAR(1) with stochastic volatility (oracle knows s_t), d = 5 (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  oracle                       0.614     0.0     -1.127   0.000   0.000    1.000  -0.002
+  esag x_{t-1}                 0.545    24.6     -2.310   1.183   0.246    0.511  -0.135
+  esag x_{t-1}, auto           0.544    24.9     -2.302   1.175   0.247    0.512  -0.136
+  esag u_{t-1}                 0.601    11.1     -1.708   0.580   0.123    0.537   0.012
+  PN-reg x_{t-1}               0.601     9.5     -1.949   0.822   0.261    0.515  -0.205
+  VAR-OLS                      0.604     9.4     -2.109   0.982   0.226    0.529  -0.150
+  esag i.i.d.                 -0.004    90.4     -2.748   1.621   0.589   -0.004   0.027
+  persistence u_{t-1}          0.139    78.0                                            
+  esag x_{t-1}/sig_{t-1}       0.589    15.4     -1.813   0.686   0.152    0.617  -0.066
+  esag x_{t-1}/sig_{t-1}, auto   0.587    15.8     -1.818   0.691   0.153    0.618  -0.066
+  PN-reg x_{t-1}/sig_{t-1}     0.611     5.7     -1.508   0.381   0.150    0.618  -0.075
+  PN-reg u_{t-1}               0.612     4.8     -1.431   0.304   0.122    0.538   0.011
+  VAR-OLS standardized         0.611     5.7     -1.532   0.405   0.149    0.619  -0.074
+  [98 s]
+
+Integrated series: directions of the levels and of the changes, d = 5 -- levels (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  esag x_{t-1}, dx_{t-1}       1.000     0.0     20.361   0.689   0.000    0.814  -0.000
+  persistence                  1.000     0.1                                            
+  oracle                       1.000     0.0     21.050   0.000   0.000    1.000   0.000
+
+Integrated series: directions of the levels and of the changes, d = 5 -- changes (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  esag dx_{t-1}                0.462     5.8     -2.653   0.043   0.017    0.986   0.010
+  esag dx_{t-1}, auto          0.461     6.6     -2.624   0.014   0.018    0.985   0.009
+  PN-reg dx_{t-1}              0.462     6.0     -2.622   0.011   0.016    0.988   0.009
+  esag u_{t-1}                 0.461     7.3     -2.718   0.107   0.096    0.278   0.010
+  esag x_{t-1} (levels)        0.028    86.4     -3.694   1.083   0.272   -0.004   0.188
+  VAR-OLS on dx                0.462     5.7     -2.621   0.010   0.015    0.989   0.008
+  esag i.i.d. (drift)          0.109    76.9     -3.244   0.633   0.363   -0.019  -0.002
+  persistence                 -0.003    89.4                                            
+  oracle                       0.463     0.0     -2.611   0.000   0.000    1.000   0.008
+  [53 s]
+
+# R=4 python examples/ts_directions.py sparse10
+
+d = 10, only the lags of x1..x4 matter, n = 3000 (4 replicates, n = 3000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  oracle                       0.352     0.0     -2.467   0.000   0.000    1.000   0.007
+  esag x_{t-1}                 0.349    11.4     -2.883   0.416   0.017    0.987   0.016
+  esag x_{t-1}, auto           0.349    11.4     -2.883   0.416   0.017    0.988   0.016
+  PN-reg x_{t-1}               0.350    10.5     -2.487   0.020   0.015    0.990   0.015
+  VAR-OLS                      0.350    10.4     -2.486   0.019   0.015    0.991   0.014
+  esag i.i.d.                 -0.007    89.8     -3.160   0.693   0.336   -0.013   0.030
+  persistence u_{t-1}          0.042    83.5                                            
+    RoC-hierarchical group LASSO: mean kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10'], shape kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']; ESAG fit 0.8 s, penalized path 11.3 s, PN-reg 0.2 s
+    RoC-hierarchical group LASSO: mean kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10'], shape kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']; ESAG fit 0.8 s, penalized path 107.3 s, PN-reg 0.1 s
+    RoC-hierarchical group LASSO: mean kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10'], shape kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']; ESAG fit 1.0 s, penalized path 77.0 s, PN-reg 0.1 s
+    RoC-hierarchical group LASSO: mean kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10'], shape kept ['x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10']; ESAG fit 0.7 s, penalized path 91.3 s, PN-reg 0.1 s
+  [301 s]
+
+# python examples/compositional.py   (10 replicates, n = 2000)
+
+Composition levels: logistic normal vs sqrt-ESAG (D = 5) (10 replicates, n = 2000)
+  model                                     aitchison   hellinger°     logscore
+  oracle (logistic normal)                      0.563        6.522        8.780
+  logistic-normal VAR (OLS)                     0.564        6.528        8.772
+  sqrt-ESAG, ilr lag                            0.565        6.538        8.687
+  sqrt-ESAG, sqrt(p) lag                        0.566        6.558        8.667
+  persistence p_{t-1}                           0.884        9.558             
+  [4 s]
+
+Composition levels from counts of 40 (zeros): forecasts of the latent p_t (10 replicates, n = 2000)
+  model                                     aitchison   hellinger°     logscore
+  oracle (latent z_{t-1})                       0.563        6.522             
+  logistic-normal VAR (+0.5 counts)             0.657        7.351             
+  sqrt-ESAG on the counts (zeros kept)          0.728        7.571             
+  sqrt-ESAG, ilr(+0.5) lag                      0.728        7.581             
+  persistence (+0.5 counts)                     1.237       12.397             
+  zeros share in data                                                     0.073
+  (the last row's log-score column is the share of zero parts in the data)
+  [0 s]
+
+Direction of compositional change on S^3 (10 replicates, n = 2000)
+  model                          cos  angle°  log score     gap  |Δrho| corr rho   calib
+  oracle                       0.694     0.0     -1.096   0.000   0.000    1.000   0.001
+  esag z_{t-1}                 0.691     4.2     -1.353   0.257   0.020    0.993   0.018
+  esag z_{t-1}, auto           0.691     4.2     -1.359   0.263   0.020    0.993   0.018
+  esag v_{t-1}                 0.514    39.5     -2.183   1.087   0.190    0.294   0.042
+  PN-reg z_{t-1}               0.693     2.9     -1.103   0.007   0.011    0.997   0.004
+  VAR-OLS on z                 0.693     2.7     -1.102   0.006   0.010    0.997   0.003
+  esag i.i.d.                 -0.001    90.1     -2.492   1.396   0.673    0.005   0.022
+  persistence v_{t-1}         -0.299   116.6                                            
+  share of parts whose share change is forecast with the right sign:
+    oracle                     0.762
+    esag z_{t-1}               0.761
+    esag z_{t-1}, auto         0.761
+    esag v_{t-1}               0.677
+    PN-reg z_{t-1}             0.761
+    VAR-OLS on z               0.761
+    esag i.i.d.                0.498
+    persistence v_{t-1}        0.383
+  [19 s]
+
+Signed compositions of net flows (Gaussian VAR) (10 replicates, n = 2000)
+  model                                            L1  signs right    all signs
+  ESAG on f/|f|_2                               0.996        0.674        0.124
+  ESAG on signed sqrt                           1.128        0.676        0.126
+  PN-reg on f/|f|_2                             0.988        0.678        0.132
+  PN-reg on signed sqrt                         1.136        0.679        0.135
+  VAR-OLS on f                                  0.982        0.679        0.139
+  oracle (conditional mean)                     0.981        0.680        0.139
+  persistence w_{t-1}                           1.239        0.560        0.057
+  [5 s]
+
+Signed compositions of net flows (Poisson counts) (10 replicates, n = 2000)
+  model                                            L1  signs right    all signs
+  ESAG on f/|f|_2                               1.649        0.468        0.015
+  ESAG on signed sqrt                           1.603        0.532        0.039
+  PN-reg on f/|f|_2                             1.077        0.569        0.056
+  PN-reg on signed sqrt                         1.173        0.568        0.057
+  VAR-OLS on f                                  1.063        0.571        0.059
+  oracle (true intensities at t)                0.500        0.761        0.250
+  persistence w_{t-1}                           1.262        0.478        0.028
+  [70 s]

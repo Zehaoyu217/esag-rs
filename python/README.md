@@ -198,7 +198,9 @@ dist.logpdf(y), dist.covariance, dist.second_moment, dist.mean_direction
 ## Tests and demo
 
 ```sh
-python -m pytest tests            # 25 tests, ~3 s
+python -m pytest tests            # 29 tests, ~3 s
 python examples/demo.py           # fit, five bootstrap tests, five penalties (d = 3)
 python examples/demo.py 5         # the same at d = 5
+python examples/ts_directions.py  # forecasting directions of time series (docs/TIME_SERIES_AND_COMPOSITIONS.md)
+python examples/compositional.py  # compositions: sqrt map, change directions, signed flows
 ```
