@@ -2190,6 +2190,7 @@ impl EsagRegressor {
             cov_params,
             column_names: feature_names,
             config,
+            response_scale: None,
         })
     }
 
@@ -4059,6 +4060,15 @@ pub struct EsagRegressorFit {
     pub column_names: Vec<String>,
     /// The estimator configuration used.
     pub config: EsagRegressor,
+    /// Part scales `s` of the responses this fit was made on, when it comes
+    /// from a standardized [`crate::model::EsagModel`]
+    /// ([`crate::model::EsagModel::response_scale`]), so that a saved fit
+    /// keeps them. The fit's own methods describe the standardized responses
+    /// `unit(y / s)`: [`EsagRegressorFit::standardize`] maps responses to
+    /// them and [`EsagRegressorFit::predict_original`] maps predicted
+    /// directions back to the original sphere.
+    #[serde(default)]
+    pub response_scale: Option<Vec<f64>>,
 }
 
 impl EsagRegressorFit {
@@ -4082,6 +4092,23 @@ impl EsagRegressorFit {
     pub fn slopes(&self) -> DMatrix<f64> {
         let start = usize::from(self.fit_intercept);
         self.coef.columns(start, self.n_features).into_owned()
+    }
+    /// The responses `y` in the fit's coordinates: `unit(y / s)` with
+    /// [`EsagRegressorFit::response_scale`], else `y` row-normalized.
+    pub fn standardize(&self, y: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        match &self.response_scale {
+            Some(s) => crate::model::standardize(y, s),
+            None => crate::model::standardize(y, &vec![1.0; y.ncols()]),
+        }
+    }
+    /// Predicted mean directions on the original sphere: `unit(s ⊙ μ̂)` with
+    /// [`EsagRegressorFit::response_scale`], else [`EsagRegressorFit::predict`].
+    pub fn predict_original(&self, x: &DMatrix<f64>) -> Result<DMatrix<f64>> {
+        let p = self.predict(x)?;
+        match &self.response_scale {
+            Some(s) => crate::model::destandardize(&p, s),
+            None => Ok(p),
+        }
     }
     /// Akaike information criterion.
     pub fn aic(&self) -> f64 {

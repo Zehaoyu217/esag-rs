@@ -106,6 +106,16 @@ fn unit_rows(y: &DMatrix<f64>) -> Result<DMatrix<f64>> {
     Ok(u)
 }
 
+/// `unit(y / s)` row by row (the standardized responses).
+pub(crate) fn standardize(y: &DMatrix<f64>, s: &[f64]) -> Result<DMatrix<f64>> {
+    rescale_rows(&unit_rows(y)?, s, true)
+}
+
+/// `unit(y ⊙ s)` row by row (standardized directions mapped back).
+pub(crate) fn destandardize(y: &DMatrix<f64>, s: &[f64]) -> Result<DMatrix<f64>> {
+    rescale_rows(y, s, false)
+}
+
 /// `unit(y / s)` (`divide`) or `unit(y ⊙ s)` row by row.
 fn rescale_rows(y: &DMatrix<f64>, s: &[f64], divide: bool) -> Result<DMatrix<f64>> {
     let mut v = y.clone();
@@ -316,7 +326,8 @@ impl EsagModel {
             let (_, res) = self.resolve_scale_fits()?;
             return res.ok_or_else(|| EsagError::Data("automatic response scale: no fit".into()));
         }
-        let fit = self.config.fit(&self.exog, &self.endog)?;
+        let mut fit = self.config.fit(&self.exog, &self.endog)?;
+        fit.response_scale = self.scale.clone();
         Ok(EsagResults {
             fit,
             model: self.clone(),
@@ -357,7 +368,13 @@ impl EsagModel {
         if let Some(r0) = &self.config.rot_basis {
             p = p.rot_basis(r0.clone());
         }
-        p.fit(&self.exog, &self.endog)
+        let mut path = p.fit(&self.exog, &self.endog)?;
+        // (the fits record the part scales, so that saved ones keep them)
+        path.initial.response_scale = self.scale.clone();
+        if let Some(r) = path.relaxed.as_mut() {
+            r.response_scale = self.scale.clone();
+        }
+        Ok(path)
     }
 }
 

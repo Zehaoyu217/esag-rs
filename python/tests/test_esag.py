@@ -484,3 +484,22 @@ def test_response_scale():
     reg = esag.ESAG(y, x, scale="auto").fit_regularized()
     assert reg.relaxed.scale is not None
     assert "standardized by part scales" in str(reg.summary())
+
+
+def test_compare_scales():
+    """Held-out comparison of scale choices: it recommends the scales where
+    the parts have very different scales and plain ESAG where they do not."""
+    y, x, _ = _unequal_scale_directions(n=900, seed=7)
+    out = esag.compare_scales(y, x, folds=3)
+    table = out["table"]
+    assert out["recommended"] == "tyler"
+    assert table.loc["tyler", "logscore"] > table.loc["none", "logscore"] + 0.3
+    assert table.loc["tyler", "cosine"] > table.loc["none", "cosine"]
+    rng = np.random.default_rng(2)
+    q, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+    z = np.zeros((901, 5))
+    for t in range(1, 901):
+        z[t] = 0.7 * q @ z[t - 1] + rng.standard_normal(5)
+    ye = z[1:] / np.linalg.norm(z[1:], axis=1, keepdims=True)
+    out = esag.compare_scales(ye, z[:-1], folds=3)
+    assert out["recommended"] is None

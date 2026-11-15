@@ -121,13 +121,7 @@ fixed-point`); `select` in `bic | aic
 Project 3 R scripts (i.i.d., gamma). `python/README.md` has the details and
 `python examples/demo.py [d]` a full session.
 
-Part scales: `esag.ESAG(Y, X, scale="auto")` (or `"tyler"`, or given scales)
-when the response coordinates have very different scales (net flows,
-returns of parts of different sizes): ESAG for `unit(Y/s)`, reported on the
-original sphere (`predict`, `mean_vector`, `covariance`, densities,
-`llf`/`bic`, `simulate`; `res.scale`); coefficients and tests are the
-standardized model's. Without it ESAG can turn its mean direction away from
-such data (forecast cosine near 0). Rust: `EsagModel::response_scale`.
+Part scales (`scale=`): see "Choosing the part scales" below.
 
 Which penalty: keep the default `auto` unless the question is narrower.
 `groups="covariate_part"` group LASSO for "does x move V at all?" (as good
@@ -137,6 +131,50 @@ time matters most (about 0.6 of `auto`'s at d = 8, more false drivers);
 `hierarchical` (`adaptive=True`) for adaptive instead of RoC weights (the
 same selections from moderate n on); `eigen_gap` (i.i.d. ties); `paper=`
 to reproduce Project 3.
+
+### Choosing the part scales
+
+`esag.ESAG(Y, X, scale=...)` fits ESAG to the standardized directions
+`unit(Y / s)`, which is the projected normal `PN(D mu, D V D)`, `D = diag(s)`,
+on the original sphere: it frees the variance along the mean direction that
+ESAG fixes at 1 (the geometric mean of the others). `predict`,
+`mean_vector`, `covariance`, `loglike_obs`, `llf`/`aic`/`bic` and `simulate`
+are on the original sphere and `res.scale` holds `s`; coefficients, tests and
+summaries describe the standardized model.
+
+What to choose, from `python examples/scale_choice.py` (7 designs at n = 300
+and 2000, 10 replicates each; regret = shortfall in held-out log score per
+observation against the best option of the design):
+
+| situation | choose | measured |
+|---|---|---|
+| default, unsure | `scale="auto"` | lowest mean regret (0.040, against 0.052 for `"tyler"` and 0.157 for `None`); took the scales in 10/10 replicates where parts differ (unequal parts, net flows, returns) and kept plain ESAG on equal parts (n = 2000: 10/10) and on concentrated directions (10/10) |
+| parts of very different scales: net flows, returns of assets with different volatilities, counts of parts of different sizes | `"auto"` (or `"tyler"`) | `None` loses up to 0.9 nats per observation, and its direction forecasts become useless (cosine 0.17–0.19 against 0.52–0.53 with scales on unequal parts, 0.02 against 0.32 on flows at n = 2000) |
+| directions concentrated around a clear mean: most regressions, square-root compositions | `None` or `"auto"`, never `"tyler"` blindly | Tyler's zero-centred scales distort concentrated data (−0.08 to −0.10 nats on the concentrated regression); `"auto"` declined them in 20/20 |
+| raw vectors available (flows, returns) | `"tyler"`; fixed `scale=raw.std(0)` only to keep the same coordinates across datasets | Tyler from the directions alone matches the raw standard deviations (mean regret 0.052 against 0.049; on flows 3.98, 1.49, 0.88, 0.61, 0.32 against 3.96, 1.49, 0.88, 0.60, 0.32) |
+| small samples (n = 300 with 84 coefficients) when the density matters: log scores, prediction regions, likelihood tests | check with `esag.compare_scales` | `"auto"`'s in-sample BIC took scales that lost 0.15–0.23 nats out of sample on returns and flows (their direction forecasts were still better: cosine 0.06 against 0.03, 0.26 against 0.02) |
+| only the direction forecast matters: point forecasts, signs | `"auto"` (or `"tyler"`) | never more than 0.03 below the best cosine; `None` up to 0.35 below |
+
+Check on your own data (held-out, contiguous blocks, so time series keep
+their order; the scales are estimated inside each training block):
+
+```python
+out = esag.compare_scales(Y, X, options=(None, "tyler"), folds=5)
+out["table"]        # per option: held-out log score and its se, held-out cosine, BIC, scales
+out["recommended"]  # best held-out log score; an earlier (simpler) option within one se wins
+```
+
+About 2 s at d = 5, n = 1500. Symptoms that call for scales: forecast
+directions uncorrelated with the data (mean cosine near 0) while least
+squares of the directions on `[1, x]` does clearly better; or Tyler scales
+(`esag.ESAG(Y, X, scale="tyler").fit().scale`) far from 1 (they spanned a
+factor of 6–20 in the designs where scales helped, 1.06 on equal parts).
+Rust: `EsagModel::new(&y, &x).response_scale(ResponseScale::Auto)?`
+(`Fixed(s)`, `Tyler`; `esag::model::tyler_scales`), then
+`EsagResults::{predict, mean_vector, predict_covariance,
+log_likelihood_rows, log_likelihood_original, bic_original,
+sample_responses, scale}`. CLI: `--scale auto|tyler|none` or
+`--scale-values ...` on `fit` and `penalize` (section 5).
 
 ## 4. Rust API
 
@@ -188,10 +226,18 @@ $B test model.json sim.csv --y y1,y2,y3 --x x1 --null shape --feature 0 --boot 5
 $B region model.json sim.csv --y y1,y2,y3 --x x1 --at 0.5
 $B penalize sim.csv --y y1,y2,y3 --x x1 --penalty adaptive-group-lasso --target shape-slopes \
    --groups gamma --shape gamma-rot --select bic [--r 1] [--folds 10] [--paper RoC-LASSO] [--paper-grid]
+# part scales ("Choosing the part scales" above): on fit and penalize
+$B fit flows.csv --y y1,y2,y3,y4,y5 --x x1,x2,x3,x4,x5 --shape gamma-rot --scale auto --model m.json
+$B fit flows.csv --y y1,y2,y3,y4,y5 --x x1,x2,x3,x4,x5 --shape gamma-rot --scale-values 4,1.5,0.9,0.6,0.3
+$B penalize flows.csv --y y1,y2,y3,y4,y5 --x x1,x2,x3,x4,x5 --shape gamma-rot --scale auto
 ```
 
 CLI defaults: `fit --shape gamma`, `penalize --shape log-tangent`; pass
-the shape explicitly for the eigen charts.
+the shape explicitly for the eigen charts. `--scale` defaults to `none`. A
+model saved with part scales keeps them: `predict` maps its mean
+directions to the original sphere (`mu_norm` and `lambda` describe the
+standardized model), and `gof`, `test`, `region` standardize their data
+with them.
 
 ## 6. Reading a fit and avoiding the known pitfalls
 
@@ -219,6 +265,14 @@ the shape explicitly for the eigen charts.
   across fits.
 - Bootstrap procedures are reproducible for a given seed regardless of the
   thread count; `RAYON_NUM_THREADS=1` gives one-core timings.
+- Forecast directions uncorrelated with the data (cosine near 0) on net
+  flows or returns: the parts have very different scales; use
+  `scale="auto"` ("Choosing the part scales").
+- Mean-zero directional series (VAR-type): penalized ESAG paths cannot
+  select (the intercept-only model has a mean near zero); the
+  constant-covariance projected normal (`python/examples/_pn.py`,
+  `PNRegression`) is the exact model there
+  (`docs/TIME_SERIES_AND_COMPOSITIONS.md`).
 
 ## 7. Examples, benchmarks and diagnostic studies
 
@@ -232,6 +286,11 @@ the shape explicitly for the eigen charts.
   file times any version on the same data (copy it into an older checkout to compare).
 - `cargo run --release --example v_recovery`, `big_fit`, `perf_suite [--quick]`, `bench_vs_r`,
   `project3_paper`, `p3_corrected`.
+- Python studies (`cd python`): `python examples/scale_choice.py [design ...]` (which `scale`
+  is reliable; env `R`, `NS`), `python examples/ts_directions.py` (directions of time series:
+  levels vs differences, volatility, d = 10), `python examples/compositional.py` (square-root
+  compositions, change directions, signed flows); results in
+  `docs/TIME_SERIES_AND_COMPOSITIONS.md`.
 - Ignored studies in `src/regression/fit_profile.rs` (run with
   `cargo test --release --lib <name> -- --ignored --nocapture`, env in each doc comment):
   `gamma_rot_prod` (production comparison of gamma-rot, spectral, log-tangent, full and penalized;

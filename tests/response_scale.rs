@@ -26,11 +26,15 @@ fn mean_cosine(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
 /// coordinates of very different scales, `f_t = D z_t`: directions
 /// `unit(f_t)` on lags `f_{t−1}`.
 fn unequal_scales(n: usize, seed: u64) -> (DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+    var_directions(n, seed, &[8.0, 3.0, 1.5, 0.8, 0.4])
+}
+
+fn var_directions(n: usize, seed: u64, scales: &[f64]) -> (DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
     let d = 5;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let g = DMatrix::from_fn(d, d, |_, _| StandardNormal.sample(&mut rng));
     let a = g.qr().q() * 0.7;
-    let scales = vec![8.0, 3.0, 1.5, 0.8, 0.4];
+    let scales = scales.to_vec();
     let mut z = vec![0.0; d];
     let mut f = DMatrix::zeros(n + 1, d);
     for t in 0..=n + 200 {
@@ -213,4 +217,135 @@ fn part_scales_fix_unequal_scale_directions() {
         cos > 0.98,
         "simulated mean direction vs prediction: cosine {cos}"
     );
+}
+
+/// `ResponseScale::Auto` keeps plain ESAG where the scales do not help
+/// (`python/examples/scale_choice.py`: equal part scales, and directions
+/// concentrated around a mean, where Tyler's zero-centred scales distort):
+/// the guide's claim that `Auto` is the safe default.
+#[test]
+fn auto_keeps_plain_esag_where_scales_do_not_help() {
+    // equal part scales
+    let (y, x, _) = var_directions(2000, 21, &[1.0; 5]);
+    let auto = EsagModel::new(&y, &x)
+        .shape(Shape::GammaRot)
+        .response_scale(ResponseScale::Auto)
+        .unwrap()
+        .fit()
+        .unwrap();
+    assert!(
+        auto.scale().is_none(),
+        "equal scales: Auto chose {:?}",
+        auto.scale()
+    );
+    // concentrated directions: ESAG regression with |mu_0| = 2.5
+    let mut rng = ChaCha8Rng::seed_from_u64(23);
+    let (n, d) = (2000usize, 5usize);
+    let x = DMatrix::from_fn(n, 3, |_, _| StandardNormal.sample(&mut rng));
+    let mut y = DMatrix::zeros(n, d);
+    let mut buf = vec![0.0; d];
+    for i in 0..n {
+        let mu: Vec<f64> = (0..d)
+            .map(|k| 2.5 / (d as f64).sqrt() + [0.5, -0.3, 0.2, 0.0, -0.4][k] * x[(i, 0)])
+            .collect();
+        let gamma: Vec<f64> = (0..9)
+            .map(|k| 0.4 * ((k as f64) * 0.9).sin() + 0.25 * x[(i, 1)] * ((k as f64) * 1.7).cos())
+            .collect();
+        let dist = esag::distribution::Esag::new(&mu, &gamma).unwrap();
+        dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+        for k in 0..d {
+            y[(i, k)] = buf[k];
+        }
+    }
+    let auto = EsagModel::new(&y, &x)
+        .shape(Shape::GammaRot)
+        .response_scale(ResponseScale::Auto)
+        .unwrap()
+        .fit()
+        .unwrap();
+    assert!(
+        auto.scale().is_none(),
+        "concentrated: Auto chose {:?}",
+        auto.scale()
+    );
+}
+
+/// The command line: `fit --scale tyler` saves the scales with the model, and
+/// `predict` from the saved model returns the library's directions on the
+/// original sphere.
+#[test]
+fn command_line_saves_and_applies_part_scales() {
+    let (y, x, _) = unequal_scales(600, 31);
+    let dir = std::env::temp_dir().join(format!("esag_scale_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("flows.csv");
+    let mut text = String::from("x1,x2,x3,x4,x5,y1,y2,y3,y4,y5\n");
+    for i in 0..y.nrows() {
+        let row: Vec<String> = (0..5)
+            .map(|k| format!("{}", x[(i, k)]))
+            .chain((0..5).map(|k| format!("{}", y[(i, k)])))
+            .collect();
+        text.push_str(&row.join(","));
+        text.push('\n');
+    }
+    std::fs::write(&data, text).unwrap();
+    let model = dir.join("m.json");
+    let bin = env!("CARGO_BIN_EXE_esag");
+    let fit = std::process::Command::new(bin)
+        .args(["fit", data.to_str().unwrap(), "--y", "y1,y2,y3,y4,y5"])
+        .args([
+            "--x",
+            "x1,x2,x3,x4,x5",
+            "--shape",
+            "gamma-rot",
+            "--scale",
+            "tyler",
+        ])
+        .args(["--model", model.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        fit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fit.stderr)
+    );
+    assert!(String::from_utf8_lossy(&fit.stdout).contains("standardized by part scales"));
+    let saved =
+        esag::regression::EsagRegressorFit::from_json(&std::fs::read_to_string(&model).unwrap())
+            .unwrap();
+    let lib = EsagModel::new(&y, &x)
+        .shape(Shape::GammaRot)
+        .response_scale(ResponseScale::Tyler)
+        .unwrap()
+        .fit()
+        .unwrap();
+    assert_eq!(saved.response_scale.as_deref(), lib.scale());
+    let pred = std::process::Command::new(bin)
+        .args(["predict", model.to_str().unwrap(), data.to_str().unwrap()])
+        .args(["--x", "x1,x2,x3,x4,x5"])
+        .output()
+        .unwrap();
+    assert!(
+        pred.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pred.stderr)
+    );
+    let want = lib.predict(&x).unwrap();
+    let out = String::from_utf8_lossy(&pred.stdout);
+    for (i, line) in out.lines().skip(1).take(20).enumerate() {
+        let v: Vec<f64> = line
+            .split(',')
+            .take(5)
+            .map(|t| t.parse().unwrap())
+            .collect();
+        for k in 0..5 {
+            assert!(
+                (v[k] - want[(i, k)]).abs() < 1e-8,
+                "row {i}: {} vs {}",
+                v[k],
+                want[(i, k)]
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

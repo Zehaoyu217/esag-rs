@@ -16,6 +16,7 @@ use esag::distribution::Esag;
 use esag::inference::{
     GofMethod, Restriction, bootstrap_gof, hypothesis_test, prediction_region, score_test,
 };
+use esag::model::{EsagModel, ResponseScale};
 use esag::optim::prox::RocMode;
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, Target};
 use esag::regression::{EsagRegressor, EsagRegressorFit, Shape};
@@ -77,6 +78,16 @@ enum NullKind {
     /// the shape coefficients of every feature are 0 (an anisotropic shape,
     /// the same at every x)
     ConstantShape,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScaleKind {
+    /// No part scales: plain ESAG of the directions.
+    None,
+    /// The diagonal Tyler estimate of the part scales from the directions.
+    Tyler,
+    /// With or without the Tyler scales, by BIC on the original sphere.
+    Auto,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -195,8 +206,18 @@ enum Cmd {
         /// Shape parameterization.
         #[arg(long, value_enum, default_value = "gamma")]
         shape: ShapeKind,
+        /// Part scales of the responses (docs/MATH.md §3, "Standardized
+        /// responses"): ESAG for unit(y / s), the projected normal
+        /// PN(D mu, D V D) on the original sphere; saved with the model.
+        #[arg(long, value_enum, default_value = "none")]
+        scale: ScaleKind,
+        /// Given part scales, comma-separated (instead of --scale).
+        #[arg(long, default_value = "")]
+        scale_values: String,
     },
-    /// Predict mean directions (and eigenvalues) for new covariates.
+    /// Predict mean directions (and eigenvalues) for new covariates. With a
+    /// model saved with part scales the mean directions are on the original
+    /// sphere and mu_norm, lambda describe the standardized model.
     Predict {
         model: PathBuf,
         data: PathBuf,
@@ -289,6 +310,13 @@ enum Cmd {
         folds: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Part scales of the responses (as for fit; auto decides by the
+        /// unpenalized fits' BIC on the original sphere).
+        #[arg(long, value_enum, default_value = "none")]
+        scale: ScaleKind,
+        /// Given part scales, comma-separated (instead of --scale).
+        #[arg(long, default_value = "")]
+        scale_values: String,
     },
     /// Prediction region thresholds at a covariate vector.
     Region {
@@ -361,6 +389,41 @@ fn load_model(path: &PathBuf) -> Res<EsagRegressorFit> {
     )?)?)
 }
 
+fn shape_of(k: ShapeKind) -> Shape {
+    match k {
+        ShapeKind::Gamma => Shape::Gamma,
+        ShapeKind::LogTangent => Shape::LogTangent,
+        ShapeKind::GammaTransported => Shape::GammaTransported,
+        ShapeKind::GammaRot => Shape::GammaRot,
+        ShapeKind::Spectral => Shape::Spectral,
+    }
+}
+
+/// The model with the part scales of `--scale` / `--scale-values`.
+fn with_scale(m: EsagModel, scale: ScaleKind, values: &str) -> Res<EsagModel> {
+    let given = split_cols(values);
+    if !given.is_empty() {
+        let s: Vec<f64> = given
+            .iter()
+            .map(|v| v.parse::<f64>())
+            .collect::<Result<_, _>>()?;
+        return Ok(m.response_scale(ResponseScale::Fixed(s))?);
+    }
+    Ok(match scale {
+        ScaleKind::None => m,
+        ScaleKind::Tyler => m.response_scale(ResponseScale::Tyler)?,
+        ScaleKind::Auto => m.response_scale(ResponseScale::Auto)?,
+    })
+}
+
+fn scale_note(s: &[f64]) -> String {
+    let list: Vec<String> = s.iter().map(|v| format!("{v:.4}")).collect();
+    format!(
+        "Responses standardized by part scales s = [{}]: the coefficients describe unit(y / s).",
+        list.join(", ")
+    )
+}
+
 fn main() {
     if let Err(e) = run() {
         if is_broken_pipe(e.as_ref()) {
@@ -407,25 +470,21 @@ fn run() -> Res<()> {
             model,
             restarts,
             shape,
+            scale,
+            scale_values,
         } => {
             let (xm, ym, names) = load_xy(&data, &y, &x)?;
             let t0 = Instant::now();
-            let fit = EsagRegressor::new()
-                .with_feature_names(names)
-                .with_response_names(split_cols(&y))
-                .with_restarts(restarts, 0)
-                .with_shape(match shape {
-                    ShapeKind::Gamma => Shape::Gamma,
-                    ShapeKind::LogTangent => Shape::LogTangent,
-                    ShapeKind::GammaTransported => Shape::GammaTransported,
-                    ShapeKind::GammaRot => Shape::GammaRot,
-                    ShapeKind::Spectral => Shape::Spectral,
-                })
-                .fit(&xm, &ym)?;
-            outln!("{}", fit.summary());
+            let m = EsagModel::new(&ym, &xm)
+                .with_config(EsagRegressor::new().with_restarts(restarts, 0))
+                .shape(shape_of(shape))
+                .exog_names(&names)
+                .endog_names(&split_cols(&y));
+            let res = with_scale(m, scale, &scale_values)?.fit()?;
+            outln!("{}", res.summary());
             outln!("fitted in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
             if let Some(p) = model {
-                std::fs::write(&p, fit.to_json()?)?;
+                std::fs::write(&p, res.fit.to_json()?)?;
                 outln!("model saved to {}", p.display());
             }
         }
@@ -443,7 +502,7 @@ fn run() -> Res<()> {
             } else {
                 read_cols(&data, &xc)?
             };
-            let dir = fit.predict(&xm)?;
+            let dir = fit.predict_original(&xm)?;
             let dists = fit.predict_distribution(&xm)?;
             let d = fit.d;
             let mut header: Vec<String> = (1..=d).map(|k| format!("mean_dir{k}")).collect();
@@ -473,6 +532,7 @@ fn run() -> Res<()> {
         } => {
             let fit = load_model(&model)?;
             let (xm, ym, _) = load_xy(&data, &y, &x)?;
+            let ym = fit.standardize(&ym)?;
             let method = if chisq {
                 GofMethod::OneSampleChiSquare
             } else {
@@ -504,6 +564,7 @@ fn run() -> Res<()> {
         } => {
             let fit = load_model(&model)?;
             let (xm, ym, _) = load_xy(&data, &y, &x)?;
+            let ym = fit.standardize(&ym)?;
             let restriction = match null {
                 NullKind::Isotropy => Restriction::Isotropy,
                 NullKind::Mu => Restriction::MuOfFeature(feature),
@@ -536,8 +597,18 @@ fn run() -> Res<()> {
             paper_grid,
             folds,
             seed,
+            scale,
+            scale_values,
         } => {
             let (xm, ym, names) = load_xy(&data, &y, &x)?;
+            // part scales: auto is decided by the unpenalized fits
+            let scaled = with_scale(
+                EsagModel::new(&ym, &xm).shape(shape_of(shape)),
+                scale,
+                &scale_values,
+            )?
+            .resolve_scale()?;
+            let ym = scaled.endog().clone();
             let mut est = match &paper {
                 Some(name) => PenalizedEsag::paper(name)?,
                 None => {
@@ -609,6 +680,9 @@ fn run() -> Res<()> {
             let path = est.fit(&xm, &ym)?;
             outln!("{}", path.path_summary());
             outln!("{}", path.summary());
+            if let Some(s) = scaled.scale() {
+                outln!("{}", scale_note(s));
+            }
             outln!(
                 "path of {} lambdas in {:.2} s",
                 path.points.len(),
@@ -627,17 +701,28 @@ fn run() -> Res<()> {
         } => {
             let fit = load_model(&model)?;
             let (xm, ym, _) = load_xy(&data, &y, &x)?;
+            let ym = fit.standardize(&ym)?;
             let x_new: Vec<f64> = split_cols(&at)
                 .iter()
                 .map(|v| v.parse::<f64>())
                 .collect::<Result<_, _>>()?;
             let levels = [0.95, 0.90, 0.85, 0.80, 0.75, 0.70];
             let pr = prediction_region(&fit, &xm, &ym, &x_new, mc, boot, &levels, seed)?;
-            outln!(
-                "mean direction at {x_new:?}: {:?}",
-                pr.dist.mean_direction()
-            );
-            outln!("region: {{y : (y - m)^T V^-1 (y - m) <= q}}");
+            let at_row = DMatrix::from_row_slice(1, x_new.len(), &x_new);
+            let md: Vec<f64> = fit
+                .predict_original(&at_row)?
+                .row(0)
+                .iter()
+                .copied()
+                .collect();
+            outln!("mean direction at {x_new:?}: {md:?}");
+            match &fit.response_scale {
+                Some(s) => {
+                    outln!("{}", scale_note(s));
+                    outln!("region: {{y : (u - m)^T V^-1 (u - m) <= q}}, u = unit(y / s)");
+                }
+                None => outln!("region: {{y : (y - m)^T V^-1 (y - m) <= q}}"),
+            }
             for (l, q) in levels.iter().zip(&pr.thresholds) {
                 outln!("  {:>3.0}%  q = {q:.4}", l * 100.0);
             }

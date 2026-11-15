@@ -149,6 +149,18 @@ those of the standardized model. On net count flows (parts of sizes 50 to 2)
 this took ESAG from 0.47 to 0.57 of the signs right, the same as least
 squares (`docs/TIME_SERIES_AND_COMPOSITIONS.md`).
 
+Which to choose (`python examples/scale_choice.py`: 7 designs, n = 300 and
+2000, 10 replicates): `scale="auto"` had the lowest regret in held-out log
+score (0.040 nats per observation against the best option of each design;
+`"tyler"` 0.052, `None` 0.157 with a worst case of 0.9); it took the scales
+wherever the parts differ and kept plain ESAG on equal parts and on
+concentrated directions, where `"tyler"` alone loses 0.08–0.10 nats. At
+small n its in-sample BIC can take scales that do not hold out of sample
+when the density matters (0.15–0.23 nats on returns and flows at n = 300),
+so check with `esag.compare_scales(Y, X)`: held-out log score and cosine per
+option over contiguous blocks, and a recommendation (the simpler option
+within one standard error).
+
 ### Shapes
 
 `shape="auto"` (default) is `"gamma-rot"`: Yu & Huang's γ groups made

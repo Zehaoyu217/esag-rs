@@ -833,6 +833,23 @@ replicates of the flow designs). Estimating the scales jointly with `B` by
 alternating maximization was tried and abandoned: from `D = I` it creeps
 out of the turned-away basin far too slowly.
 
+Which choice is reliable (`python/examples/scale_choice.py`, output in
+`docs/scale_choice_output.txt`: 7 designs × n = 300, 2000 × 10 replicates;
+regret = shortfall in held-out log score per observation against the best
+option of the design): `Auto` 0.040 on average (worst 0.234), `Tyler` 0.052
+(worst 0.234), the raw vectors' standard deviations 0.049 (worst 0.229),
+none 0.157 (worst 0.896, parts of very different scales). `Auto` took the
+scales in 10/10 replicates of the unequal-parts, flow and return designs and
+kept plain ESAG on equal parts at n = 2000 (10/10) and on concentrated
+directions (20/20), where `Tyler` alone loses 0.08–0.10 nats. Its weak spot
+is small samples of weakly predictable or count data (n = 300, 84
+coefficients): the in-sample BIC took scales that lost 0.15–0.23 nats out
+of sample, though their direction forecasts were still better; for the
+mean cosine every scaled option stayed within 0.03 of the best, none fell
+up to 0.35 below. `esag.compare_scales` decides on held-out blocks instead
+(tests: `auto_keeps_plain_esag_where_scales_do_not_help`,
+`test_compare_scales`).
+
 ## 4. Residuals and goodness of fit (`src/inference/gof.rs`)
 
 `r_i = (I − μ̂_iμ̂_iᵀ) y_i`, `Q_i = r_iᵀ V_i⁻¹ r_i`,

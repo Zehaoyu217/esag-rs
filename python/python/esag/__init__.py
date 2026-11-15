@@ -37,6 +37,7 @@ except ImportError:  # pragma: no cover
 
 __all__ = [
     "ESAG",
+    "compare_scales",
     "ESAGResults",
     "RegularizedResults",
     "TestResults",
@@ -823,3 +824,75 @@ class RegularizedResults(_CoefTable):
 
     def __repr__(self) -> str:
         return f"<esag.RegularizedResults: {self.method}, alpha={self.alpha:.4g}>"
+
+
+def compare_scales(endog, exog=None, options=(None, "tyler"), folds=5, shape="auto",
+                   **fit_kw):
+    """Held-out comparison of part-scale choices (``ESAG(..., scale=...)``).
+
+    The data are cut into ``folds`` contiguous blocks (time series keep their
+    order within a block); each option is fitted on all blocks but one and
+    scored on the held-out block: mean log-density on the original sphere
+    (scaled models include the Jacobian, so every option is scored on the
+    same measure) and mean cosine between the predicted and the realized
+    direction. ``"tyler"`` and ``"auto"`` estimate their scales from the
+    training blocks only. Given scales may be passed as an array in
+    ``options``. ``fit_kw`` go to ``ESAG.fit``.
+
+    Returns a dict: ``table``, a pandas DataFrame (a dict of lists without
+    pandas) with one row per option (held-out log score per observation and
+    its standard error over the folds, held-out cosine, in-sample BIC of the
+    fit to all the data), and ``recommended``: the option with the highest
+    held-out log score, unless an option listed earlier (``None`` first) is
+    within one standard error of it, which is then preferred (the simpler
+    model). Use it when the density matters and the sample is small: there
+    ``scale="auto"``'s in-sample BIC can accept scales that do not hold out
+    of sample (``python/examples/scale_choice.py``).
+    """
+    y = _as_2d(endog, "endog")
+    n = y.shape[0]
+    x = None if exog is None else _as_2d(exog, "exog")
+    edges = np.linspace(0, n, folds + 1).astype(int)
+
+    def label(o):
+        if o is None:
+            return "none"
+        if isinstance(o, str):
+            return o
+        return "given " + ",".join(f"{v:g}" for v in np.asarray(o, dtype=float).ravel())
+
+    rows = []
+    for opt in options:
+        lls, coss = [], []
+        for k in range(folds):
+            test = np.zeros(n, dtype=bool)
+            test[edges[k]:edges[k + 1]] = True
+            xtr = None if x is None else x[~test]
+            model = ESAG(y[~test], xtr, shape=shape, scale=opt)
+            res = model.fit(**fit_kw)
+            xte = np.zeros((test.sum(), 0)) if x is None else model._exog_new(x[test])
+            yte = y[test] / np.linalg.norm(y[test], axis=1, keepdims=True)
+            ll = np.asarray(res._native.loglike_obs(xte, yte))
+            pred = np.asarray(res._native.predict(xte))
+            lls.append(ll.mean())
+            coss.append((pred * yte).sum(1).mean())
+        full = ESAG(y, x, shape=shape, scale=opt).fit(**fit_kw)
+        rows.append({
+            "option": label(opt),
+            "logscore": float(np.mean(lls)),
+            "se": float(np.std(lls, ddof=1) / np.sqrt(folds)) if folds > 1 else float("nan"),
+            "cosine": float(np.mean(coss)),
+            "bic": float(full.bic),
+            "scale": None if full.scale is None else np.round(full.scale, 4).tolist(),
+        })
+    best = max(range(len(rows)), key=lambda i: rows[i]["logscore"])
+    pick = best
+    for i in range(best):
+        if rows[best]["logscore"] - rows[i]["logscore"] <= rows[best]["se"]:
+            pick = i
+            break
+    table = rows
+    if _pd is not None:
+        table = _pd.DataFrame(rows).set_index("option")
+    return {"table": table, "recommended": options[pick]}
+

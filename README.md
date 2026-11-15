@@ -222,14 +222,22 @@ $B fit sim.csv --y y1,y2,y3 --x x1 --shape log-tangent
 $B penalize sim.csv --y y1,y2,y3 --x x1 --penalty adaptive-group-lasso --groups covariate-part
 $B penalize sim.csv --y y1,y2,y3 --x x1 --penalty sparse-group-lasso --l1-ratio 0.3 --select cv
 $B penalize sim.csv --y y1,y2,y3 --paper RoC-LASSO                          # the paper's methods (i.i.d.)
+$B fit flows.csv --y y1,y2,y3 --x x1 --shape gamma-rot --scale auto --model m.json   # part scales (saved with the model)
+$B penalize flows.csv --y y1,y2,y3 --x x1 --shape gamma-rot --scale auto
 ```
+
+`--scale auto|tyler|none` (or `--scale-values 4,1,0.3`) standardizes the
+responses by part scales; a saved model keeps them, so `predict` returns
+directions on the original sphere and `gof`, `test`, `region` standardize
+their data. Which scale to choose is in `.claude/skills/esag/SKILL.md`
+("Choosing the part scales") and `docs/MATH.md` §3.
 
 ## API overview
 
 | item | role |
 |---|---|
 | `regression::EsagRegressor` | configuration and builder: `fit_intercept`, `max_iter`, `tol`, `init` (`Auto`, `DataDriven`, `RStyle`, `Custom`), `with_restarts`, `with_mask` (restricted fits), `with_hessian`, `with_feature_names`, `with_shape` (`Shape::Gamma` or `Shape::LogTangent`). `fit(x, y)` and `fit_warm(x, y, b0)`. |
-| `model::{EsagModel, EsagResults}` | statsmodels-style front end: `EsagModel::new(endog, exog)`, `fit()`, `fit_regularized(penalty)`; results deref to the fit and add `test`, `gof`, `prediction_region`. |
+| `model::{EsagModel, EsagResults}` | statsmodels-style front end: `EsagModel::new(endog, exog)`, `response_scale(ResponseScale::{Auto, Tyler, Fixed})`, `fit()`, `fit_regularized(penalty)`; results deref to the fit and add `test`, `gof`, `prediction_region`, and on the original sphere `predict`, `mean_vector`, `predict_covariance`, `log_likelihood_rows`, `bic_original`, `sample_responses`. |
 | `regression::EsagRegressorFit` | fitted model: `params`, `bse`, `zvalues`, `pvalues`, `conf_int`, `llf`, `nobs`, `df_model`, `df_resid`, `coef`, `intercept()`, `slopes()`, `predict`, `predict_distribution`, `linear_predictor`, `score`, `log_likelihood_rows`, `residuals`, `std_errors`, `cov_params`, `summary`, `aic`, `bic`, `sample_responses`, `to_json` and `from_json`. |
 | `estimator::{EsagEstimator, EsagFit}` | i.i.d. fit (no covariates), same options. |
 | `estimator::{Fit, Predict, Score}` | scikit-learn-style traits, implemented by the estimators. |
