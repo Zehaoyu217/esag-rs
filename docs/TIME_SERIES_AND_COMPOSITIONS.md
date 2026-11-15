@@ -61,7 +61,7 @@ regression has 84).
 | stationary, mean 0 | `x_t/|x_t|` | `x_{t−1}` | `u_t ~ PN(A x_{t−1}, S)` |
 | stationary, mean `c ≠ 0` | `(x_t − ĉ)/|x_t − ĉ|` | `x_{t−1} − ĉ` | otherwise the direction is mostly that of `c` |
 | integrated (unit root) | `Δx_t/|Δx_t|` | `Δx_{t−1}` (error-correction terms if cointegrated) | the levels' direction tends to the drift's and moves by `O(1/√t)` |
-| volatility clustering | as above | `u_{t−1}` (or `x_{t−1}/σ̂_{t−1}`) | `|m_t|/s_t`, not `|m_t|`, sets the concentration |
+| volatility clustering | as above; with coordinate-specific volatilities, of the devolatilized vector | `u_{t−1}` (or `x_{t−1}/σ̂_{t−1}`) | a common `s_t` cancels from the direction and sets the concentration `|m_t|/s_t`; per-coordinate scales would also bend the direction |
 | composition levels | `√p_t` | ilr lags | Yu & Huang's map |
 | composition changes | `Δilr_t/|Δilr_t|` | ilr lags | Aitchison geometry; losing parts point the negative way |
 | signed compositions (net flows) | `f_t/|f_t|` | `f_{t−1}` | the whole sphere; Gaussian flows are exactly PN |
@@ -262,7 +262,88 @@ projected normal with a constant covariance has no frame to flip and matches
 least squares.
 
 
-## 5. Conclusions
+## 5. What others do
+
+A citation-checked survey (items matched on authors, year, title and venue in
+search results; † checked through abstracts or citing papers only;
+"preprint" = arXiv only).
+
+*Directional models.* von Mises–Fisher mixtures and losses (Banerjee,
+Dhillon, Ghosh & Sra 2005, JMLR 6) are the isotropic baseline; Kent /
+Fisher–Bingham (Kent 1982, JRSS-B 44; Kume & Wood 2005, Biometrika 92) need
+costly normalizing constants in high d, while ESAG's density is exact. The
+angular central Gaussian is the law of the direction of *any* zero-centred
+elliptical vector (Tyler 1987, Biometrika 74; Tyler's M-estimator, AoS 15),
+the basis of robust scatter estimation for financial returns (Frahm &
+Jaekel, Univ. Cologne DP 2/07); at `μ = 0` ESAG is the ACG, but its
+mean-anchored frame is undefined there (§1). The general projected normal
+regression — the model `_pn.PNRegression` fits by maximum likelihood — is
+Presnell, Morrison & Littell's projected linear model (1998, JASA 93, by
+EM) and Hernandez-Stumpfhauser, Breidt & van der Woerd's projected normal
+of arbitrary dimension (2017, Bayesian Analysis 12, by MCMC, one
+covariance entry fixed). Spherical regression: Paine, Preston, Tsagris &
+Wood 2018 and 2020 (Stat Comput 28, 30; Kent or ESAG errors), Rosenthal,
+Wu, Klassen & Srivastava 2014 (JASA 109; projective-linear mean link),
+Scealy & Wood 2019 (JASA 114; scaled vMF), and heavy-tailed alternatives
+(spherical Cauchy, Kato & McCullagh 2020, Bernoulli 26; regression with it,
+Tsagris, Papastamoulis & Kato 2025, Stat Comput 35).
+
+*Directional and sign time series.* Circular ARMA and Markov models (Fisher
+& Lee 1994, JRSS-B 56†; Kato 2010, JRSS-B 72; score-driven von Mises,
+Harvey, Hurn, Palumbo & Thiele 2024, J Econometrics 239); projected-normal
+dynamics on the circle (Wang & Gelfand 2014, JASA 109; Nuñez-Antonio &
+Gutiérrez-Peña 2014, CSDA 71); and in any dimension the projected dynamic
+linear model of Zito & Kowal (preprint 2308.14996: Gibbs sampling and a
+particle filter, applied to square-root electricity shares), the closest
+existing work to these experiments. Zhu & Müller (2024, J Econometrics 239)
+fit spherical autoregressions by rotations and chose the *differenced*
+version for square-root energy shares because the levels trended — the
+same conclusion as §3. Christoffersen & Diebold (2006, Management Science
+52): volatility dynamics make the *sign* of a return predictable only when
+its expected value is not zero — here, the concentration `|m_t|/s_t`.
+Spatial-sign methods for multivariate series test for white noise or build
+factor models (Hallin & Paindaveine 2002, Bernoulli 8; Fan, Liu & Wang 2018,
+AoS 46); location estimates bias high-dimensional sign tests (Feng, Zou &
+Wang 2016, JASA 111). The survey found no ESAG time-series or forecasting
+work, and no model of the direction of return vectors with vMF, ESAG or ACG.
+
+*Compositions.* Log-ratio analysis (Aitchison 1982, JRSS-B 44; ilr, Egozcue
+et al. 2003, Math Geol 35); the square-root map with Kent regression, which
+takes zeros as they are but is not Aitchison-coherent (Scealy & Welsh 2011,
+JRSS-B 73†; small concentration and folding, 2014, Stat Comput 24); ESAG
+truncated to the non-negative orthant with spatial effects (Schwob, Hooten,
+Calzada & Keitt, preprint 2410.03648), the direct extension of square-root
+ESAG; the α-transformation between the two (Tsagris, Preston & Wood,
+preprint 1106.1451; folded, Tsagris & Stewart 2020, ANZJS 62); score
+matching for compositions with zeros (Scealy & Wood 2023, JASA; Scealy,
+Hingee, Kent & Wood 2024, Stat Comput 34); sparse log-contrast regression
+(Lin, Shi, Feng & Li 2014, Biometrika 101). Compositional time series: alr
+VARMA (Brunsdon & Smith 1998, J Off Stat 14), VAR on ilr coordinates
+(Kynčlová, Filzmoser & Hron 2015, J Forecasting 34), Dirichlet ARMA (Zheng
+& Chen 2017, JMVA 158; Bayesian, Katz, Brusch & Weiss 2024, IJF 40),
+logistic-normal dynamic linear models for counts (Silverman et al. 2018,
+Microbiome 6; 2022, JMLR 23).
+
+*Signed compositions.* The accepted practice is to split, not to sign:
+negative quantities are differences of positive ones, analysed as
+sub-compositions of the positive parts plus the gross total (in and out
+flows, long and short weights; Coenders & Arimany-Serrat, preprint
+2305.16842). Compositional change is the perturbation `p_t ⊖ p_{t−1}`
+(Aitchison & Ng 2005, Stat Model 5), whose ilr difference is the change
+direction of §4. The survey found no use of the signed square root onto the
+whole sphere in statistics (it appears in computer vision: Perronnin,
+Sánchez & Mensink 2010, ECCV†; RootSIFT, Arandjelović & Zisserman 2012).
+It and the direction `f/|f|_2` are one-to-one maps of the same signed
+composition (`w = sign(s) s² = u/|u|_1`): both keep the signs and the
+shares, net share `Σw` included, and drop the gross size `|f|_1`; they
+differ only in geometry, and §4 found the direction's the better one.
+
+*Evaluation.* Beyond the log score, angular error and mean-resultant-length
+calibration used here: energy and kernel scores (Gneiting & Raftery 2007,
+JASA 102), coverage of predictive regions, and for signs hit rates with the
+Pesaran–Timmermann test (1992, JBES 10).
+
+## 6. Conclusions
 
 * **Direction forecasts work.** In the stationary, differenced and
   compositional designs ESAG regression's forecast direction is within
@@ -289,7 +370,11 @@ least squares.
   representation (losing parts negative); the signed square root is a valid
   extension of the square-root map but not a better one here.
 * **Next steps.** A native projected normal regression with a constant
-  covariance (with the package's penalties on the lag columns, bootstrap
-  tests and prediction regions) for VAR-type and signed data; a warning when
+  covariance (the projected linear model of Presnell et al. 1998 and
+  Hernandez-Stumpfhauser et al. 2017, here by maximum likelihood in 0.1–0.2 s
+  at d = 10), with the package's penalties on the lag columns, bootstrap
+  tests and prediction regions, for VAR-type and signed data; a warning when
   a penalized ESAG path starts from an intercept-only model with a mean
-  vector near zero; count observation layers for compositions with zeros.
+  vector near zero; count observation layers for compositions with zeros;
+  coordinate-wise devolatilization and real series (returns, energy shares)
+  against Zito & Kowal's dynamic model and Zhu & Müller's autoregression.
