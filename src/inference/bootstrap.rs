@@ -13,8 +13,7 @@ use crate::error::Result;
 use crate::regression::EsagRegressorFit;
 use crate::stats::quantile::quantiles_type7;
 use nalgebra::DMatrix;
-use rand::{RngExt, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::RngExt;
 use rayon::prelude::*;
 
 /// Bootstrap replicates of a fitted regression.
@@ -46,7 +45,7 @@ pub fn bootstrap_coef(
     let fits: Vec<Option<EsagRegressorFit>> = (0..n_boot)
         .into_par_iter()
         .map(|b| {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(b as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::COEF_BOOT, b as u64);
             let idx: Vec<usize> = (0..n).map(|_| rng.random_range(0..n)).collect();
             let xb = DMatrix::from_fn(n, x.ncols(), |i, j| x[(idx[i], j)]);
             let yb = DMatrix::from_fn(n, y.ncols(), |i, j| y[(idx[i], j)]);

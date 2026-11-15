@@ -29,6 +29,10 @@ pub trait Scalar:
     + Sync
     + 'static
 {
+    /// Highest derivative order this type carries: 0 for `f64`, 1 for
+    /// first-order duals, 2 (the default) for second-order types. Lets
+    /// kernels skip derivative work the type would discard.
+    const DERIV_ORDER: u8 = 2;
     /// Lift a constant (zero derivative).
     fn from_f64(v: f64) -> Self;
     /// The value (real part).
@@ -49,6 +53,10 @@ pub trait Scalar:
     /// `self.atan2(other)` = atan2(y = self, x = other), as in `f64::atan2`.
     fn atan2(self, other: Self) -> Self;
     fn powf(self, p: f64) -> Self;
+    /// Cube root (`f64::cbrt` for `f64`).
+    fn cbrt(self) -> Self {
+        self.powf(1.0 / 3.0)
+    }
     fn powi(self, n: i32) -> Self;
     fn abs(self) -> Self;
     /// Standard normal CDF Φ(x).
@@ -62,6 +70,7 @@ pub trait Scalar:
 }
 
 impl Scalar for f64 {
+    const DERIV_ORDER: u8 = 0;
     #[inline]
     fn from_f64(v: f64) -> Self {
         v
@@ -101,6 +110,10 @@ impl Scalar for f64 {
     #[inline]
     fn powf(self, p: f64) -> Self {
         f64::powf(self, p)
+    }
+    #[inline]
+    fn cbrt(self) -> Self {
+        f64::cbrt(self)
     }
     #[inline]
     fn powi(self, n: i32) -> Self {

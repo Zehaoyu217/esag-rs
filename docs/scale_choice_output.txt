@@ -1,0 +1,123 @@
+# python examples/scale_choice.py   (R = 10, NS = 300,2000)
+
+equal part scales (VAR, isotropic noise), n = 300 (10 replicates; auto chose the scales 1/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -2.594   0.037    0.062       0.220   0.573
+  tyler        -2.627   0.036    0.095       0.234   0.573
+  auto         -2.616   0.045    0.084       0.234   0.572
+  raw sd       -2.569   0.039    0.037       0.162   0.575
+  [1 s]
+
+part scales 8, 3, 1.5, 0.8, 0.4 (VAR), n = 300 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -0.045   0.033    0.712       0.877   0.174
+  tyler         0.660   0.024    0.007       0.038   0.517
+  auto          0.660   0.024    0.007       0.038   0.517
+  raw sd        0.658   0.023    0.008       0.024   0.515
+  [8 s]
+
+net Poisson flows, part sizes 50 ... 2, n = 300 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -1.057   0.026    0.017       0.113   0.016
+  tyler        -1.192   0.044    0.152       0.268   0.260
+  auto         -1.192   0.044    0.152       0.268   0.260
+  raw sd       -1.174   0.054    0.134       0.341   0.287
+  [20 s]
+
+returns: common SV, asset volatilities 3 ... 0.5, lagged direction, n = 300 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -2.398   0.019    0.000       0.000   0.027
+  tyler        -2.632   0.030    0.234       0.365   0.061
+  auto         -2.632   0.030    0.234       0.365   0.061
+  raw sd       -2.627   0.036    0.229       0.352   0.049
+  [14 s]
+
+VAR with anisotropic noise on random axes, n = 300 (10 replicates; auto chose the scales 6/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -1.875   0.042    0.067       0.135   0.589
+  tyler        -1.820   0.034    0.013       0.120   0.589
+  auto         -1.849   0.040    0.042       0.128   0.591
+  raw sd       -1.864   0.032    0.057       0.185   0.589
+  [1 s]
+
+concentrated regression (the hard scenario), n = 300 (10 replicates; auto chose the scales 0/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -1.473   0.031    0.004       0.041   0.750
+  tyler        -1.567   0.020    0.098       0.206   0.749
+  auto         -1.473   0.031    0.004       0.041   0.750
+  [0 s]
+
+square-root compositions with a rare part (3%), n = 300 (10 replicates; auto chose the scales 0/10)
+  option    log score    (se)   regret  max regret     cos
+  none          6.331   0.017    0.020       0.078   0.992
+  tyler         6.324   0.025    0.026       0.099   0.992
+  auto          6.331   0.017    0.020       0.078   0.992
+  [1 s]
+
+equal part scales (VAR, isotropic noise), n = 2000 (10 replicates; auto chose the scales 0/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -2.165   0.027    0.002       0.019   0.586
+  tyler        -2.175   0.029    0.011       0.024   0.586
+  auto         -2.165   0.027    0.002       0.019   0.586
+  raw sd       -2.177   0.029    0.013       0.024   0.586
+  [1 s]
+
+part scales 8, 3, 1.5, 0.8, 0.4 (VAR), n = 2000 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none          0.263   0.048    0.896       0.986   0.185
+  tyler         1.158   0.028    0.001       0.004   0.529
+  auto          1.158   0.028    0.001       0.004   0.529
+  raw sd        1.157   0.028    0.002       0.010   0.529
+  [11 s]
+
+net Poisson flows, part sizes 50 ... 2, n = 2000 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -0.814   0.025    0.262       0.301   0.026
+  tyler        -0.553   0.028    0.002       0.010   0.317
+  auto         -0.553   0.028    0.002       0.010   0.317
+  raw sd       -0.554   0.028    0.002       0.011   0.317
+  [20 s]
+
+returns: common SV, asset volatilities 3 ... 0.5, lagged direction, n = 2000 (10 replicates; auto chose the scales 10/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -2.074   0.015    0.074       0.107   0.052
+  tyler        -2.000   0.016    0.000       0.004   0.141
+  auto         -2.000   0.016    0.000       0.004   0.141
+  raw sd       -2.005   0.015    0.006       0.016   0.145
+  [2 s]
+
+VAR with anisotropic noise on random axes, n = 2000 (10 replicates; auto chose the scales 9/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -1.559   0.018    0.068       0.096   0.600
+  tyler        -1.497   0.018    0.006       0.027   0.597
+  auto         -1.501   0.019    0.009       0.038   0.597
+  raw sd       -1.493   0.018    0.001       0.006   0.599
+  [1 s]
+
+concentrated regression (the hard scenario), n = 2000 (10 replicates; auto chose the scales 0/10)
+  option    log score    (se)   regret  max regret     cos
+  none         -1.132   0.009    0.000       0.000   0.756
+  tyler        -1.212   0.008    0.079       0.109   0.755
+  auto         -1.132   0.009    0.000       0.000   0.756
+  [0 s]
+
+square-root compositions with a rare part (3%), n = 2000 (10 replicates; auto chose the scales 6/10)
+  option    log score    (se)   regret  max regret     cos
+  none          6.504   0.017    0.011       0.023   0.992
+  tyler         6.514   0.016    0.000       0.001   0.992
+  auto          6.507   0.017    0.007       0.023   0.992
+  [1 s]
+
+Regret in log score per observation against the best option of each design
+  option      mean               worst design (mean regret)
+  none       0.157                 unequal n=2000   0.896   (designs scored: 14)
+  tyler      0.052                  returns n=300   0.234   (designs scored: 14)
+  auto       0.040                  returns n=300   0.234   (designs scored: 14)
+  raw sd     0.049                  returns n=300   0.229   (designs scored: 10)
+
+Regret in mean cosine against the best option of each design
+  option      mean               worst design (mean regret)
+  none       0.100                 unequal n=2000   0.345   (designs scored: 14)
+  tyler      0.004                    flows n=300   0.032   (designs scored: 14)
+  auto       0.004                    flows n=300   0.032   (designs scored: 14)
+  raw sd     0.004                  returns n=300   0.019   (designs scored: 10)

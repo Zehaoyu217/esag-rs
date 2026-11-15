@@ -14,27 +14,20 @@
 //! requested covariate row.
 
 use super::refit_config;
-use crate::distribution::{Esag, region_statistic};
+use crate::distribution::Esag;
 use crate::error::{EsagError, Result};
 use crate::regression::EsagRegressorFit;
 use crate::stats::quantile::quantiles_type7;
 use nalgebra::DMatrix;
-use rand::{Rng, RngExt, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::{Rng, RngExt};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Sample `m` region statistics `q = (Y − μ̂)ᵀ V⁻¹ (Y − μ̂)` with `Y ~ dist`
 /// (R: `Confidence_Region`).
 pub fn confidence_region_sample<R: Rng + ?Sized>(dist: &Esag, m: usize, rng: &mut R) -> Vec<f64> {
-    let frame = dist.frame();
-    let mut buf = vec![0.0; dist.dim()];
-    (0..m)
-        .map(|_| {
-            dist.sample_one(&frame, rng, &mut buf);
-            region_statistic(&frame, &buf)
-        })
-        .collect()
+    let sampler = dist.sampler();
+    (0..m).map(|_| sampler.region_statistic_draw(rng)).collect()
 }
 
 /// A prediction region for one covariate vector.
@@ -62,7 +55,7 @@ impl PredictionRegion {
 }
 
 /// `n_boot` pairs-bootstrap refits of `fit`, warm-started at its estimate.
-/// Replicate `b` uses seed `seed + 1 + b`. Failed refits are skipped.
+/// Each replicate has its own random stream. Failed refits are skipped.
 pub fn bootstrap_refits(
     fit: &EsagRegressorFit,
     x: &DMatrix<f64>,
@@ -75,7 +68,7 @@ pub fn bootstrap_refits(
     (0..n_boot)
         .into_par_iter()
         .filter_map(|b| {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1 + b as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::REGION_BOOT, b as u64);
             let idx: Vec<usize> = (0..n).map(|_| rng.random_range(0..n)).collect();
             let xb = DMatrix::from_fn(n, x.ncols(), |i, j| x[(idx[i], j)]);
             let yb = DMatrix::from_fn(n, y.ncols(), |i, j| y[(idx[i], j)]);
@@ -116,8 +109,7 @@ pub fn prediction_regions(
         .into_par_iter()
         .enumerate()
         .map(|(i, dist)| {
-            let mut rng =
-                ChaCha8Rng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9).wrapping_add(i as u64));
+            let mut rng = crate::stream_rng(seed, crate::streams::REGION_MC, i as u64);
             let mut pooled = confidence_region_sample(&dist, n_mc, &mut rng);
             for b in &boot {
                 pooled.extend(confidence_region_sample(&b[i], n_mc, &mut rng));

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! Behaviour of the scikit-learn-style API on simulated data.
 
 use esag::distribution::Esag;
@@ -128,7 +129,12 @@ fn json_roundtrip_and_errors() {
         .unwrap();
     let back = EsagRegressorFit::from_json(&fit.to_json().unwrap()).unwrap();
     assert_eq!(back.coef, fit.coef);
-    assert!(back.summary().contains("[dose]"));
+    let summary = back.summary();
+    assert!(
+        summary.contains("ESAG Regression Results")
+            && summary.contains("dose")
+            && summary.contains("P>|z|")
+    );
     // shape errors
     assert!(
         EsagRegressor::new()
@@ -177,5 +183,102 @@ fn higher_dimensions_fit() {
             .abs()
             .max();
         assert!(dv < 0.2, "d={d}: dV = {dv}");
+    }
+}
+
+#[test]
+fn covariance_estimates_with_bootstrap_intervals() {
+    use esag::inference::{covariance_intervals, geodesic_distance};
+    let b = b_true();
+    let (x, y) = simulate(1500, &b, 21);
+    let fit = EsagRegressor::new().fit(&x, &y).unwrap();
+    let x_new = DMatrix::from_column_slice(2, 1, &[0.0, 1.0]);
+    let est = covariance_intervals(&fit, &x, &y, &x_new, 200, 0.95, 3).unwrap();
+    let plain = fit.predict_covariance(&x_new).unwrap();
+    assert_eq!(est.len(), 2);
+    for (i, e) in est.iter().enumerate() {
+        let v = &e.covariance;
+        assert!((v - &plain[i]).abs().max() < 1e-12);
+        assert!((v - v.transpose()).abs().max() < 1e-12);
+        assert!((v.determinant() - 1.0).abs() < 1e-9);
+        // V μ̂ = μ̂
+        let mu = nalgebra::DVector::from_column_slice(&e.mean_direction);
+        assert!((v * &mu - &mu).abs().max() < 1e-9);
+        assert_eq!(e.n_boot, 200);
+        for k in 0..2 {
+            assert!(e.eig_lower[k] < e.eigenvalues[k] && e.eigenvalues[k] < e.eig_upper[k]);
+            assert!(e.eig_se[k] > 0.0);
+        }
+        assert!(e.entry_se.iter().all(|s| s.is_finite() && *s >= 0.0));
+        assert!(e.radius > 0.0 && e.radius < 1.0);
+        // the truth is within a few radii of the estimate
+        let eta: Vec<f64> = (0..5)
+            .map(|k| b[(k, 0)] + b[(k, 1)] * x_new[(i, 0)])
+            .collect();
+        let vt = Esag::from_eta(&eta).unwrap().covariance();
+        assert!(geodesic_distance(v, &vt) < 3.0 * e.radius);
+        let s = e.summary();
+        assert!(s.contains("ESAG Covariance Estimate V(x)") && s.contains("lambda[2]"));
+    }
+}
+
+/// Fits, their standard errors and their iteration counts are bit-for-bit
+/// the same with and without `parallel` (the evaluations sum fixed chunks of
+/// observations in order either way), at d = 3 and d = 4.
+#[test]
+fn fits_do_not_depend_on_parallel() {
+    for d in [3usize, 4] {
+        let bd = esag::dims::eta_len(d);
+        let mut rng = ChaCha8Rng::seed_from_u64(20 + d as u64);
+        let n = 700;
+        let x = DMatrix::from_fn(n, 2, |_, _| {
+            let z: f64 = StandardNormal.sample(&mut rng);
+            z
+        });
+        let b = DMatrix::from_fn(bd, 3, |k, j| {
+            let s = (k * 5 + j * 3) as f64;
+            if j == 0 {
+                if k < d {
+                    1.5 + 0.5 * s.sin()
+                } else {
+                    0.6 * s.cos()
+                }
+            } else {
+                0.3 * (s * 0.7).sin()
+            }
+        });
+        let mut y = DMatrix::zeros(n, d);
+        let mut buf = vec![0.0; d];
+        for i in 0..n {
+            let eta: Vec<f64> = (0..bd)
+                .map(|k| b[(k, 0)] + b[(k, 1)] * x[(i, 0)] + b[(k, 2)] * x[(i, 1)])
+                .collect();
+            let dist = Esag::from_eta(&eta).unwrap();
+            dist.sample_one(&dist.frame(), &mut rng, &mut buf);
+            for k in 0..d {
+                y[(i, k)] = buf[k];
+            }
+        }
+        let seq = EsagRegressor::new()
+            .with_parallel(false)
+            .fit(&x, &y)
+            .unwrap();
+        let par = EsagRegressor::new()
+            .with_parallel(true)
+            .fit(&x, &y)
+            .unwrap();
+        assert_eq!(
+            seq.log_likelihood.to_bits(),
+            par.log_likelihood.to_bits(),
+            "d={d}"
+        );
+        assert_eq!(seq.n_iter, par.n_iter, "d={d}");
+        let bits = |m: &DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&seq.coef), bits(&par.coef), "d={d}");
+        assert_eq!(
+            bits(&seq.std_errors().unwrap()),
+            bits(&par.std_errors().unwrap()),
+            "d={d}"
+        );
     }
 }

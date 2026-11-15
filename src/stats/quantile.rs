@@ -30,9 +30,52 @@ pub fn quantiles_type7(x: &[f64], probs: &[f64]) -> Vec<f64> {
     if x.is_empty() || x.iter().any(|v| v.is_nan()) {
         return vec![f64::NAN; probs.len()];
     }
-    let mut sorted = x.to_vec();
-    sorted.sort_unstable_by(f64::total_cmp);
-    probs.iter().map(|&p| type7_sorted(&sorted, p)).collect()
+    let n = x.len();
+    // 0-based ranks needed by the type-7 interpolation of every probability
+    let mut ranks: Vec<usize> = Vec::with_capacity(2 * probs.len());
+    for &p in probs {
+        if p.is_nan() || !(-PROB_EPS..=1.0 + PROB_EPS).contains(&p) {
+            continue;
+        }
+        let index = 1.0 + (n - 1) as f64 * p.clamp(0.0, 1.0);
+        ranks.push(index.floor() as usize - 1);
+        ranks.push(index.ceil() as usize - 1);
+    }
+    ranks.sort_unstable();
+    ranks.dedup();
+    let mut v = x.to_vec();
+    if ranks.len() > 16 {
+        // many order statistics: one full sort is cheaper
+        v.sort_unstable_by(f64::total_cmp);
+        return probs.iter().map(|&p| type7_sorted(&v, p)).collect();
+    }
+    // Successive selection: after placing rank r, everything right of r is
+    // ≥ v[r], so the next (larger) rank is selected within v[r+1..] only.
+    // Linear time per rank instead of O(n log n), identical order statistics.
+    let mut start = 0;
+    for &r in &ranks {
+        v[start..].select_nth_unstable_by(r - start, f64::total_cmp);
+        start = r + 1;
+    }
+    probs
+        .iter()
+        .map(|&p| {
+            if p.is_nan() || !(-PROB_EPS..=1.0 + PROB_EPS).contains(&p) {
+                return f64::NAN;
+            }
+            let index = 1.0 + (n - 1) as f64 * p.clamp(0.0, 1.0);
+            let lo = index.floor();
+            let hi = index.ceil();
+            let xlo = v[lo as usize - 1];
+            let xhi = v[hi as usize - 1];
+            if index > lo && xhi != xlo {
+                let h = index - lo;
+                (1.0 - h) * xlo + h * xhi
+            } else {
+                xlo
+            }
+        })
+        .collect()
 }
 
 /// Type-7 quantile of an already sorted, non-empty, NaN-free sample.
@@ -217,5 +260,31 @@ mod tests {
         assert!(ecdf_fraction_ge(&[], 0.0).is_nan());
         assert!(ecdf_fraction_gt(&[], 0.0).is_nan());
         assert!(ecdf_fraction_lt(&[], 0.0).is_nan());
+    }
+
+    #[test]
+    fn selection_equals_full_sort() {
+        let mut st = 99u64;
+        for n in [1usize, 2, 3, 10, 101, 1000, 50_000] {
+            let x: Vec<f64> = (0..n)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((st >> 11) as f64 / (1u64 << 53) as f64 * 10.0).floor() / 3.0 // with ties
+                })
+                .collect();
+            let probs = [0.95, 0.0, 0.5, 1.0, 0.7, 0.025, 0.975, 0.3333];
+            let got = quantiles_type7(&x, &probs);
+            let mut sorted = x.clone();
+            sorted.sort_unstable_by(f64::total_cmp);
+            for (g, &p) in got.iter().zip(&probs) {
+                assert_eq!(
+                    g.to_bits(),
+                    type7_sorted(&sorted, p).to_bits(),
+                    "n={n} p={p}"
+                );
+            }
+        }
     }
 }

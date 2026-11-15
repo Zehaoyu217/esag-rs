@@ -107,6 +107,11 @@ impl EsagEstimator {
         self.inner.verbose = v;
         self
     }
+    /// Shape parameterization ([`crate::regression::Shape`]).
+    pub fn with_shape(mut self, shape: crate::regression::Shape) -> Self {
+        self.inner.shape = shape;
+        self
+    }
     /// Force an isotropic fit (`gamma = 0`).
     pub fn isotropic(mut self, d: usize) -> Self {
         self.inner.mask = Some(crate::regression::isotropic_mask(d, 1));
@@ -122,7 +127,7 @@ impl EsagEstimator {
         let x = DMatrix::<f64>::zeros(y.nrows(), 0);
         let reg = self.inner.fit(&x, y)?;
         let eta: Vec<f64> = reg.coef.column(0).iter().copied().collect();
-        let dist = Esag::from_eta(&eta)?;
+        let dist = reg.distribution_at(&eta, reg.lt_frame().as_ref())?;
         Ok(EsagFit { dist, reg })
     }
 }
