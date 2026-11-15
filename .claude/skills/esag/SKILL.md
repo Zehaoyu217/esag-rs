@@ -121,6 +121,14 @@ fixed-point`); `select` in `bic | aic
 Project 3 R scripts (i.i.d., gamma). `python/README.md` has the details and
 `python examples/demo.py [d]` a full session.
 
+Part scales: `esag.ESAG(Y, X, scale="auto")` (or `"tyler"`, or given scales)
+when the response coordinates have very different scales (net flows,
+returns of parts of different sizes): ESAG for `unit(Y/s)`, reported on the
+original sphere (`predict`, `mean_vector`, `covariance`, densities,
+`llf`/`bic`, `simulate`; `res.scale`); coefficients and tests are the
+standardized model's. Without it ESAG can turn its mean direction away from
+such data (forecast cosine near 0). Rust: `EsagModel::response_scale`.
+
 Which penalty: keep the default `auto` unless the question is narrower.
 `groups="covariate_part"` group LASSO for "does x move V at all?" (as good
 as `auto` at about 2–3 observations per coefficient, where V should stay

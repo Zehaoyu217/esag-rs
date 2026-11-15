@@ -435,3 +435,52 @@ def test_auto_penalty():
     assert "hierarchical" in default.method
     assert np.allclose(default.params, esag.ESAG(Y, X).fit_regularized("auto").params)
     assert "eigen-gap" in esag.ESAG(Y).fit_regularized().method
+
+
+def _unequal_scale_directions(n=1500, seed=5):
+    """A VAR(1) with isotropic noise seen in coordinates of very different
+    scales: directions dominated by the first coordinate, whose mean flips
+    sign."""
+    rng = np.random.default_rng(seed)
+    q, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+    a = 0.7 * q
+    scales = np.array([8.0, 3.0, 1.5, 0.8, 0.4])
+    z = np.zeros((n + 201, 5))
+    for t in range(1, n + 201):
+        z[t] = a @ z[t - 1] + rng.standard_normal(5)
+    f = z[200:] * scales
+    y = f[1:] / np.linalg.norm(f[1:], axis=1, keepdims=True)
+    return y, f[:-1], scales
+
+
+def test_response_scale():
+    """scale="tyler"/"auto"/array: ESAG for unit(y / s), reported on the
+    original sphere; it fixes directions whose coordinates have very
+    different scales."""
+    y, x, scales = _unequal_scale_directions()
+    cos = lambda r: float((np.asarray(r.predict(x)) * y).sum(1).mean())
+    plain = esag.ESAG(y, x).fit()
+    tyler = esag.ESAG(y, x, scale="tyler").fit()
+    z = np.column_stack([np.ones(len(x)), x])
+    coef, *_ = np.linalg.lstsq(z, y, rcond=None)
+    pred = z @ coef
+    ls = float(((pred / np.linalg.norm(pred, axis=1, keepdims=True)) * y).sum(1).mean())
+    assert cos(tyler) > cos(plain) + 0.15
+    assert cos(tyler) > ls - 0.02
+    assert tyler.bic < plain.bic
+    gm = np.exp(np.log(scales).mean())
+    assert np.allclose(tyler.scale, scales / gm, rtol=0.15)
+    # llf, loglike_obs and the summary are on the original sphere
+    assert abs(tyler.llf - tyler.loglike_obs().sum()) < 1e-6
+    assert "standardized by part scales" in str(tyler.summary())
+    assert np.allclose(np.linalg.det(tyler.covariance()), 1.0)
+    auto = esag.ESAG(y, x, scale="auto").fit()
+    assert auto.scale is not None and abs(auto.bic - tyler.bic) < 1e-6
+    fixed = esag.ESAG(y, x, scale=scales).fit()
+    assert np.allclose(fixed.scale, scales / gm) and cos(fixed) > cos(plain) + 0.15
+    assert esag.ESAG(y, x).fit().scale is None
+    with pytest.raises(ValueError):
+        esag.ESAG(y, x, scale="bogus")
+    reg = esag.ESAG(y, x, scale="auto").fit_regularized()
+    assert reg.relaxed.scale is not None
+    assert "standardized by part scales" in str(reg.summary())

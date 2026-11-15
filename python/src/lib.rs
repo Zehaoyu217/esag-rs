@@ -3,7 +3,7 @@
 
 use esag::distribution::Esag;
 use esag::inference::{GofMethod, HypothesisTestResult, Restriction, bootstrap_gof};
-use esag::model::{EsagModel, EsagResults};
+use esag::model::{EsagModel, EsagResults, ResponseScale};
 use esag::optim::prox::RocMode;
 use esag::penalized::{Grouping, LambdaGrid, PenalizedEsag, PenalizedPath, Target};
 use esag::regression::{EsagRegressor, Shape};
@@ -54,7 +54,7 @@ struct PyModel {
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None, rot_basis=None))]
+    #[pyo3(signature = (endog, exog=None, exog_names=None, endog_names=None, shape="gamma", hasconst=true, lt_reference=None, rot_basis=None, scale=None, scale_values=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         endog: PyReadonlyArray2<'_, f64>,
@@ -65,6 +65,8 @@ impl PyModel {
         hasconst: bool,
         lt_reference: Option<Vec<f64>>,
         rot_basis: Option<Vec<Vec<f64>>>,
+        scale: Option<&str>,
+        scale_values: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         let y = to_dmatrix(&endog);
         let x = match &exog {
@@ -106,6 +108,17 @@ impl PyModel {
             }
             m = m.rot_basis(DMatrix::from_fn(p, p, |r, c| r0[r][c]));
         }
+        m = match (scale, scale_values) {
+            (Some("tyler"), None) => m.response_scale(ResponseScale::Tyler).map_err(err)?,
+            (Some("auto"), None) => m.response_scale(ResponseScale::Auto).map_err(err)?,
+            (None, Some(v)) => m.response_scale(ResponseScale::Fixed(v)).map_err(err)?,
+            (None, None) => m,
+            (s, _) => {
+                return Err(err(format!(
+                    "scale must be None, 'tyler', 'auto' or one positive number per endog column, got {s:?}"
+                )));
+            }
+        };
         Ok(Self { inner: m })
     }
 
@@ -249,7 +262,9 @@ impl PyModel {
         } else if paper_grid {
             est = est.with_grid(LambdaGrid::Paper);
         }
-        let model = self.inner.clone();
+        // (scale="auto": decided by the unpenalized fits, and the relaxed
+        // refit's results use the model chosen)
+        let model = py.detach(|| self.inner.resolve_scale()).map_err(err)?;
         let path = py.detach(|| model.fit_regularized(est)).map_err(err)?;
         Ok(PyRegularized { inner: path, model })
     }
@@ -356,17 +371,34 @@ impl PyResults {
     fn column_names(&self) -> Vec<String> {
         self.inner.column_names.clone()
     }
+    /// Log-likelihood of the responses on the original sphere (with
+    /// standardized responses, including the Jacobian of the map).
     #[getter]
     fn llf(&self) -> f64 {
-        self.inner.llf()
+        self.inner.log_likelihood_original()
     }
     #[getter]
     fn aic(&self) -> f64 {
-        self.inner.aic()
+        self.inner.aic_original()
     }
     #[getter]
     fn bic(&self) -> f64 {
-        self.inner.bic()
+        self.inner.bic_original()
+    }
+    /// Part scales of standardized responses (geometric mean 1), or None.
+    #[getter]
+    fn scale(&self) -> Option<Vec<f64>> {
+        self.inner.scale().map(|s| s.to_vec())
+    }
+    /// Mean vectors `m(x)` of the predictive projected normal on the
+    /// original sphere (`n × d`).
+    fn mean_vector<'py>(
+        &self,
+        py: Python<'py>,
+        exog: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let x = to_dmatrix(&exog);
+        Ok(to_py(py, &self.inner.mean_vector(&x).map_err(err)?))
     }
     #[getter]
     fn nobs(&self) -> usize {
@@ -464,7 +496,7 @@ impl PyResults {
     fn resid<'py>(&self, py: Python<'py>) -> PyResult<(Vector<'py>, Vector<'py>)> {
         let r = self
             .inner
-            .residuals(self.inner.model.exog(), self.inner.model.endog())
+            .residuals(self.inner.model.exog(), self.inner.model.raw_endog())
             .map_err(err)?;
         Ok((
             Array1::from_vec(r.q).into_pyarray(py),
@@ -558,7 +590,17 @@ impl PyResults {
         let d = PyDict::new(py);
         d.set_item("levels", levels)?;
         d.set_item("thresholds", pr.thresholds.clone())?;
-        d.set_item("mean_direction", pr.dist.mean_direction())?;
+        // (the region's statistic is the standardized model's; its mean
+        // direction is mapped to the original sphere)
+        let mut md = pr.dist.mean_direction();
+        if let Some(s) = res.scale() {
+            for (v, sk) in md.iter_mut().zip(s) {
+                *v *= sk;
+            }
+            let r = md.iter().map(|v| v * v).sum::<f64>().sqrt();
+            md.iter_mut().for_each(|v| *v /= r);
+        }
+        d.set_item("mean_direction", md)?;
         Ok(d)
     }
     /// Responses simulated from the fitted model at covariates `exog`.
@@ -743,7 +785,15 @@ struct PyRegularized {
 #[pymethods]
 impl PyRegularized {
     fn summary(&self) -> String {
-        self.inner.summary()
+        let mut s = self.inner.summary();
+        if let Some(sc) = self.model.scale() {
+            let list: Vec<String> = sc.iter().map(|v| format!("{v:.4}")).collect();
+            s.push_str(&format!(
+                "Responses standardized by part scales s = [{}]: the coefficients describe unit(y / s).\n",
+                list.join(", ")
+            ));
+        }
+        s
     }
     fn path_summary(&self) -> String {
         self.inner.path_summary()

@@ -27,8 +27,10 @@ Truth: a logistic-normal VAR(1) in ilr coordinates, z_t = c + A (z_{t-1} - c)
   f_t / |f_t|_2 or by the signed square root sign(w) sqrt(|w|) (Yu & Huang's
   map with the sign kept: the positive orthant is their case). Flows are a
   Gaussian VAR (``flows``) or differences of Poisson counts with
-  heterogeneous sizes (``counts``). Scores: L1 error of the forecast signed
-  composition and the share of signs right.
+  heterogeneous sizes (``counts``), also with part scales (``scale="tyler"``
+  and ``"auto"``: ESAG for the standardized directions, which the count
+  flows need). Scores: L1 error of the forecast signed composition and the
+  share of signs right.
 
 ``python examples/compositional.py [levels zeros change flows counts]``
 env: ``R`` replicates (10), ``N`` training length (2000).
@@ -250,6 +252,13 @@ def flows(rep, poisson):
     res = esag_fit(u[tr], lag_f[tr], SHAPE)
     uh = unit(np.asarray(res.linear_predictor(lag_f[te]))[:, :d])
     sc("ESAG on f/|f|_2", uh / np.abs(uh).sum(1, keepdims=True))
+    for scale in ("tyler", "auto"):
+        res = esag_fit(u[tr], lag_f[tr], SHAPE, scale=scale)
+        uh = np.asarray(res.predict(lag_f[te]))
+        label = f"ESAG on f/|f|_2, scale={scale}"
+        if scale == "auto":
+            label += f" ({'scaled' if res.scale is not None else 'unscaled'})"
+        sc(label, uh / np.abs(uh).sum(1, keepdims=True))
     res = esag_fit(sq[tr], lag_f[tr], SHAPE)
     sh = unit(np.asarray(res.linear_predictor(lag_f[te]))[:, :d])
     sc("ESAG on signed sqrt", np.sign(sh) * sh * sh)

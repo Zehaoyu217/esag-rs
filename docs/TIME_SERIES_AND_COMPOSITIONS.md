@@ -239,12 +239,14 @@ their case; L1 error of the forecast `ŵ`, share of signs right):
 | flows | model | L1 | signs right |
 |---|---|---|---|
 | Gaussian VAR | ESAG, `f/|f|_2` | 0.996 | 0.674 |
+| | ESAG, `f/|f|_2`, `scale="tyler"` (or `"auto"`) | 0.985 | 0.676 |
 | | ESAG, signed sqrt | 1.128 | 0.676 |
 | | PN regression, `f/|f|_2` | 0.988 | 0.678 |
 | | PN regression, signed sqrt | 1.136 | 0.679 |
 | | VAR-OLS | 0.982 | 0.679 |
 | | oracle | 0.981 | 0.680 |
 | Poisson counts (in − out, sizes 50 … 2) | ESAG, `f/|f|_2` | 1.649 | 0.468 |
+| | **ESAG, `f/|f|_2`, `scale="tyler"` (or `"auto"`)** | **1.063** | **0.569** |
 | | ESAG, signed sqrt | 1.603 | 0.532 |
 | | PN regression, `f/|f|_2` | 1.077 | 0.569 |
 | | PN regression, signed sqrt | 1.173 | 0.568 |
@@ -254,12 +256,36 @@ their case; L1 error of the forecast `ŵ`, share of signs right):
 Signed data use the whole sphere naturally, and the plain direction is the
 better embedding: for Gaussian flows it is exactly projected normal, and the
 signed square root gets the same signs but larger share errors (1.13 against
-0.99). ESAG fails on the count flows (fewer signs right than persistence):
-their directions sit near `±e_1`, with a sign that depends on the lag, so
-`μ(x)` passes through zero and ESAG's mean-anchored frame flips (its fit does
-not converge, with raw or standardized lags, γ-rot or log-tangent). The
-projected normal with a constant covariance has no frame to flip and matches
-least squares.
+0.99).
+
+Plain ESAG fails on the count flows (fewer signs right than persistence),
+and the cause is not the sign flip: the Gaussian flows flip sign too, and
+ESAG forecasts them as well as the true model. The count flows' parts have
+very different sizes (50 … 2), so the first part dominates both the mean and
+the noise of the direction: the projected normal fitted to them has variance
+12.7 (median) along its mean direction, with `det S = 1`. ESAG fixes the
+variance along `μ` at 1, the geometric mean of the others (`V μ = μ`,
+`det V = 1`), and cannot put the spread along the mean axis; its best fit
+turns the mean direction perpendicular to the data instead (mean cosine
+0.02, log-likelihood −1540 against the projected normal's −922). A better
+start or a frame reference away from the antipodes does not change that,
+and neither does a free variance along `μ` alone (prototyped: cosine 0.13).
+
+The fix is to standardize the parts before taking directions: ESAG for
+`unit(f/s)`, which on the original sphere is `PN(D μ, D V D)`, `D = diag(s)`
+— ESAG's shape, with the variance along the mean direction freed by the
+part scales. `esag.ESAG(Y, X, scale=...)` (Rust
+`EsagModel::response_scale`) fits it and reports predictions,
+`mean_vector`, `covariance`, densities (with the Jacobian
+`|D^{-1}y|^{-d}`), `llf`/AIC/BIC and simulations on the original sphere;
+`scale="tyler"` estimates the scales from the directions alone by the
+diagonal Tyler (angular central Gaussian) estimator, which recovered the
+count flows' scales (3.98, 1.49, 0.88, 0.61, 0.32 against their standard
+deviations 3.96, 1.49, 0.88, 0.60, 0.32), and `scale="auto"` keeps it only
+if it lowers the BIC on the original sphere (it did in all 20 replicates of
+both designs). Standardized, ESAG matches least squares on the count flows
+(L1 1.063, 0.569 of the signs) and beats the projected normal regression,
+and on the Gaussian flows it gains a little too.
 
 
 ## 5. What others do
@@ -364,11 +390,19 @@ Pesaran–Timmermann test (1992, JBES 10).
 * **The density needs the right structure.** When the noise is anisotropic
   and the mean direction turns with the state (every VAR-type series), the
   projected normal with a constant covariance is the exact model; ESAG's
-  mean-anchored shape costs 0.26–0.39 nats per step. When the mean
-  direction passes through zero (mean-zero series, signed flows), ESAG's
-  frame degenerates: its fits fail on count flows, and its penalized path
+  mean-anchored shape costs 0.26–0.39 nats per step. When the
+  intercept-only model has a mean vector near zero (mean-zero series),
+  ESAG's shape is not identified at the top of a penalized path, which then
   cannot select (at d = 10 it kept every lag, for the mean and the shape,
   with unsolved λ's).
+* **Parts of different sizes: standardize them.** When one part dominates
+  both the mean and the noise (net flows of parts of sizes 50 … 2), the
+  spread lies along the mean direction, where ESAG fixes the variance at
+  1, and plain ESAG turns its mean direction away from the data. ESAG for
+  the standardized directions (`scale="tyler"` or `"auto"`: `PN(D μ, D V D)`
+  on the original sphere, scales estimated from the directions) matches
+  least squares there. The mean direction flipping sign is not a problem
+  in itself.
 * **Prepare the series.** Difference integrated series, demean stationary
   ones, and use scale-free covariates under volatility clustering; with
   volatility the directional model on lagged directions beats the Gaussian
@@ -384,8 +418,10 @@ Pesaran–Timmermann test (1992, JBES 10).
   with the covariance held fixed across observations, the observation model
   of Zito & Kowal's dynamic model; here by maximum likelihood in 0.1–0.2 s
   at d = 10), with the package's penalties on the lag columns, bootstrap
-  tests and prediction regions, for VAR-type and signed data; a warning when
-  a penalized ESAG path starts from an intercept-only model with a mean
-  vector near zero; count observation layers for compositions with zeros;
+  tests and prediction regions, for VAR-type data; a warning when a
+  penalized ESAG path starts from an intercept-only model with a mean
+  vector near zero; part scales in the command-line interface (its saved
+  models do not carry them yet); count observation layers for compositions
+  with zeros;
   coordinate-wise devolatilization and real series (returns, energy shares)
   against Zito & Kowal's dynamic model and Zhu & Müller's autoregression.

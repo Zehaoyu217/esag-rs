@@ -20,6 +20,10 @@ angular Gaussian distribution on the unit sphere S^{d−1}. The library covers:
 * an opt-in smooth shape parameterization (`Shape::LogTangent`) for the same
   distributions, which removes the discontinuities of `γ ↦ V` that make large
   regressions (d = 7–8, 5–6 covariates) slow and unreliable;
+* part scales for responses whose coordinates have very different scales
+  (net flows, returns): ESAG for `unit(y/s)`, the projected normal
+  `PN(Dμ, DVD)` on the original sphere, with the scales estimated from the
+  directions (`scale="tyler"` or `"auto"`; `EsagModel::response_scale`);
 * the LASSO family (Project 3): LASSO, adaptive LASSO, group, adaptive group
   and sparse group LASSO on any set of coefficients, with adaptive or RoC
   weights on every shape and with covariates, a hierarchical group LASSO over

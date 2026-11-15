@@ -132,6 +132,23 @@ observations, where the unpenalized MLE does not exist, the path starts
 from the null model, never selects a degenerate refit, and takes adaptive
 weights from the plain penalty's selection.
 
+### Part scales
+
+When the coordinates of the responses have very different scales (net
+flows or returns of parts of different sizes), one part dominates both the
+mean and the noise of the direction, and plain ESAG, which fixes the
+variance along the mean direction, turns its mean direction away from the
+data. `esag.ESAG(Y, X, scale="tyler")` fits ESAG to `unit(Y / s)` with the
+part scales `s` estimated from the directions (diagonal Tyler), i.e. the
+projected normal `PN(D mu, D V D)` on the original sphere;
+`scale="auto"` keeps the scales only if they lower the BIC on the original
+sphere; `scale=s` takes given scales. `predict`, `mean_vector`,
+`covariance`, `loglike_obs`, `llf`/`aic`/`bic` and `simulate` are on the
+original sphere, `res.scale` holds the scales; coefficients and tests are
+those of the standardized model. On net count flows (parts of sizes 50 to 2)
+this took ESAG from 0.47 to 0.57 of the signs right, the same as least
+squares (`docs/TIME_SERIES_AND_COMPOSITIONS.md`).
+
 ### Shapes
 
 `shape="auto"` (default) is `"gamma-rot"`: Yu & Huang's γ groups made
@@ -198,7 +215,7 @@ dist.logpdf(y), dist.covariance, dist.second_moment, dist.mean_direction
 ## Tests and demo
 
 ```sh
-python -m pytest tests            # 29 tests, ~3 s
+python -m pytest tests            # 30 tests, ~4 s
 python examples/demo.py           # fit, five bootstrap tests, five penalties (d = 3)
 python examples/demo.py 5         # the same at d = 5
 python examples/ts_directions.py  # forecasting directions of time series (docs/TIME_SERIES_AND_COMPOSITIONS.md)

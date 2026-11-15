@@ -141,3 +141,31 @@ Signed compositions of net flows (Poisson counts) (10 replicates, n = 2000)
   oracle (true intensities at t)                0.500        0.761        0.250
   persistence w_{t-1}                           1.262        0.478        0.028
   [70 s]
+
+# python examples/compositional.py flows counts   (after part scales: scale="tyler"/"auto"; 10 replicates, n = 2000)
+
+Signed compositions of net flows (Gaussian VAR) (10 replicates, n = 2000)
+  model                                            L1  signs right    all signs
+  ESAG on f/|f|_2                               0.996        0.674        0.124
+  ESAG on f/|f|_2, scale=tyler                  0.985        0.676        0.127
+  ESAG on f/|f|_2, scale=auto (scaled)          0.985        0.676        0.127
+  ESAG on signed sqrt                           1.128        0.676        0.126
+  PN-reg on f/|f|_2                             0.988        0.678        0.132
+  PN-reg on signed sqrt                         1.136        0.679        0.135
+  VAR-OLS on f                                  0.982        0.679        0.139
+  oracle (conditional mean)                     0.981        0.680        0.139
+  persistence w_{t-1}                           1.239        0.560        0.057
+  [5 s]
+
+Signed compositions of net flows (Poisson counts) (10 replicates, n = 2000)
+  model                                            L1  signs right    all signs
+  ESAG on f/|f|_2                               1.649        0.468        0.015
+  ESAG on f/|f|_2, scale=tyler                  1.063        0.569        0.057
+  ESAG on f/|f|_2, scale=auto (scaled)          1.063        0.569        0.057
+  ESAG on signed sqrt                           1.603        0.532        0.039
+  PN-reg on f/|f|_2                             1.077        0.569        0.056
+  PN-reg on signed sqrt                         1.173        0.568        0.057
+  VAR-OLS on f                                  1.063        0.571        0.059
+  oracle (true intensities at t)                0.500        0.761        0.250
+  persistence w_{t-1}                           1.262        0.478        0.028
+  [181 s]

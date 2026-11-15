@@ -85,10 +85,11 @@ def pn_forecast(m, s, u, rng, ndraw=2000, symmetric=False) -> Forecast:
     return Forecast(v, rho, pn_logpdf(u, m, s))
 
 
-def esag_fit(y, x, shape="gamma-rot", penalty=None):
+def esag_fit(y, x, shape="gamma-rot", penalty=None, scale=None):
     """ESAG regression of directions y on covariates x (None: i.i.d.); with
-    ``penalty`` the relaxed refit of the selected model."""
-    model = esag.ESAG(y, x, shape=shape)
+    ``penalty`` the relaxed refit of the selected model; ``scale`` as in
+    ``esag.ESAG`` (part scales of the responses)."""
+    model = esag.ESAG(y, x, shape=shape, scale=scale)
     if penalty is None:
         return model.fit()
     return model.fit_regularized(penalty).relaxed
@@ -96,14 +97,15 @@ def esag_fit(y, x, shape="gamma-rot", penalty=None):
 
 def esag_forecast(res, x_new, u, rng, ndraw=2000) -> Forecast:
     """The fitted ESAG's predictive PN(mu(x), V(x)) at the test covariates."""
-    d = u.shape[1]
     if x_new is None:
-        eta = np.asarray(res.linear_predictor())[:1].repeat(len(u), 0)
+        m = np.asarray(res.mean_vector())[:1].repeat(len(u), 0)
         cov = np.asarray(res.covariance())[:1].repeat(len(u), 0)
     else:
-        eta = np.asarray(res.linear_predictor(x_new))
+        m = np.asarray(res.mean_vector(x_new))
         cov = np.asarray(res.covariance(x_new))
-    return pn_forecast(eta[:, :d], cov, u, rng, ndraw, symmetric=True)
+    # (ESAG is symmetric about its mean vector; with part scales the
+    # predictive projected normal PN(D mu, D V D) need not be)
+    return pn_forecast(m, cov, u, rng, ndraw, symmetric=res.scale is None)
 
 
 def scores(f: Forecast, u: np.ndarray, oracle: Forecast) -> dict:

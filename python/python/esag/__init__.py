@@ -212,10 +212,26 @@ class ESAG:
         ``results.rot_basis``). The gamma-rot regression model depends on
         it; pass ``rot_basis=results.rot_basis`` with ``lt_reference`` to
         fit the same model to other data.
+    scale : None, "tyler", "auto" or array-like, optional
+        Standardize the responses by part scales s before the fit: the
+        model is ESAG for unit(y / s), which on the original sphere is the
+        projected normal PN(D mu, D V D), D = diag(s). ESAG fixes the
+        variance along the mean direction at the geometric mean of the
+        others; part scales free it, which matters when the coordinates have
+        very different scales (net flows or returns of parts of different
+        sizes, where one part dominates both the mean and the noise of the
+        direction and plain ESAG turns its mean direction away from the
+        data). ``"tyler"``: the diagonal Tyler (angular central Gaussian)
+        estimate from the directions; ``"auto"``: with or without it, by
+        BIC on the original sphere; or the scales themselves (raw vectors
+        may be passed as ``endog``; their sizes are ignored). Predictions,
+        ``mean_vector``, ``covariance``, densities, ``llf``/``aic``/``bic``
+        and simulations are on the original sphere; coefficients and tests
+        are those of the standardized model.
     """
 
     def __init__(self, endog, exog=None, shape: str = "auto", missing: str = "none",
-                 lt_reference=None, rot_basis=None):
+                 lt_reference=None, rot_basis=None, scale=None):
         y = _as_2d(endog, "endog")
         self.endog_names = _names(endog, y.shape[1], "y")
         if exog is None:
@@ -252,6 +268,13 @@ class ESAG:
             if rb.shape != (d - 1, d - 1):
                 raise ValueError(f"rot_basis must be ({d - 1}, {d - 1})")
             rot_basis = [[float(v) for v in row] for row in rb]
+        scale_name, scale_values = None, None
+        if isinstance(scale, str):
+            scale_name = scale.lower()
+            if scale_name not in ("tyler", "auto"):
+                raise ValueError("scale must be None, 'tyler', 'auto' or one number per endog column")
+        elif scale is not None:
+            scale_values = [float(v) for v in np.asarray(scale, dtype=np.float64).ravel()]
         self._native = _esag.Model(
             y,
             x,
@@ -260,6 +283,8 @@ class ESAG:
             shape=shape,
             lt_reference=None if lt_reference is None else [float(v) for v in lt_reference],
             rot_basis=rot_basis,
+            scale=scale_name,
+            scale_values=scale_values,
         )
 
     def _exog_new(self, exog) -> np.ndarray:
@@ -485,7 +510,11 @@ class ESAGResults(_CoefTable):
         labels = [f"{self._names[k]}:{self.model.exog_names[j]}" for k, j in free]
         return _frame(np.asarray(cov), labels, labels)
 
-    llf = property(lambda self: self._native.llf, doc="Maximised log-likelihood.")
+    llf = property(lambda self: self._native.llf,
+                   doc="Maximised log-likelihood (on the original sphere with ``scale``).")
+    scale = property(lambda self: (None if self._native.scale is None
+                                   else np.asarray(self._native.scale)),
+                     doc="Part scales of standardized responses (geometric mean 1), or None.")
     aic = property(lambda self: self._native.aic)
     bic = property(lambda self: self._native.bic)
     nobs = property(lambda self: self._native.nobs)
@@ -522,6 +551,14 @@ class ESAGResults(_CoefTable):
         return Summary(self._native.summary(alpha))
 
     # prediction --------------------------------------------------------------
+    def mean_vector(self, exog=None):
+        """Mean vectors m(x) of the predictive projected normal PN(m(x), V(x))
+        on the original sphere (V from :meth:`covariance`): mu(x), or
+        D mu_s(x) with standardized responses."""
+        x = self.model.exog if exog is None else self.model._exog_new(exog)
+        out = np.asarray(self._native.mean_vector(x))
+        return _frame(out, range(out.shape[0]), self.model.endog_names)
+
     def predict(self, exog=None):
         """Mean directions (unit vectors) at ``exog`` (default: the training
         covariates)."""

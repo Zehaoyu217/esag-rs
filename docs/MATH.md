@@ -794,6 +794,45 @@ bootstrap SEs and percentile intervals.
 `preprocessing::MinMaxScaler` does this. The model is linear in `x`, so
 rescaling changes `B` but not the fitted distributions.
 
+### Standardized responses: part scales (`src/model.rs`)
+
+ESAG is the projected normal `PN(μ, V)` with `V μ = μ` and `det V = 1`: the
+variance along the mean direction equals the geometric mean of the others.
+When the coordinates have very different scales, as net flows or returns of
+parts of different sizes, one part dominates both the mean and the noise of
+the direction and the spread lies along the mean direction; ESAG cannot
+place it there, and its best fit turns `μ̂` away from the data (on net
+Poisson flows of parts of sizes 50 … 2 the mean cosine of its forecasts was
+0.02; `docs/TIME_SERIES_AND_COMPOSITIONS.md` §4).
+
+`EsagModel::response_scale` (Python `ESAG(..., scale=...)`) fits ESAG to the
+standardized directions `u = unit(y/s)`, `s` with geometric mean 1. On the
+original sphere the model is the projected normal `PN(D μ, D V D)`,
+`D = diag(s)` (if `x ~ N(μ, V)` then `D x ~ N(D μ, D V D)`, and `unit(D x)` has
+the direction `y`): ESAG's shape, with the variance along the mean freed by
+the scales. The density of `y` is that of `u` times the Jacobian of
+`y ↦ unit(D⁻¹y)` on the sphere, `|det D⁻¹| / |D⁻¹y|^d = |D⁻¹y|^{−d}`
+(`scaled_model_is_the_projected_normal_on_the_original_sphere` checks the
+identity to 1e−9). Predictions (`unit(s ⊙ μ̂_s)`), the mean vector `D μ_s`,
+`V = D V_s D`, densities, log-likelihood, AIC/BIC and simulations are
+reported on the original sphere; coefficients, tests and their bootstrap
+are those of the standardized model (a fixed bijection of the responses,
+so tests of covariate effects keep their meaning).
+
+The scales: `Fixed(s)`; `Tyler`, the diagonal Tyler estimate from the
+directions alone — the maximum-likelihood scales of a zero-centred angular
+central Gaussian with a diagonal shape (Tyler 1987), the fixed point of
+`σ_k = d · mean_i(u_ik² / Σ_l u_il²/σ_l)`, `s = √σ` — which for vectors with
+independent parts (or a common radial law) recovers the part scales
+whatever the vectors' sizes (`tyler_scales_recover_part_scales`: within 4%
+at n = 20 000; on the count flows 3.98, 1.49, 0.88, 0.61, 0.32 against their
+standard deviations 3.96, 1.49, 0.88, 0.60, 0.32); and `Auto`, the unscaled
+and the Tyler-scaled fits compared by BIC on the original sphere, the
+estimated scales counting `d − 1` parameters (it chose the scales in all 20
+replicates of the flow designs). Estimating the scales jointly with `B` by
+alternating maximization was tried and abandoned: from `D = I` it creeps
+out of the turned-away basin far too slowly.
+
 ## 4. Residuals and goodness of fit (`src/inference/gof.rs`)
 
 `r_i = (I − μ̂_iμ̂_iᵀ) y_i`, `Q_i = r_iᵀ V_i⁻¹ r_i`,
