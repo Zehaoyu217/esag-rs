@@ -276,12 +276,13 @@ angular central Gaussian is the law of the direction of *any* zero-centred
 elliptical vector (Tyler 1987, Biometrika 74; Tyler's M-estimator, AoS 15),
 the basis of robust scatter estimation for financial returns (Frahm &
 Jaekel, Univ. Cologne DP 2/07); at `μ = 0` ESAG is the ACG, but its
-mean-anchored frame is undefined there (§1). The general projected normal
-regression — the model `_pn.PNRegression` fits by maximum likelihood — is
-Presnell, Morrison & Littell's projected linear model (1998, JASA 93, by
-EM) and Hernandez-Stumpfhauser, Breidt & van der Woerd's projected normal
-of arbitrary dimension (2017, Bayesian Analysis 12, by MCMC, one
-covariance entry fixed). Spherical regression: Paine, Preston, Tsagris &
+mean-anchored frame is undefined there (§1). Projected normal regression
+goes back to Presnell, Morrison & Littell's projected linear model (1998,
+JASA 93, fitted by EM; whether it allows a general covariance was not
+checked). Hernandez-Stumpfhauser, Breidt & van der Woerd's projected normal
+of arbitrary dimension (2017, Bayesian Analysis 12, by MCMC) has a general
+covariance, identified by fixing one entry: the model `_pn.PNRegression`
+fits by maximum likelihood (identified by `det S = 1` instead). Spherical regression: Paine, Preston, Tsagris &
 Wood 2018 and 2020 (Stat Comput 28, 30; Kent or ESAG errors), Rosenthal,
 Wu, Klassen & Srivastava 2014 (JASA 109; projective-linear mean link),
 Scealy & Wood 2019 (JASA 114; scaled vMF), and heavy-tailed alternatives
@@ -293,9 +294,14 @@ Tsagris, Papastamoulis & Kato 2025, Stat Comput 35).
 Harvey, Hurn, Palumbo & Thiele 2024, J Econometrics 239); projected-normal
 dynamics on the circle (Wang & Gelfand 2014, JASA 109; Nuñez-Antonio &
 Gutiérrez-Peña 2014, CSDA 71); and in any dimension the projected dynamic
-linear model of Zito & Kowal (preprint 2308.14996: Gibbs sampling and a
-particle filter, applied to square-root electricity shares), the closest
-existing work to these experiments. Zhu & Müller (2024, J Econometrics 239)
+linear model of Zito & Kowal (preprint 2308.14996), the closest existing
+work to these experiments: `r_t u_t = F_t s_t + ε_t`, `ε_t ~ N(0, Σ)` with
+`Σ` constant over time and one diagonal entry fixed, by Gibbs sampling and
+a particle filter. Its observation model is the constant-covariance
+projected normal that beat ESAG in §3, with dynamic coefficients; on wind
+directions and square-root US electricity shares it beat von Mises–Fisher
+and wrapped-normal state-space models and spherical autoregressions on
+point, set and density forecasts. Zhu & Müller (2024, J Econometrics 239)
 fit spherical autoregressions by rotations and chose the *differenced*
 version for square-root energy shares because the levels trended — the
 same conclusion as §3. Christoffersen & Diebold (2006, Management Science
@@ -337,6 +343,10 @@ It and the direction `f/|f|_2` are one-to-one maps of the same signed
 composition (`w = sign(s) s² = u/|u|_1`): both keep the signs and the
 shares, net share `Σw` included, and drop the gross size `|f|_1`; they
 differ only in geometry, and §4 found the direction's the better one.
+Where the sign flips, the alternatives to a whole-sphere direction are the
+split representation (inflows and outflows as two compositions inside the
+orthant, the net sign carried by the log-ratio of their totals) and, if the
+sign itself does not matter, an axial model.
 
 *Evaluation.* Beyond the log score, angular error and mean-resultant-length
 calibration used here: energy and kernel scores (Gneiting & Raftery 2007,
@@ -370,8 +380,9 @@ Pesaran–Timmermann test (1992, JBES 10).
   representation (losing parts negative); the signed square root is a valid
   extension of the square-root map but not a better one here.
 * **Next steps.** A native projected normal regression with a constant
-  covariance (the projected linear model of Presnell et al. 1998 and
-  Hernandez-Stumpfhauser et al. 2017, here by maximum likelihood in 0.1–0.2 s
+  covariance (Hernandez-Stumpfhauser et al. 2017's general projected normal
+  with the covariance held fixed across observations, the observation model
+  of Zito & Kowal's dynamic model; here by maximum likelihood in 0.1–0.2 s
   at d = 10), with the package's penalties on the lag columns, bootstrap
   tests and prediction regions, for VAR-type and signed data; a warning when
   a penalized ESAG path starts from an intercept-only model with a mean
